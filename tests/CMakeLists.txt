@@ -15,6 +15,10 @@ target_link_libraries(giga_drill_tests PRIVATE
   Catch2::Catch2WithMain
 )
 
+target_compile_definitions(giga_drill_tests PRIVATE
+  PROJECT_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+)
+
 list(APPEND CMAKE_MODULE_PATH ${Catch2_SOURCE_DIR}/extras)
 include(Catch)
 catch_discover_tests(giga_drill_tests)

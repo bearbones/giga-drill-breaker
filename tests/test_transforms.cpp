@@ -24,16 +24,16 @@ TEST_CASE("Example files are loadable", "[transforms][smoke]") {
   // Verify that the example files exist and can be read.
   // Paths are relative to the project root; tests should be run from there.
   SECTION("macro_split examples exist") {
-    auto input = readFile("examples/macro_split/input.cpp");
-    auto expected = readFile("examples/macro_split/expected.cpp");
+    auto input = readFile(std::string(PROJECT_SOURCE_DIR) + "/examples/macro_split/input.cpp");
+    auto expected = readFile(std::string(PROJECT_SOURCE_DIR) + "/examples/macro_split/expected.cpp");
     CHECK_FALSE(input.empty());
     CHECK_FALSE(expected.empty());
     CHECK(input != expected);
   }
 
   SECTION("builder_to_struct examples exist") {
-    auto input = readFile("examples/builder_to_struct/input.cpp");
-    auto expected = readFile("examples/builder_to_struct/expected.cpp");
+    auto input = readFile(std::string(PROJECT_SOURCE_DIR) + "/examples/builder_to_struct/input.cpp");
+    auto expected = readFile(std::string(PROJECT_SOURCE_DIR) + "/examples/builder_to_struct/expected.cpp");
     CHECK_FALSE(input.empty());
     CHECK_FALSE(expected.empty());
     CHECK(input != expected);

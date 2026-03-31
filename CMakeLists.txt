@@ -25,5 +25,16 @@ include_directories(
   ${CMAKE_BINARY_DIR}/extern/llvm-project/llvm/tools/clang/include
 )
 
+# Match LLVM's RTTI setting (off by default) to avoid linker errors
+if(NOT LLVM_ENABLE_RTTI)
+  if(MSVC)
+    string(APPEND CMAKE_CXX_FLAGS " /GR-")
+  else()
+    string(APPEND CMAKE_CXX_FLAGS " -fno-rtti")
+  endif()
+endif()
+
 add_subdirectory(src)
+
+enable_testing()
 add_subdirectory(tests)
