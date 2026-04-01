@@ -8,6 +8,7 @@ FetchContent_MakeAvailable(Catch2)
 add_executable(giga_drill_tests
   test_matcher_engine.cpp
   test_transforms.cpp
+  test_adl_ctad.cpp
 )
 
 target_link_libraries(giga_drill_tests PRIVATE
