@@ -1,6 +1,9 @@
 add_library(giga_drill_lib
   MatcherEngine.cpp
   TransformPipeline.cpp
+  GlobalIndex.cpp
+  Indexer.cpp
+  Analyzer.cpp
 )
 
 target_include_directories(giga_drill_lib PUBLIC
@@ -14,6 +17,7 @@ target_link_libraries(giga_drill_lib PUBLIC
   clangAST
   clangBasic
   clangFrontend
+  clangSema
   clangSerialization
   clangRewrite
   clangToolingCore
