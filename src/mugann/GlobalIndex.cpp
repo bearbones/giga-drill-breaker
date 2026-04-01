@@ -1,4 +1,4 @@
-#include "giga_drill/GlobalIndex.h"
+#include "giga_drill/mugann/GlobalIndex.h"
 
 namespace giga_drill {
 

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "giga_drill/GlobalIndex.h"
+#include "giga_drill/mugann/GlobalIndex.h"
 
 #include "clang/AST/ASTConsumer.h"
 #include "clang/AST/RecursiveASTVisitor.h"

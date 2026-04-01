@@ -1,6 +1,6 @@
-#include "giga_drill/Analyzer.h"
-#include "giga_drill/GlobalIndex.h"
-#include "giga_drill/Indexer.h"
+#include "giga_drill/mugann/Analyzer.h"
+#include "giga_drill/mugann/GlobalIndex.h"
+#include "giga_drill/mugann/Indexer.h"
 
 #include "clang/Tooling/CompilationDatabase.h"
 #include "clang/Tooling/Tooling.h"
