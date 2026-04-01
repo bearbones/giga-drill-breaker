@@ -69,6 +69,80 @@ bool IndexerVisitor::VisitCXXDeductionGuideDecl(
   return true;
 }
 
+void IndexerVisitor::setASTContext(clang::ASTContext *ctx) {
+  astContext_ = ctx;
+}
+
+bool IndexerVisitor::VisitCXXMethodDecl(clang::CXXMethodDecl *decl) {
+  if (decl->isImplicit())
+    return true;
+
+  if (!decl->isThisDeclarationADefinition())
+    return true;
+
+  if (decl->getPreviousDecl())
+    return true;
+
+  auto *parent = llvm::dyn_cast<clang::CXXRecordDecl>(decl->getParent());
+  if (!parent)
+    return true;
+
+  CoveragePropertyEntry entry;
+  entry.qualifiedName = decl->getQualifiedNameAsString();
+  entry.headerPath = getFilePath(decl->getLocation());
+  entry.sourceLine = sm_.getSpellingLineNumber(decl->getLocation());
+  entry.enclosingClass = parent->getQualifiedNameAsString();
+
+  if (astContext_)
+    entry.gvaLinkage =
+        static_cast<int>(astContext_->GetGVALinkageForFunction(decl));
+
+  entry.isInlined = decl->isInlined();
+  entry.isConstexpr = decl->isConstexpr();
+  entry.isDefaulted = decl->isDefaulted();
+  entry.isTrivial = decl->isTrivial();
+  entry.isVirtual = decl->isVirtual();
+  entry.isStaticMethod = decl->isStatic();
+  entry.isImplicitlyInstantiable = decl->isImplicitlyInstantiable();
+  entry.templatedKind = static_cast<int>(decl->getTemplatedKind());
+  entry.storageClass = static_cast<int>(decl->getStorageClass());
+  entry.formalLinkage =
+      static_cast<int>(decl->getLinkageAndVisibility().getLinkage());
+
+  if (auto *body = decl->getBody())
+    entry.bodyStmtCount = countStmts(body);
+
+  // Build human-readable signature.
+  entry.signature = decl->getReturnType().getAsString() + " " +
+                    decl->getQualifiedNameAsString() + "(";
+  for (unsigned i = 0; i < decl->getNumParams(); ++i) {
+    if (i > 0)
+      entry.signature += ", ";
+    entry.signature += decl->getParamDecl(i)->getType().getAsString();
+  }
+  entry.signature += ")";
+  if (decl->isConst())
+    entry.signature += " const";
+
+  index_.addCoverageProperty(std::move(entry));
+  return true;
+}
+
+unsigned IndexerVisitor::countStmts(const clang::Stmt *s,
+                                    unsigned limit) const {
+  if (!s || limit == 0)
+    return 0;
+  unsigned count = 1;
+  for (auto *child : s->children()) {
+    if (child) {
+      count += countStmts(child, limit - count);
+      if (count >= limit)
+        return limit;
+    }
+  }
+  return count;
+}
+
 std::string IndexerVisitor::getFilePath(clang::SourceLocation loc) const {
   auto fileEntry = sm_.getFileEntryRefForID(sm_.getFileID(
       sm_.getSpellingLoc(loc)));
@@ -83,6 +157,7 @@ IndexerConsumer::IndexerConsumer(GlobalIndex &index, clang::SourceManager &sm)
     : visitor_(index, sm) {}
 
 void IndexerConsumer::HandleTranslationUnit(clang::ASTContext &context) {
+  visitor_.setASTContext(&context);
   visitor_.TraverseDecl(context.getTranslationUnitDecl());
 }
 

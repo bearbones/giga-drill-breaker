@@ -72,10 +72,17 @@ private:
   std::vector<Diagnostic> &diagnostics_;
 };
 
+// Analyze coverage-relevant properties across classes in the index.
+// Emits diagnostics for GVA linkage mismatches, discardable ODR, etc.
+void analyzeCoverageProperties(const GlobalIndex &index,
+                               std::vector<Diagnostic> &diagnostics);
+
 // Run the full two-phase analysis: index all sources, then analyze for
-// fragile ADL/CTAD resolution.
+// fragile ADL/CTAD resolution. When enableCoverageDiag is true, also
+// runs coverage property analysis between phases.
 std::vector<Diagnostic>
 runAnalysis(const clang::tooling::CompilationDatabase &compDb,
-            const std::vector<std::string> &sourceFiles);
+            const std::vector<std::string> &sourceFiles,
+            bool enableCoverageDiag = false);
 
 } // namespace giga_drill

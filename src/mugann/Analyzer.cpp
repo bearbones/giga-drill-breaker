@@ -261,11 +261,156 @@ std::unique_ptr<clang::FrontendAction> AnalyzerActionFactory::create() {
   return std::make_unique<AnalyzerAction>(index_, diagnostics_);
 }
 
+// --- Coverage Analysis ---
+
+static std::string gvaLinkageName(int gva) {
+  switch (gva) {
+  case 0:
+    return "GVA_Internal";
+  case 1:
+    return "GVA_AvailableExternally";
+  case 2:
+    return "GVA_DiscardableODR";
+  case 3:
+    return "GVA_StrongODR";
+  case 4:
+    return "GVA_StrongExternal";
+  default:
+    return "Unknown(" + std::to_string(gva) + ")";
+  }
+}
+
+void analyzeCoverageProperties(const GlobalIndex &index,
+                               std::vector<Diagnostic> &diagnostics) {
+  for (const auto &className : index.allIndexedClasses()) {
+    auto methods = index.findClassMethods(className);
+    if (methods.empty())
+      continue;
+
+    // Phase A: Flag individual methods with risky GVA linkage.
+    for (const auto *m : methods) {
+      if (m->gvaLinkage == 2 /* GVA_DiscardableODR */) {
+        Diagnostic diag;
+        diag.kind = Diagnostic::Coverage_DiscardableODR;
+        diag.callLocation =
+            m->headerPath + ":" + std::to_string(m->sourceLine);
+        diag.resolvedDecl = m->signature;
+        diag.message =
+            "Coverage risk: " + m->signature +
+            " has GVA_DiscardableODR linkage. COMDAT deduplication at link "
+            "time may replace the instrumented definition with an "
+            "uninstrumented one from another TU, producing hash 0x0 in "
+            "coverage data.";
+        diagnostics.push_back(std::move(diag));
+      }
+      if (m->gvaLinkage == 1 /* GVA_AvailableExternally */) {
+        Diagnostic diag;
+        diag.kind = Diagnostic::Coverage_AvailableExternally;
+        diag.callLocation =
+            m->headerPath + ":" + std::to_string(m->sourceLine);
+        diag.resolvedDecl = m->signature;
+        diag.message =
+            "Coverage risk: " + m->signature +
+            " has GVA_AvailableExternally linkage. The optimizer may "
+            "inline the body and then discard the standalone definition, "
+            "eliminating coverage instrumentation.";
+        diagnostics.push_back(std::move(diag));
+      }
+    }
+
+    if (methods.size() < 2)
+      continue;
+
+    // Phase B: Compare sibling methods for GVA linkage mismatch.
+    std::unordered_map<int, std::vector<const CoveragePropertyEntry *>> byGVA;
+    for (const auto *m : methods)
+      byGVA[m->gvaLinkage].push_back(m);
+
+    if (byGVA.size() > 1) {
+      size_t maxGroupSize = 0;
+      int majorityGVA = -1;
+      for (const auto &kv : byGVA) {
+        if (kv.second.size() > maxGroupSize) {
+          maxGroupSize = kv.second.size();
+          majorityGVA = kv.first;
+        }
+      }
+
+      for (const auto &kv : byGVA) {
+        if (kv.first == majorityGVA)
+          continue;
+        for (const auto *m : kv.second) {
+          Diagnostic diag;
+          diag.kind = Diagnostic::Coverage_GVAMismatch;
+          diag.callLocation =
+              m->headerPath + ":" + std::to_string(m->sourceLine);
+          diag.resolvedDecl = m->signature;
+          diag.betterDecl =
+              "majority linkage: " + gvaLinkageName(majorityGVA);
+          diag.message =
+              "Coverage divergence in " + className + ": " + m->signature +
+              " has " + gvaLinkageName(kv.first) + " linkage, but " +
+              std::to_string(maxGroupSize) +
+              " other method(s) in the same class have " +
+              gvaLinkageName(majorityGVA) +
+              " linkage. This difference may cause divergent coverage "
+              "instrumentation behavior.";
+          diagnostics.push_back(std::move(diag));
+        }
+      }
+    }
+
+    // Phase C: Property divergence within same-GVA groups.
+    for (const auto &kv : byGVA) {
+      if (kv.second.size() < 2)
+        continue;
+      for (size_t i = 0; i < kv.second.size(); ++i) {
+        for (size_t j = i + 1; j < kv.second.size(); ++j) {
+          const auto *a = kv.second[i];
+          const auto *b = kv.second[j];
+          // AST node counting: a simple `return x_` getter has ~5 nodes
+          // (CompoundStmt, ReturnStmt, ImplicitCastExpr, MemberExpr,
+          // CXXThisExpr). Threshold of 8 captures one-line getters/setters.
+          bool aTrivial = (a->bodyStmtCount <= 8 || a->isTrivial);
+          bool bTrivial = (b->bodyStmtCount <= 8 || b->isTrivial);
+          if (aTrivial != bTrivial) {
+            const auto *complex = aTrivial ? b : a;
+            const auto *trivial = aTrivial ? a : b;
+            Diagnostic diag;
+            diag.kind = Diagnostic::Coverage_PropertyDivergence;
+            diag.callLocation =
+                complex->headerPath + ":" +
+                std::to_string(complex->sourceLine);
+            diag.resolvedDecl = complex->signature;
+            diag.betterDecl = trivial->signature;
+            diag.message =
+                "Coverage property divergence in " + className + ": " +
+                complex->signature + " (body complexity: " +
+                std::to_string(complex->bodyStmtCount) +
+                " stmts, inline=" +
+                (complex->isInlined ? "true" : "false") + ", constexpr=" +
+                (complex->isConstexpr ? "true" : "false") + ") vs " +
+                trivial->signature + " (body complexity: " +
+                std::to_string(trivial->bodyStmtCount) +
+                " stmts, inline=" +
+                (trivial->isInlined ? "true" : "false") + ", constexpr=" +
+                (trivial->isConstexpr ? "true" : "false") +
+                "). The more complex method may receive different "
+                "optimization treatment affecting coverage instrumentation.";
+            diagnostics.push_back(std::move(diag));
+          }
+        }
+      }
+    }
+  }
+}
+
 // --- runAnalysis ---
 
 std::vector<Diagnostic>
 runAnalysis(const clang::tooling::CompilationDatabase &compDb,
-            const std::vector<std::string> &sourceFiles) {
+            const std::vector<std::string> &sourceFiles,
+            bool enableCoverageDiag) {
   // Phase 1: Index all translation units.
   GlobalIndex index;
   {
@@ -274,8 +419,12 @@ runAnalysis(const clang::tooling::CompilationDatabase &compDb,
     tool.run(&factory);
   }
 
-  // Phase 2: Analyze each translation unit against the global index.
+  // Phase 1.5: Coverage property analysis (index-only, no AST needed).
   std::vector<Diagnostic> diagnostics;
+  if (enableCoverageDiag)
+    analyzeCoverageProperties(index, diagnostics);
+
+  // Phase 2: Analyze each translation unit against the global index.
   {
     clang::tooling::ClangTool tool(compDb, sourceFiles);
     AnalyzerActionFactory factory(index, diagnostics);

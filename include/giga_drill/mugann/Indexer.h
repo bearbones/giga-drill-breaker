@@ -19,12 +19,17 @@ public:
 
   bool VisitFunctionDecl(clang::FunctionDecl *decl);
   bool VisitCXXDeductionGuideDecl(clang::CXXDeductionGuideDecl *decl);
+  bool VisitCXXMethodDecl(clang::CXXMethodDecl *decl);
+
+  void setASTContext(clang::ASTContext *ctx);
 
 private:
   GlobalIndex &index_;
   clang::SourceManager &sm_;
+  clang::ASTContext *astContext_ = nullptr;
 
   std::string getFilePath(clang::SourceLocation loc) const;
+  unsigned countStmts(const clang::Stmt *s, unsigned limit = 100) const;
 };
 
 // ASTConsumer that drives the IndexerVisitor.
