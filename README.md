@@ -9,6 +9,63 @@ analysis. It exposes two features as subcommands:
 Designed as a backend for external systems (e.g. a Python script translating
 a custom DSL) that generate matcher/replacement rule specifications.
 
+The names are drawn from *Tengen Toppa Gurren Lagann* (TTGL). See
+[Naming](#naming) for the full breakdown.
+
+---
+
+## Naming
+
+The project and its subcommands are named after elements from the 2007 mecha
+anime *Tengen Toppa Gurren Lagann* (天元突破グレンラガン, "Heaven-Piercing
+Gurren Lagann"). The central motif of TTGL is the spiral drill — an
+unstoppable force that breaks through any limit by evolving and combining.
+
+### giga-drill-breaker
+
+The **Giga Drill Breaker** (ギガドリルブレイク) is Gurren Lagann's signature
+finishing move: the mech generates a colossal spiral drill and drives it
+through whatever stands in its way — up to and including the laws of physics.
+The name fits a tool whose job is to break through the structural limitations
+baked into large C++ codebases.
+
+### lagann — the transformation subcommand
+
+**Lagann** (ラガン) is Simon's personal core mech. It is small but contains
+the fundamental power: a spiral drill and the ability to *combine* with any
+other machine, boring into it and reshaping it into something new. Lagann does
+not destroy — it transforms. Every combination produces a more powerful form.
+
+The `lagann` subcommand does the same thing to source code. It drills into the
+AST and rewrites what it finds, pass by pass. The multi-pass pipeline echoes
+Lagann's repeated combinations — each pass a new merge, each one producing a
+more evolved result. The source file going in is not the same structure coming
+out.
+
+### mugann — the fragility-hunting subcommand
+
+The **Mugann** (ムガン) are the Anti-Spiral's biomechanical hunter-killers.
+They are dangerous in a very specific way: they give no warning, they look
+inert until triggered, and the hazard is entirely in *how they resolve* — a
+Mugann killed inside Earth's atmosphere detonates with enough force to destroy
+a city. The danger is not visible at the point of encounter. It is latent,
+structural, and catastrophic only when the wrong conditions converge.
+
+Fragile ADL and CTAD resolutions have exactly this character. The code
+compiles without error. The call site looks normal. But depending on which
+headers happen to be included in a given translation unit, the same unqualified
+call silently resolves to a different overload — or the same CTAD expression
+deduces a different type. The hazard is invisible at the call site and only
+detonates when build order or include structure shifts.
+
+The `mugann` subcommand hunts these latent threats. It indexes declarations
+across all translation units (building a picture the Anti-Spirals would call
+"the full spiral census") and then re-walks each TU looking for resolutions
+that would change if a different header were in scope. Like the Dai-Gurren
+Brigade learning to lure Mugann into space before destroying them, `mugann`
+surfaces the danger in a controlled setting before it can explode in
+production.
+
 ---
 
 ## Features

@@ -22,6 +22,27 @@ that supplies matcher/rule specifications.
 
 ---
 
+## Naming Reference (TTGL)
+
+The project and its features are named after *Tengen Toppa Gurren Lagann*, a
+mecha anime whose central motif is the spiral drill — a force that evolves,
+combines, and breaks through any limit.
+
+- **giga-drill-breaker** — the Giga Drill Breaker finishing move: an
+  impossibly large spiral drill that pierces through whatever stands in the way.
+
+- **lagann** — Simon's core mech. Its nature is *transformation and
+  combination*: it bores into other machines and reshapes them into new forms.
+  Fitting for the subcommand that drills into ASTs and rewrites source code.
+
+- **mugann** — the Anti-Spiral's hunter-killers. Their defining trait: they
+  appear inert, give no warning, and the danger is entirely in *how they
+  resolve* — a Mugann killed in the wrong context detonates catastrophically.
+  Fragile ADL/CTAD resolutions have the same character: they compile silently
+  and only detonate when include order shifts.
+
+---
+
 ## Feature Layout
 
 The codebase is split into two named feature folders:
