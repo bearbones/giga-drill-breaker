@@ -1,9 +1,9 @@
 add_library(giga_drill_lib
-  MatcherEngine.cpp
-  TransformPipeline.cpp
-  GlobalIndex.cpp
-  Indexer.cpp
-  Analyzer.cpp
+  mugann/GlobalIndex.cpp
+  mugann/Indexer.cpp
+  mugann/Analyzer.cpp
+  lagann/MatcherEngine.cpp
+  lagann/TransformPipeline.cpp
 )
 
 target_include_directories(giga_drill_lib PUBLIC

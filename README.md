@@ -1,11 +1,108 @@
 # giga-drill-breaker
 
-Using LLVM libraries to make refactoring safe and easy.
+A Clang LibTooling backend for safe, AST-aware C++ refactoring and static
+analysis. It exposes two features as subcommands:
 
-A tool that parses AST matcher expressions from strings and applies
-source-to-source transformations using Clang's LibTooling. Designed as a backend
-for external systems (e.g. a Python script translating from a custom DSL) that
-generate matcher/replacement rule specifications.
+- **mugann** — detect fragile ADL/CTAD resolutions across translation units
+- **lagann** — apply rule-driven, multi-pass AST matcher transformations
+
+Designed as a backend for external systems (e.g. a Python script translating
+a custom DSL) that generate matcher/replacement rule specifications.
+
+The names are drawn from *Tengen Toppa Gurren Lagann* (TTGL). See
+[Naming](#naming) for the full breakdown.
+
+---
+
+## Naming
+
+The project and its subcommands are named after elements from the 2007 mecha
+anime *Tengen Toppa Gurren Lagann* (天元突破グレンラガン, "Heaven-Piercing
+Gurren Lagann"). The central motif of TTGL is the spiral drill — an
+unstoppable force that breaks through any limit by evolving and combining.
+
+### giga-drill-breaker
+
+The **Giga Drill Breaker** (ギガドリルブレイク) is Gurren Lagann's signature
+finishing move: the mech generates a colossal spiral drill and drives it
+through whatever stands in its way — up to and including the laws of physics.
+The name fits a tool whose job is to break through the structural limitations
+baked into large C++ codebases.
+
+### lagann — the transformation subcommand
+
+**Lagann** (ラガン) is Simon's personal core mech. It is small but contains
+the fundamental power: a spiral drill and the ability to *combine* with any
+other machine, boring into it and reshaping it into something new. Lagann does
+not destroy — it transforms. Every combination produces a more powerful form.
+
+The `lagann` subcommand does the same thing to source code. It drills into the
+AST and rewrites what it finds, pass by pass. The multi-pass pipeline echoes
+Lagann's repeated combinations — each pass a new merge, each one producing a
+more evolved result. The source file going in is not the same structure coming
+out.
+
+### mugann — the fragility-hunting subcommand
+
+The **Mugann** (ムガン) are the Anti-Spiral's biomechanical hunter-killers.
+They are dangerous in a very specific way: they give no warning, they look
+inert until triggered, and the hazard is entirely in *how they resolve* — a
+Mugann killed inside Earth's atmosphere detonates with enough force to destroy
+a city. The danger is not visible at the point of encounter. It is latent,
+structural, and catastrophic only when the wrong conditions converge.
+
+Fragile ADL and CTAD resolutions have exactly this character. The code
+compiles without error. The call site looks normal. But depending on which
+headers happen to be included in a given translation unit, the same unqualified
+call silently resolves to a different overload — or the same CTAD expression
+deduces a different type. The hazard is invisible at the call site and only
+detonates when build order or include structure shifts.
+
+The `mugann` subcommand hunts these latent threats. It indexes declarations
+across all translation units (building a picture the Anti-Spirals would call
+"the full spiral census") and then re-walks each TU looking for resolutions
+that would change if a different header were in scope. Like the Dai-Gurren
+Brigade learning to lure Mugann into space before destroying them, `mugann`
+surfaces the danger in a controlled setting before it can explode in
+production.
+
+---
+
+## Features
+
+### mugann — ADL/CTAD Fragility Analysis
+
+ADL (Argument-Dependent Lookup) and CTAD (Class Template Argument Deduction)
+can silently resolve to different declarations depending on which headers are
+included in a given translation unit. This is a portability and correctness
+hazard that standard compilers do not diagnose.
+
+`mugann` runs a two-phase analysis:
+
+1. **Index phase** — walks every translation unit and records all function
+   overloads and deduction guides found in any header, building a
+   project-wide `GlobalIndex`.
+2. **Analysis phase** — re-walks each translation unit, comparing resolved
+   call sites and CTAD usages against the global index. Any overload or
+   deduction guide that exists globally but is invisible in the current TU
+   (because its header is not included) is flagged as a fragile resolution.
+
+Output is a list of diagnostics with source locations and human-readable
+messages indicating which header to include or how to qualify the call.
+
+### lagann — AST-Based Source Transformations
+
+`lagann` parses matcher expressions from a JSON rules file and runs them
+against source files using Clang's dynamic AST matcher API. It supports
+multi-pass pipelines where each pass can build on the results of the
+previous one.
+
+Rules are specified as JSON objects containing:
+- A matcher expression string (Clang's dynamic AST matcher DSL)
+- A bind ID for the root matched node
+- An action name (resolved to a built-in callback)
+
+---
 
 ## Building
 
@@ -21,7 +118,7 @@ cd extern/llvm-project
 git sparse-checkout set llvm clang cmake third-party
 cd ../..
 
-# Configure (first time is slow due to LLVM build)
+# Configure (first time is slow due to LLVM build if not using system LLVM)
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 
 # Build the tool
@@ -29,48 +126,180 @@ cmake --build build --target giga-drill-breaker
 
 # Build and run tests
 cmake --build build --target giga_drill_tests
-cd build && ctest
+cd build && ctest --output-on-failure
 ```
 
-On macOS with Apple Silicon, the build includes AArch64 support automatically.
-For Intel-only builds, set `-DLLVM_TARGETS_TO_BUILD=X86`.
+The build system first tries to find a system-installed LLVM/Clang 18
+(`llvm-18-dev`, `libclang-18-dev`). If not found, it falls back to the
+bundled submodule.
+
+On macOS with Apple Silicon, AArch64 support is included automatically.
+For Intel-only builds: `-DLLVM_TARGETS_TO_BUILD=X86`.
+
+---
 
 ## Usage
 
+### mugann — Analyze for Fragile ADL/CTAD
+
 ```bash
-./build/giga-drill-breaker \
+./build/giga-drill-breaker mugann \
+  --build-path /path/to/compile_commands_dir \
+  --source file1.cpp file2.cpp
+```
+
+Output example:
+
+```
+src/logic.cpp:42:5: Fragile ADL resolution: MathLib::scale(Vector, double) exists in
+    Extension.hpp but is not visible here. The current call resolves to
+    MathLib::scale(Vector, int). Include Extension.hpp or explicitly qualify the call.
+```
+
+### lagann — Apply Transformations
+
+```bash
+./build/giga-drill-breaker lagann \
   --rules-json rules.json \
   --build-path /path/to/compile_commands_dir \
   --source file1.cpp file2.cpp \
   --dry-run
 ```
 
-Rules are specified as a JSON file containing matcher expressions and action
-names. The matcher expressions use Clang's dynamic AST matcher DSL.
+The `--dry-run` flag collects replacements without writing them to disk,
+which is useful for previewing changes.
 
-## Project structure
+---
+
+## Project Structure
 
 ```
-CMakeLists.txt              Top-level build configuration
-extern/llvm-project/        LLVM/Clang submodule (sparse checkout)
-include/giga_drill/         Public headers
-  MatcherEngine.h           Core: dynamic matcher parsing + execution
-  TransformPipeline.h       Multi-pass transform orchestration
-src/                        Implementation
-  main.cpp                  CLI entry point
-  MatcherEngine.cpp         Dynamic matcher parsing + MatchFinder integration
-  TransformPipeline.cpp     Pipeline execution
-tests/                      Catch2 tests
-  test_matcher_engine.cpp   Unit tests for matcher parsing
-  test_transforms.cpp       Integration test stubs for transforms
-examples/                   Example input/expected pairs for TDD
-  macro_split/              Boolean macro splitting
-  builder_to_struct/        Builder pattern to struct conversion
+CMakeLists.txt                  Top-level build configuration
+extern/llvm-project/            LLVM/Clang submodule (sparse checkout)
+
+include/giga_drill/
+  mugann/                       Public headers — ADL/CTAD analysis feature
+    GlobalIndex.h               Project-wide declaration database
+    Indexer.h                   Phase-1 AST visitor (index all declarations)
+    Analyzer.h                  Phase-2 AST visitor (detect fragile resolutions)
+  lagann/                       Public headers — transform pipeline feature
+    MatcherEngine.h             Dynamic matcher parsing and execution
+    TransformPipeline.h         Multi-pass transform orchestration
+
+src/
+  main.cpp                      CLI entry point (mugann / lagann subcommands)
+  mugann/                       mugann implementation
+    GlobalIndex.cpp
+    Indexer.cpp
+    Analyzer.cpp
+  lagann/                       lagann implementation
+    MatcherEngine.cpp
+    TransformPipeline.cpp
+  CMakeLists.txt
+
+tests/                          Catch2 test suite
+  test_matcher_engine.cpp       Unit tests for MatcherEngine::parse and addRule
+  test_transforms.cpp           Integration test stubs for lagann transforms
+  test_adl_ctad.cpp             Unit and integration tests for mugann analysis
+
+examples/
+  adl_fallback/                 ADL fragility example (include-order sensitivity)
+    Core.hpp, Extension.hpp, Logic.hpp
+    order_a.cpp, order_b.cpp
+  ctad_fallback/                CTAD fragility example (deduction guide visibility)
+    Container.hpp, Factory.hpp, Guide.hpp
+    order_a.cpp, order_b.cpp
+  macro_split/                  Boolean macro splitting transform example
+    input.cpp, expected.cpp
+  builder_to_struct/            Builder pattern to struct conversion example
+    input.cpp, expected.cpp
 ```
 
-## Future analysis modes
+---
 
-- **ADL/CTAD detection**: Identify implicit conversions from argument-dependent
-  lookup or class template argument deduction that may be undesired.
-- **Coverage diagnostics**: Analyze whether/why a header-defined function won't
-  have a coverage record emitted in a translation unit or binary.
+## Architecture
+
+### Two-Phase Analysis (mugann)
+
+```
+Phase 1 — Index:
+  ClangTool(all files) → IndexerActionFactory
+    → for each TU: IndexerVisitor
+      → VisitFunctionDecl → GlobalIndex::addFunctionOverload
+      → VisitCXXDeductionGuideDecl → GlobalIndex::addDeductionGuide
+
+Phase 2 — Analyze:
+  ClangTool(all files) → AnalyzerActionFactory
+    → for each TU: AnalyzerVisitor(GlobalIndex)
+      → VisitCallExpr → check ADL candidates vs global index
+      → VisitVarDecl  → check CTAD usages vs global index
+      → emit Diagnostic entries
+```
+
+### Transform Pipeline (lagann)
+
+```
+For each pass:
+  MatcherEngine(pass rules)
+    → parse matcher expressions (Clang dynamic parser)
+    → register callbacks with MatchFinder
+    → ClangTool::run → collect Replacements
+  merge into allReplacements_
+Apply replacements to disk (when not dry-run)
+```
+
+### Key Design Patterns
+
+| Pattern | Where used |
+|---|---|
+| RecursiveASTVisitor | IndexerVisitor, AnalyzerVisitor |
+| FrontendActionFactory | IndexerActionFactory, AnalyzerActionFactory |
+| MatchFinder + MatchCallback | MatcherEngine (via CallbackAdapter) |
+| Two-phase index/analyze | runAnalysis() in Analyzer.cpp |
+| Multi-pass pipeline | TransformPipeline::execute() |
+
+---
+
+## Examples
+
+### ADL Fragility (`examples/adl_fallback/`)
+
+`order_a.cpp` and `order_b.cpp` contain identical code but include headers in
+different orders. Due to ADL, the same unqualified call resolves to different
+overloads depending on which `scale()` overload is visible at the call site.
+`mugann` detects this without requiring compilation of both orderings.
+
+### CTAD Fragility (`examples/ctad_fallback/`)
+
+`Container c("hello")` deduces differently depending on whether `Guide.hpp`
+(which contains an explicit `Container(const char*) -> Container<std::string>`
+deduction guide) is included. `mugann` flags the case where the explicit guide
+is absent.
+
+### Boolean Macro Split (`examples/macro_split/`)
+
+`input.cpp` uses a boolean macro for a compound flag. `expected.cpp` shows the
+target form after splitting into separate named parameters. The `lagann`
+transform for this pattern is a planned TDD target.
+
+### Builder to Struct (`examples/builder_to_struct/`)
+
+`input.cpp` uses a builder pattern with chained setters. `expected.cpp` shows
+the equivalent aggregate initialization. Demonstrates a significant reduction
+in boilerplate (1130 → 482 bytes) achievable via AST rewriting.
+
+---
+
+## Current Status
+
+| Component | Status |
+|---|---|
+| MatcherEngine (parse + run) | Complete |
+| TransformPipeline (multi-pass) | Complete (apply-to-disk TODO) |
+| GlobalIndex | Complete |
+| Indexer (two-phase phase 1) | Complete |
+| Analyzer (two-phase phase 2) | Complete |
+| mugann CLI subcommand | Complete |
+| lagann CLI subcommand | Complete (JSON parsing TODO) |
+| Test suite (unit) | Complete |
+| Test suite (integration stubs) | Stubs present, impl pending |

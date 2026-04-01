@@ -1,4 +1,4 @@
-#include "giga_drill/TransformPipeline.h"
+#include "giga_drill/lagann/TransformPipeline.h"
 
 #include "clang/Tooling/CompilationDatabase.h"
 #include "clang/Tooling/Refactoring.h"
