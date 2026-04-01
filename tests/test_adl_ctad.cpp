@@ -117,8 +117,13 @@ TEST_CASE("Indexer collects deduction guides from source",
           "[Indexer]") {
   GlobalIndex index;
 
+  // Avoid #include <string> which requires system headers that may not
+  // be available to the in-memory Clang tooling when built from source.
   std::string code = R"(
-    #include <string>
+    struct MyString {
+      const char *data;
+      MyString(const char *s) : data(s) {}
+    };
 
     template <typename T>
     struct Container {
@@ -126,7 +131,7 @@ TEST_CASE("Indexer collects deduction guides from source",
       Container(T v) : value(v) {}
     };
 
-    Container(const char*) -> Container<std::string>;
+    Container(const char*) -> Container<MyString>;
   )";
 
   IndexerActionFactory factory(index);
@@ -136,8 +141,8 @@ TEST_CASE("Indexer collects deduction guides from source",
   auto guides = index.findDeductionGuides("Container");
   REQUIRE(guides.size() == 1);
   CHECK(guides[0]->templateName == "Container");
-  // The deduced type should mention string.
-  CHECK(guides[0]->deducedType.find("string") != std::string::npos);
+  // The deduced type should mention MyString.
+  CHECK(guides[0]->deducedType.find("MyString") != std::string::npos);
 }
 
 TEST_CASE("Indexer skips implicit and compiler-generated declarations",

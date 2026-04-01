@@ -46,4 +46,34 @@ size_t GlobalIndex::guideCount() const {
   return count;
 }
 
+void GlobalIndex::addCoverageProperty(CoveragePropertyEntry entry) {
+  coverageProps_[entry.enclosingClass].push_back(std::move(entry));
+}
+
+std::vector<const CoveragePropertyEntry *>
+GlobalIndex::findClassMethods(const std::string &enclosingClass) const {
+  std::vector<const CoveragePropertyEntry *> result;
+  auto it = coverageProps_.find(enclosingClass);
+  if (it != coverageProps_.end()) {
+    for (const auto &entry : it->second)
+      result.push_back(&entry);
+  }
+  return result;
+}
+
+std::vector<std::string> GlobalIndex::allIndexedClasses() const {
+  std::vector<std::string> result;
+  result.reserve(coverageProps_.size());
+  for (const auto &kv : coverageProps_)
+    result.push_back(kv.first);
+  return result;
+}
+
+size_t GlobalIndex::coverageEntryCount() const {
+  size_t count = 0;
+  for (const auto &kv : coverageProps_)
+    count += kv.second.size();
+  return count;
+}
+
 } // namespace giga_drill

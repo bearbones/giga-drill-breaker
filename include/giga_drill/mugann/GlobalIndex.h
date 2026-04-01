@@ -24,9 +24,44 @@ struct DeductionGuideEntry {
   unsigned sourceLine = 0;
 };
 
-// A diagnostic emitted when shadow lookup finds a mismatch.
+// Coverage-relevant properties of a header-defined class member function.
+// Used to diagnose why certain inline methods get dummy coverage records
+// (hash 0x0) while sibling methods in the same class do not.
+struct CoveragePropertyEntry {
+  std::string qualifiedName;    // e.g. "MyClass::getValue"
+  std::string headerPath;
+  unsigned sourceLine = 0;
+  std::string enclosingClass;   // qualified name of parent CXXRecordDecl
+
+  // GVA linkage — the primary signal for coverage instrumentation fate.
+  // Maps to clang::GVALinkage: 0=Internal, 1=AvailableExternally,
+  // 2=DiscardableODR, 3=StrongODR, 4=StrongExternal
+  int gvaLinkage = -1;
+
+  bool isInlined = false;
+  bool isConstexpr = false;
+  bool isDefaulted = false;
+  bool isTrivial = false;
+  bool isVirtual = false;
+  bool isStaticMethod = false;
+  bool isImplicitlyInstantiable = false;
+  int templatedKind = 0;
+  int storageClass = 0;
+  int formalLinkage = 0;
+  unsigned bodyStmtCount = 0;   // body complexity heuristic
+  std::string signature;        // e.g. "int MyClass::getValue() const"
+};
+
+// A diagnostic emitted when analysis finds an issue.
 struct Diagnostic {
-  enum Kind { ADL_Fallback, CTAD_Fallback };
+  enum Kind {
+    ADL_Fallback,
+    CTAD_Fallback,
+    Coverage_GVAMismatch,         // siblings have different GVA linkage
+    Coverage_DiscardableODR,      // method has GVA_DiscardableODR (COMDAT risk)
+    Coverage_AvailableExternally, // method may be discarded by optimizer
+    Coverage_PropertyDivergence,  // siblings diverge on complexity/properties
+  };
   Kind kind;
   std::string callLocation;  // file:line:col of the call site
   std::string resolvedDecl;  // what the compiler chose
@@ -49,13 +84,24 @@ public:
   std::vector<const DeductionGuideEntry *>
   findDeductionGuides(const std::string &templateName) const;
 
+  // Coverage property tracking.
+  void addCoverageProperty(CoveragePropertyEntry entry);
+
+  std::vector<const CoveragePropertyEntry *>
+  findClassMethods(const std::string &enclosingClass) const;
+
+  std::vector<std::string> allIndexedClasses() const;
+
   // Total counts for testing/debugging.
   size_t overloadCount() const;
   size_t guideCount() const;
+  size_t coverageEntryCount() const;
 
 private:
   std::unordered_map<std::string, std::vector<FunctionOverloadEntry>> overloads_;
   std::unordered_map<std::string, std::vector<DeductionGuideEntry>> guides_;
+  std::unordered_map<std::string, std::vector<CoveragePropertyEntry>>
+      coverageProps_;
 };
 
 } // namespace giga_drill

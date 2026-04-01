@@ -34,6 +34,11 @@ static llvm::cl::list<std::string>
                       llvm::cl::OneOrMore,
                       llvm::cl::sub(MugannCmd));
 
+static llvm::cl::opt<bool>
+    MugannCoverageDiag("coverage-diag",
+                       llvm::cl::desc("Enable coverage instrumentation diagnostics"),
+                       llvm::cl::sub(MugannCmd));
+
 // ---------------------------------------------------------------------------
 // lagann options
 // ---------------------------------------------------------------------------
@@ -96,7 +101,8 @@ int main(int argc, const char **argv) {
 
     std::vector<std::string> files(MugannSourceFiles.begin(),
                                    MugannSourceFiles.end());
-    auto diagnostics = giga_drill::runAnalysis(*compDb, files);
+    auto diagnostics =
+        giga_drill::runAnalysis(*compDb, files, MugannCoverageDiag);
 
     if (diagnostics.empty()) {
       llvm::outs() << "mugann: no fragile ADL/CTAD resolutions found.\n";
