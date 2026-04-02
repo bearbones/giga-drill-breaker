@@ -6,10 +6,51 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # --- LLVM/Clang: prefer system packages, fall back to submodule ---
+# Supported LLVM versions, checked in order (newest first).
+# To add a new version, append it to this list.
+set(GIGA_DRILL_SUPPORTED_LLVM_VERSIONS 20 18)
+
 set(LLVM_SUBMODULE_DIR "${CMAKE_SOURCE_DIR}/extern/llvm-project/llvm")
 
-find_package(LLVM 18 CONFIG QUIET)
-find_package(Clang CONFIG QUIET HINTS ${LLVM_INSTALL_PREFIX}/lib/cmake/clang)
+# Try each supported version by probing well-known install paths.
+# LLVM's version-compat file requires major.minor to match exactly, so we
+# search without a version constraint and verify the major version ourselves.
+foreach(_ver IN LISTS GIGA_DRILL_SUPPORTED_LLVM_VERSIONS)
+  find_package(LLVM CONFIG QUIET
+    PATHS "/usr/lib/llvm-${_ver}/lib/cmake/llvm"
+    NO_DEFAULT_PATH)
+  if(LLVM_FOUND AND LLVM_VERSION_MAJOR STREQUAL "${_ver}")
+    find_package(Clang CONFIG QUIET
+      HINTS "${LLVM_INSTALL_PREFIX}/lib/cmake/clang"
+            "${LLVM_DIR}/../clang")
+    if(Clang_FOUND)
+      break()
+    endif()
+  endif()
+  # Reset state so the next iteration starts clean.
+  unset(LLVM_FOUND)
+  unset(LLVM_DIR CACHE)
+  unset(LLVM_INSTALL_PREFIX)
+  unset(Clang_FOUND)
+  unset(Clang_DIR CACHE)
+endforeach()
+
+# If the well-known paths didn't work, try CMAKE_PREFIX_PATH / system paths.
+if(NOT LLVM_FOUND)
+  find_package(LLVM CONFIG QUIET)
+  if(LLVM_FOUND)
+    list(FIND GIGA_DRILL_SUPPORTED_LLVM_VERSIONS "${LLVM_VERSION_MAJOR}" _idx)
+    if(_idx GREATER_EQUAL 0)
+      find_package(Clang CONFIG QUIET
+        HINTS "${LLVM_INSTALL_PREFIX}/lib/cmake/clang"
+              "${LLVM_DIR}/../clang")
+    else()
+      message(WARNING "Found LLVM ${LLVM_PACKAGE_VERSION}, but only versions "
+              "${GIGA_DRILL_SUPPORTED_LLVM_VERSIONS} are supported.")
+      unset(LLVM_FOUND)
+    endif()
+  endif()
+endif()
 
 if(LLVM_FOUND AND Clang_FOUND)
   message(STATUS "Using system LLVM ${LLVM_PACKAGE_VERSION}")
@@ -33,8 +74,10 @@ elseif(EXISTS "${LLVM_SUBMODULE_DIR}/CMakeLists.txt")
     ${CMAKE_BINARY_DIR}/extern/llvm-project/llvm/tools/clang/include
   )
 else()
+  string(REPLACE ";" ", " _ver_list "${GIGA_DRILL_SUPPORTED_LLVM_VERSIONS}")
   message(FATAL_ERROR
-    "LLVM/Clang not found. Install llvm-18-dev and libclang-18-dev, "
+    "LLVM/Clang not found. Install one of the supported versions "
+    "(${_ver_list}), e.g. llvm-18-dev and libclang-18-dev, "
     "or initialize the submodule: git submodule update --init")
 endif()
 

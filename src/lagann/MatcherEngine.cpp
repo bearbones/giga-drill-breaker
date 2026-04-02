@@ -1,4 +1,5 @@
 #include "giga_drill/lagann/MatcherEngine.h"
+#include "giga_drill/compat/ClangVersion.h"
 
 #include "clang/ASTMatchers/Dynamic/Diagnostics.h"
 #include "clang/ASTMatchers/Dynamic/Parser.h"

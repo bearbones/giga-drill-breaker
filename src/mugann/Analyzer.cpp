@@ -1,5 +1,6 @@
 #include "giga_drill/mugann/Analyzer.h"
 #include "giga_drill/mugann/Indexer.h"
+#include "giga_drill/compat/ClangVersion.h"
 
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/DeclCXX.h"
