@@ -97,8 +97,12 @@ To add a new subcommand, follow the pattern in `main.cpp`:
 
 `CMakeLists.txt` (top-level):
 - Requires CMake 3.20+, C++17.
-- Tries system LLVM/Clang 18 first; falls back to `extern/llvm-project` submodule.
+- Iterates `GIGA_DRILL_SUPPORTED_LLVM_VERSIONS` (currently `20 18`, newest
+  first) via `find_package()`. To add a new version, append it to that list.
+- Falls back to `extern/llvm-project` submodule if no system package matches.
 - Disables RTTI (`-fno-rtti`) to match LLVM's default.
+- A lightweight compatibility header (`include/giga_drill/compat/ClangVersion.h`)
+  provides `GIGA_DRILL_LLVM_AT_LEAST(major)` for version-conditional code.
 
 `src/CMakeLists.txt`:
 - Builds `giga_drill_lib` from `mugann/*.cpp` and `lagann/*.cpp`.
@@ -116,8 +120,12 @@ To add a new subcommand, follow the pattern in `main.cpp`:
 ## Build and Test Commands
 
 ```bash
-# Configure (Release)
+# Configure (Release) — picks the newest supported LLVM automatically
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+# Configure against a specific LLVM version (e.g. 20)
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_PREFIX_PATH=/usr/lib/llvm-20
 
 # Configure (Debug — faster iteration)
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
@@ -252,6 +260,6 @@ only, not a namespace boundary.
 
 ## External Dependencies
 
-- **LLVM/Clang 18** — system package or git submodule at `extern/llvm-project`
+- **LLVM/Clang 18 or 20** — system package or git submodule at `extern/llvm-project`
 - **Catch2 v3.7.1** — fetched automatically by CMake during test configuration
 - No other runtime dependencies
