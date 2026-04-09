@@ -1,0 +1,44 @@
+{
+  "description": "Expected liveness classifications for the dead_code example project. Used by tests to validate the analyzer.",
+  "entry_points": ["main"],
+  "public_api": [],
+
+  "functions": {
+    "main":                         { "pessimistic": "alive",  "optimistic": "alive" },
+
+    "mathutil::sum":                { "pessimistic": "alive",  "optimistic": "alive" },
+    "mathutil::mean":               { "pessimistic": "dead",   "optimistic": "dead",  "note": "alive if marked public_api" },
+    "mathutil::normalize":          { "pessimistic": "alive",  "optimistic": "alive" },
+    "mathutil::obscure_transform":  { "pessimistic": "dead",   "optimistic": "dead" },
+
+    "Shape::~Shape":                { "pessimistic": "alive",  "optimistic": "alive" },
+    "Shape::debug_print":           { "pessimistic": "dead",   "optimistic": "alive", "note": "cascading: alive only if Square is alive, and Square is only optimistically alive" },
+    "Circle::area":                 { "pessimistic": "alive",  "optimistic": "alive" },
+    "Circle::name":                 { "pessimistic": "alive",  "optimistic": "alive" },
+    "Circle::debug_print":          { "pessimistic": "alive",  "optimistic": "alive" },
+    "Circle::circumference":        { "pessimistic": "alive",  "optimistic": "alive" },
+    "Triangle::area":               { "pessimistic": "alive",  "optimistic": "alive" },
+    "Triangle::name":               { "pessimistic": "alive",  "optimistic": "alive" },
+    "Triangle::debug_print":        { "pessimistic": "alive",  "optimistic": "alive" },
+    "Triangle::hypotenuse":         { "pessimistic": "dead",   "optimistic": "dead" },
+    "Square::area":                 { "pessimistic": "dead",   "optimistic": "alive", "note": "factory can construct, but no proven dispatch path" },
+    "Square::name":                 { "pessimistic": "dead",   "optimistic": "alive" },
+    "Hexagon::area":                { "pessimistic": "dead",   "optimistic": "dead" },
+    "Hexagon::name":                { "pessimistic": "dead",   "optimistic": "dead" },
+    "Hexagon::debug_print":         { "pessimistic": "dead",   "optimistic": "dead" },
+    "print_shape_info":             { "pessimistic": "alive",  "optimistic": "alive" },
+    "make_shape":                   { "pessimistic": "alive",  "optimistic": "alive" },
+
+    "double_it":                    { "pessimistic": "alive",  "optimistic": "alive" },
+    "triple_it":                    { "pessimistic": "alive",  "optimistic": "alive" },
+    "negate_it":                    { "pessimistic": "dead",   "optimistic": "alive", "note": "address taken, never called through" },
+    "square_it":                    { "pessimistic": "dead",   "optimistic": "dead" },
+    "apply_once":                   { "pessimistic": "alive",  "optimistic": "alive" },
+    "apply_chain":                  { "pessimistic": "dead",   "optimistic": "dead" },
+    "select_transform":             { "pessimistic": "alive",  "optimistic": "alive" },
+
+    "internal::accumulate_helper":  { "pessimistic": "alive",  "optimistic": "alive" },
+    "internal::old_normalize":      { "pessimistic": "dead",   "optimistic": "dead" },
+    "internal::log_value":          { "pessimistic": "dead",   "optimistic": "dead" }
+  }
+}
