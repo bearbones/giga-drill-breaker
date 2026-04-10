@@ -11,6 +11,7 @@ add_executable(giga_drill_tests
   test_adl_ctad.cpp
   test_coverage_diag.cpp
   test_dead_code.cpp
+  test_control_flow.cpp
 )
 
 target_link_libraries(giga_drill_tests PRIVATE
