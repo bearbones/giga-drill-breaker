@@ -1,4 +1,6 @@
 #include "giga_drill/mugann/Analyzer.h"
+#include "giga_drill/mugann/DeadCodeAnalyzer.h"
+#include "giga_drill/callgraph/CallGraphBuilder.h"
 #include "giga_drill/lagann/TransformPipeline.h"
 
 #include "clang/Tooling/CompilationDatabase.h"
@@ -38,6 +40,17 @@ static llvm::cl::opt<bool>
     MugannCoverageDiag("coverage-diag",
                        llvm::cl::desc("Enable coverage instrumentation diagnostics"),
                        llvm::cl::sub(MugannCmd));
+
+static llvm::cl::opt<bool>
+    MugannDeadCode("dead-code",
+                   llvm::cl::desc("Enable dead code analysis via call graph"),
+                   llvm::cl::sub(MugannCmd));
+
+static llvm::cl::list<std::string>
+    MugannEntryPoints("entry-point",
+                      llvm::cl::desc("Entry point function names (default: main)"),
+                      llvm::cl::value_desc("name"),
+                      llvm::cl::sub(MugannCmd));
 
 // ---------------------------------------------------------------------------
 // lagann options
@@ -104,8 +117,27 @@ int main(int argc, const char **argv) {
     auto diagnostics =
         giga_drill::runAnalysis(*compDb, files, MugannCoverageDiag);
 
+    // Dead code analysis.
+    if (MugannDeadCode) {
+      auto graph = giga_drill::buildCallGraph(*compDb, files);
+
+      std::vector<std::string> entryPoints(MugannEntryPoints.begin(),
+                                           MugannEntryPoints.end());
+      if (entryPoints.empty())
+        entryPoints.push_back("main");
+
+      giga_drill::DeadCodeAnalyzer analyzer(graph, entryPoints);
+      analyzer.analyzePessimistic();
+      analyzer.analyzeOptimistic();
+
+      auto deadDiags = analyzer.getDiagnostics();
+      for (const auto &diag : deadDiags) {
+        diagnostics.push_back(diag);
+      }
+    }
+
     if (diagnostics.empty()) {
-      llvm::outs() << "mugann: no fragile ADL/CTAD resolutions found.\n";
+      llvm::outs() << "mugann: no issues found.\n";
       return 0;
     }
 

@@ -2,8 +2,11 @@ add_library(giga_drill_lib
   mugann/GlobalIndex.cpp
   mugann/Indexer.cpp
   mugann/Analyzer.cpp
+  mugann/DeadCodeAnalyzer.cpp
   lagann/MatcherEngine.cpp
   lagann/TransformPipeline.cpp
+  callgraph/CallGraph.cpp
+  callgraph/CallGraphBuilder.cpp
 )
 
 target_include_directories(giga_drill_lib PUBLIC

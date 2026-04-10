@@ -61,6 +61,8 @@ struct Diagnostic {
     Coverage_DiscardableODR,      // method has GVA_DiscardableODR (COMDAT risk)
     Coverage_AvailableExternally, // method may be discarded by optimizer
     Coverage_PropertyDivergence,  // siblings diverge on complexity/properties
+    DeadCode_Pessimistic,         // function unreachable via proven paths
+    DeadCode_Optimistic,          // function reachable only via plausible paths
   };
   Kind kind;
   std::string callLocation;  // file:line:col of the call site
