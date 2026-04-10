@@ -1,6 +1,8 @@
 #include "giga_drill/mugann/Analyzer.h"
 #include "giga_drill/mugann/DeadCodeAnalyzer.h"
 #include "giga_drill/callgraph/CallGraphBuilder.h"
+#include "giga_drill/callgraph/ControlFlowIndex.h"
+#include "giga_drill/callgraph/ControlFlowOracle.h"
 #include "giga_drill/lagann/TransformPipeline.h"
 
 #include "clang/Tooling/CompilationDatabase.h"
@@ -18,6 +20,10 @@ static llvm::cl::SubCommand
 static llvm::cl::SubCommand
     LagannCmd("lagann",
               "Apply AST-based source transformations");
+
+static llvm::cl::SubCommand
+    CfqueryCmd("cfquery",
+               "Query control flow and exception handling context");
 
 // ---------------------------------------------------------------------------
 // mugann options
@@ -81,6 +87,94 @@ static llvm::cl::opt<bool>
                  llvm::cl::sub(LagannCmd));
 
 // ---------------------------------------------------------------------------
+// cfquery options
+// ---------------------------------------------------------------------------
+
+static llvm::cl::opt<std::string>
+    CfqueryBuildPath("build-path",
+                     llvm::cl::desc("Directory containing compile_commands.json"),
+                     llvm::cl::value_desc("dir"),
+                     llvm::cl::sub(CfqueryCmd));
+
+static llvm::cl::list<std::string>
+    CfquerySourceFiles("source",
+                       llvm::cl::desc("Source files to analyze"),
+                       llvm::cl::value_desc("file"),
+                       llvm::cl::OneOrMore,
+                       llvm::cl::sub(CfqueryCmd));
+
+static llvm::cl::list<std::string>
+    CfqueryEntryPoints("entry-point",
+                       llvm::cl::desc("Entry point function names (default: main)"),
+                       llvm::cl::value_desc("name"),
+                       llvm::cl::sub(CfqueryCmd));
+
+enum CfqueryMode { CfqueryDump, CfqueryQuery };
+static llvm::cl::opt<CfqueryMode>
+    CfqueryModeOpt("mode",
+                   llvm::cl::desc("Output mode"),
+                   llvm::cl::values(
+                       clEnumValN(CfqueryDump, "dump",
+                                  "Dump full control flow index as JSON"),
+                       clEnumValN(CfqueryQuery, "query",
+                                  "Run a targeted query")),
+                   llvm::cl::init(CfqueryDump),
+                   llvm::cl::sub(CfqueryCmd));
+
+enum CfqueryType {
+  CfqExceptionProtection,
+  CfqCallSiteContext,
+  CfqAllPathContexts,
+  CfqThrowPropagation,
+  CfqNearestCatches
+};
+static llvm::cl::opt<CfqueryType>
+    CfqueryQueryType("query-type",
+                     llvm::cl::desc("Type of query to run (requires --mode query)"),
+                     llvm::cl::values(
+                         clEnumValN(CfqExceptionProtection,
+                                    "exception-protection",
+                                    "Is function always/sometimes/never under try/catch?"),
+                         clEnumValN(CfqCallSiteContext,
+                                    "call-site-context",
+                                    "Exception context at a specific call site"),
+                         clEnumValN(CfqAllPathContexts,
+                                    "all-path-contexts",
+                                    "All paths to function with exception context"),
+                         clEnumValN(CfqThrowPropagation,
+                                    "throw-propagation",
+                                    "Is a thrown exception caught before unwinding?"),
+                         clEnumValN(CfqNearestCatches,
+                                    "nearest-catches",
+                                    "Nearest try/catch on each path to function")),
+                     llvm::cl::init(CfqExceptionProtection),
+                     llvm::cl::sub(CfqueryCmd));
+
+static llvm::cl::opt<std::string>
+    CfqueryFunction("function",
+                    llvm::cl::desc("Target function (qualified name)"),
+                    llvm::cl::value_desc("name"),
+                    llvm::cl::sub(CfqueryCmd));
+
+static llvm::cl::opt<std::string>
+    CfqueryCallSite("call-site",
+                    llvm::cl::desc("Call site location (file:line:col)"),
+                    llvm::cl::value_desc("location"),
+                    llvm::cl::sub(CfqueryCmd));
+
+static llvm::cl::opt<std::string>
+    CfqueryExceptionType("exception-type",
+                         llvm::cl::desc("Exception type for protection queries"),
+                         llvm::cl::value_desc("type"),
+                         llvm::cl::sub(CfqueryCmd));
+
+static llvm::cl::opt<unsigned>
+    CfqueryMaxPaths("max-paths",
+                    llvm::cl::desc("Maximum number of paths to enumerate (default: 100)"),
+                    llvm::cl::init(100),
+                    llvm::cl::sub(CfqueryCmd));
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -90,7 +184,8 @@ int main(int argc, const char **argv) {
       "giga-drill-breaker: AST-based C++ analysis and transformation tool\n"
       "\nSubcommands:\n"
       "  mugann   Detect fragile ADL/CTAD resolution across translation units\n"
-      "  lagann   Apply rule-driven AST matcher transformations\n");
+      "  lagann   Apply rule-driven AST matcher transformations\n"
+      "  cfquery  Query control flow and exception handling context\n");
 
   // ---- mugann ---------------------------------------------------------------
   if (MugannCmd) {
@@ -176,7 +271,159 @@ int main(int argc, const char **argv) {
     return pipeline.execute(LagannBuildPath, files, LagannDryRun);
   }
 
-  llvm::errs() << "No subcommand specified. Use 'mugann' or 'lagann'.\n"
+  // ---- cfquery --------------------------------------------------------------
+  if (CfqueryCmd) {
+    if (CfqueryBuildPath.empty()) {
+      llvm::errs() << "cfquery: --build-path is required\n";
+      return 1;
+    }
+    if (CfquerySourceFiles.empty()) {
+      llvm::errs() << "cfquery: at least one --source file is required\n";
+      return 1;
+    }
+
+    std::string dbError;
+    auto compDb = clang::tooling::CompilationDatabase::loadFromDirectory(
+        CfqueryBuildPath, dbError);
+    if (!compDb) {
+      llvm::errs() << "cfquery: error loading compilation database from "
+                   << CfqueryBuildPath << ": " << dbError << "\n";
+      return 1;
+    }
+
+    std::vector<std::string> files(CfquerySourceFiles.begin(),
+                                   CfquerySourceFiles.end());
+
+    // Phase 1+2: Build call graph.
+    auto graph = giga_drill::buildCallGraph(*compDb, files);
+
+    // Phase 3: Build control flow index.
+    auto cfIndex = giga_drill::buildControlFlowIndex(*compDb, files, graph);
+
+    // Dump mode: serialize the full index as JSON.
+    if (CfqueryModeOpt == CfqueryDump) {
+      llvm::outs() << giga_drill::ControlFlowOracle::dumpIndexToJson(cfIndex);
+      return 0;
+    }
+
+    // Query mode: run a specific query.
+    giga_drill::ControlFlowOracle oracle(graph, cfIndex);
+
+    std::vector<std::string> entryPoints(CfqueryEntryPoints.begin(),
+                                         CfqueryEntryPoints.end());
+    if (entryPoints.empty())
+      entryPoints.push_back("main");
+
+    switch (CfqueryQueryType) {
+    case CfqCallSiteContext: {
+      if (CfqueryCallSite.empty()) {
+        llvm::errs() << "cfquery: --call-site is required for "
+                        "call-site-context query\n";
+        return 1;
+      }
+      auto info = oracle.queryCallSite(CfqueryCallSite);
+      // Simple JSON output for call site info.
+      llvm::outs() << "{\n"
+                   << "  \"callSite\": \"" << info.callSite << "\",\n"
+                   << "  \"caller\": \"" << info.caller << "\",\n"
+                   << "  \"callee\": \"" << info.callee << "\",\n"
+                   << "  \"isUnderTryCatch\": "
+                   << (info.isUnderTryCatch ? "true" : "false") << ",\n"
+                   << "  \"wouldTerminateIfThrows\": "
+                   << (info.wouldTerminateIfThrows ? "true" : "false") << ",\n"
+                   << "  \"enclosingScopeCount\": "
+                   << info.enclosingScopes.size() << ",\n"
+                   << "  \"enclosingGuardCount\": "
+                   << info.enclosingGuards.size() << "\n"
+                   << "}\n";
+      return 0;
+    }
+
+    case CfqExceptionProtection: {
+      if (CfqueryFunction.empty()) {
+        llvm::errs() << "cfquery: --function is required for "
+                        "exception-protection query\n";
+        return 1;
+      }
+      auto result = oracle.queryExceptionProtection(
+          CfqueryFunction, CfqueryExceptionType, entryPoints);
+      llvm::outs() << giga_drill::ControlFlowOracle::toJson(
+          result, "exception-protection", CfqueryFunction,
+          CfqueryExceptionType);
+      return 0;
+    }
+
+    case CfqAllPathContexts: {
+      if (CfqueryFunction.empty()) {
+        llvm::errs() << "cfquery: --function is required for "
+                        "all-path-contexts query\n";
+        return 1;
+      }
+      auto result = oracle.queryExceptionProtection(
+          CfqueryFunction, CfqueryExceptionType, entryPoints);
+      llvm::outs() << giga_drill::ControlFlowOracle::toJson(
+          result, "all-path-contexts", CfqueryFunction,
+          CfqueryExceptionType);
+      return 0;
+    }
+
+    case CfqThrowPropagation: {
+      if (CfqueryFunction.empty()) {
+        llvm::errs() << "cfquery: --function is required for "
+                        "throw-propagation query\n";
+        return 1;
+      }
+      auto result = oracle.queryThrowPropagation(
+          CfqueryFunction, CfqueryExceptionType, entryPoints);
+      llvm::outs() << giga_drill::ControlFlowOracle::toJson(
+          result, "throw-propagation", CfqueryFunction,
+          CfqueryExceptionType);
+      return 0;
+    }
+
+    case CfqNearestCatches: {
+      if (CfqueryFunction.empty()) {
+        llvm::errs() << "cfquery: --function is required for "
+                        "nearest-catches query\n";
+        return 1;
+      }
+      auto catches = oracle.queryNearestCatches(CfqueryFunction);
+      llvm::outs() << "{\n"
+                   << "  \"query\": \"nearest-catches\",\n"
+                   << "  \"function\": \"" << CfqueryFunction.getValue()
+                   << "\",\n"
+                   << "  \"results\": [\n";
+      for (size_t i = 0; i < catches.size(); ++i) {
+        const auto &c = catches[i];
+        llvm::outs() << "    {\n"
+                     << "      \"framesFromTarget\": " << c.framesFromTarget
+                     << ",\n"
+                     << "      \"tryLocation\": \""
+                     << c.scope.tryLocation << "\",\n"
+                     << "      \"enclosingFunction\": \""
+                     << c.scope.enclosingFunction << "\",\n"
+                     << "      \"pathSegment\": [";
+        for (size_t j = 0; j < c.pathSegment.size(); ++j) {
+          llvm::outs() << "\"" << c.pathSegment[j] << "\"";
+          if (j + 1 < c.pathSegment.size())
+            llvm::outs() << ", ";
+        }
+        llvm::outs() << "]\n"
+                     << "    }";
+        if (i + 1 < catches.size())
+          llvm::outs() << ",";
+        llvm::outs() << "\n";
+      }
+      llvm::outs() << "  ]\n}\n";
+      return 0;
+    }
+    }
+
+    return 0;
+  }
+
+  llvm::errs() << "No subcommand specified. Use 'mugann', 'lagann', or "
+                  "'cfquery'.\n"
                << "Run with --help for usage information.\n";
   return 1;
 }
