@@ -2,6 +2,7 @@
 
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace giga_drill {
@@ -52,12 +53,61 @@ struct CoveragePropertyEntry {
   std::string signature;        // e.g. "int MyClass::getValue() const"
 };
 
+// Type relation index: the conservative convertibility model consulted by
+// the analyzer's overload scorer. Populated during phase 1 indexing from
+// CXXRecordDecl bases, non-explicit converting constructors, and non-explicit
+// conversion operators. Keys and values are normalized through
+// `normalizeTypeForMatching` so lookup is spelling-insensitive.
+//
+// Scope and limitations (the scorer documents these again at its call site):
+//  - single-hop only: we do not chain A -> B -> C
+//  - string-based type identity (no ODR / typedef transparency beyond what
+//    the indexer canonicalizes before inserting)
+//  - no template deduction
+//  - explicit ctors and conversion operators are filtered out by the indexer
+//
+// This structure is intentionally coarser than Clang Sema. It exists to
+// drop candidates that clearly cannot apply and to license candidates that
+// are viable via a standard conversion path the analyzer would otherwise
+// miss — nothing more.
+struct TypeRelationIndex {
+  // Normalized derived className -> list of direct base class names.
+  std::unordered_map<std::string, std::vector<std::string>> bases;
+
+  // Normalized target type -> list of source types accepted by a non-explicit
+  // single-argument converting constructor of that target.
+  std::unordered_map<std::string, std::vector<std::string>> ctorEdges;
+
+  // Normalized source type -> list of target types reachable via a non-explicit
+  // conversion operator on the source.
+  std::unordered_map<std::string, std::vector<std::string>> convOpEdges;
+
+  void addBase(std::string derived, std::string base);
+  void addCtorEdge(std::string toType, std::string fromType);
+  void addConvOpEdge(std::string fromType, std::string toType);
+
+  // Transitive base-class check (cycle-safe). Returns true when
+  // `derived == maybeBase` or when `maybeBase` appears anywhere on the
+  // chain of base classes reachable from `derived`.
+  bool isBaseOrSelf(const std::string &derived,
+                    const std::string &maybeBase) const;
+
+  // Conservative single-hop convertibility check used by the analyzer. The
+  // rules (in order): identity after normalization, both arithmetic builtins,
+  // pointer/reference-stripped derived-to-base, a converting constructor
+  // edge, a conversion-operator edge. Returns false otherwise.
+  bool isConvertible(const std::string &from, const std::string &to) const;
+};
+
 // A diagnostic emitted when analysis finds an issue.
 struct Diagnostic {
   enum Kind {
     ADL_Fallback,
     ADL_Ambiguity,                // including the missing header would make
                                   // this call an ambiguous overload resolution
+    ADL_SameScore,                // an invisible overload ties the resolved
+                                  // one on every argument position — inclusion
+                                  // order silently decides which wins
     CTAD_Fallback,
     Coverage_GVAMismatch,         // siblings have different GVA linkage
     Coverage_DiscardableODR,      // method has GVA_DiscardableODR (COMDAT risk)
@@ -96,6 +146,10 @@ public:
 
   std::vector<std::string> allIndexedClasses() const;
 
+  // Type relation index — populated by the indexer, queried by the analyzer.
+  const TypeRelationIndex &typeRelations() const { return types_; }
+  TypeRelationIndex &mutableTypeRelations() { return types_; }
+
   // Total counts for testing/debugging.
   size_t overloadCount() const;
   size_t guideCount() const;
@@ -106,6 +160,7 @@ private:
   std::unordered_map<std::string, std::vector<DeductionGuideEntry>> guides_;
   std::unordered_map<std::string, std::vector<CoveragePropertyEntry>>
       coverageProps_;
+  TypeRelationIndex types_;
 };
 
 } // namespace giga_drill

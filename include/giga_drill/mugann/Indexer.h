@@ -20,6 +20,9 @@ public:
   bool VisitFunctionDecl(clang::FunctionDecl *decl);
   bool VisitCXXDeductionGuideDecl(clang::CXXDeductionGuideDecl *decl);
   bool VisitCXXMethodDecl(clang::CXXMethodDecl *decl);
+  bool VisitCXXRecordDecl(clang::CXXRecordDecl *decl);
+  bool VisitCXXConstructorDecl(clang::CXXConstructorDecl *decl);
+  bool VisitCXXConversionDecl(clang::CXXConversionDecl *decl);
 
   void setASTContext(clang::ASTContext *ctx);
 
