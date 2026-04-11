@@ -11,7 +11,183 @@
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Tooling/CompilationDatabase.h"
 
+#include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSwitch.h"
+
+#include <cctype>
+
 namespace giga_drill {
+
+namespace {
+
+// ---- Overload-resolution heuristics ---------------------------------------
+//
+// The GlobalIndex stores parameter types as strings produced by
+// QualType::getAsString(). We don't have the original QualTypes for invisible
+// overloads, so we can't ask Clang's Sema to rank them against a call. These
+// helpers implement a conservative string-based model good enough to (a)
+// suppress the math-library false positives where unrelated overloads share
+// the same operator name and arity, and (b) recognize when a call would
+// become ambiguous if an invisible overload were brought into the TU.
+
+// Strip whitespace, const/volatile keywords, and trailing references so
+// that e.g. "const MathLib::Vector &" and "MathLib::Vector" compare equal.
+// Interior whitespace is removed so "long long int" stays internally
+// consistent regardless of how getAsString formatted it.
+static std::string normalizeTypeForMatching(llvm::StringRef in) {
+  std::string s = in.str();
+
+  auto isIdent = [](char c) {
+    return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
+  };
+
+  auto stripKeyword = [&](llvm::StringRef kw) {
+    size_t pos = 0;
+    while ((pos = s.find(kw.str(), pos)) != std::string::npos) {
+      bool boundaryLeft = (pos == 0) || !isIdent(s[pos - 1]);
+      bool boundaryRight =
+          (pos + kw.size() == s.size()) || !isIdent(s[pos + kw.size()]);
+      if (boundaryLeft && boundaryRight) {
+        s.erase(pos, kw.size());
+      } else {
+        pos += kw.size();
+      }
+    }
+  };
+
+  stripKeyword("const");
+  stripKeyword("volatile");
+
+  // Strip trailing reference markers.
+  while (!s.empty() && s.back() == '&')
+    s.pop_back();
+
+  // Strip all whitespace so spacing variations don't matter.
+  std::string out;
+  out.reserve(s.size());
+  for (char c : s) {
+    if (c != ' ' && c != '\t' && c != '\n' && c != '\r')
+      out.push_back(c);
+  }
+  return out;
+}
+
+// The fixed set of builtin arithmetic type names. Any normalized type name
+// in this set is assumed to be implicitly convertible to every other name in
+// the set, matching the behaviour of C++ standard conversions. This is what
+// lets the analyzer recognize that e.g. `int` and `double` are mutually
+// viable when deciding whether an alternative overload could apply.
+static bool isArithmeticTypeName(const std::string &normalized) {
+  return llvm::StringSwitch<bool>(normalized)
+      .Case("bool", true)
+      .Case("char", true)
+      .Case("signedchar", true)
+      .Case("unsignedchar", true)
+      .Case("wchar_t", true)
+      .Case("char8_t", true)
+      .Case("char16_t", true)
+      .Case("char32_t", true)
+      .Case("short", true)
+      .Case("shortint", true)
+      .Case("unsignedshort", true)
+      .Case("unsignedshortint", true)
+      .Case("int", true)
+      .Case("unsigned", true)
+      .Case("unsignedint", true)
+      .Case("long", true)
+      .Case("longint", true)
+      .Case("unsignedlong", true)
+      .Case("unsignedlongint", true)
+      .Case("longlong", true)
+      .Case("longlongint", true)
+      .Case("unsignedlonglong", true)
+      .Case("unsignedlonglongint", true)
+      .Case("float", true)
+      .Case("double", true)
+      .Case("longdouble", true)
+      .Default(false);
+}
+
+// Per-position exactness score: 2 for an exact (normalized) match, 1 for a
+// non-exact but possibly-convertible match. We never emit 0 — non-viable
+// overloads are filtered earlier by isPlausiblyViable.
+static int scoreParamMatch(const std::string &argTypeNormalized,
+                            const std::string &paramTypeNormalized) {
+  return argTypeNormalized == paramTypeNormalized ? 2 : 1;
+}
+
+// Is the candidate overload something the compiler could even consider for
+// this call? We can't run Sema, so approximate: for every argument position,
+// the candidate's parameter must be (a) exactly the arg type, (b) exactly
+// the resolved overload's parameter (we know that one compiled, so whatever
+// conversion the resolved path uses is also available to the candidate), or
+// (c) both the candidate's parameter and the argument are builtin
+// arithmetic types, in which case a standard conversion exists.
+static bool isPlausiblyViable(
+    const std::vector<std::string> &argTypes,
+    const std::vector<std::string> &resolvedParamTypes,
+    const std::vector<std::string> &candidateParamTypes) {
+  if (candidateParamTypes.size() != argTypes.size() ||
+      resolvedParamTypes.size() != argTypes.size())
+    return false;
+  for (size_t i = 0; i < argTypes.size(); ++i) {
+    const std::string &arg = argTypes[i];
+    const std::string &cand = candidateParamTypes[i];
+    const std::string &res = resolvedParamTypes[i];
+    if (cand == arg)
+      continue;
+    if (cand == res)
+      continue;
+    if (isArithmeticTypeName(cand) && isArithmeticTypeName(arg))
+      continue;
+    return false;
+  }
+  return true;
+}
+
+// Score a whole parameter list against the call's argument types.
+static std::vector<int>
+scoreOverload(const std::vector<std::string> &argTypes,
+              const std::vector<std::string> &paramTypes) {
+  std::vector<int> out;
+  out.reserve(argTypes.size());
+  for (size_t i = 0; i < argTypes.size(); ++i)
+    out.push_back(scoreParamMatch(argTypes[i], paramTypes[i]));
+  return out;
+}
+
+// Compare two per-position score vectors and set flags describing the
+// relationship:
+//   candidateBetter = exists i where candidate[i] > resolved[i]
+//   resolvedBetter  = exists i where resolved[i]  > candidate[i]
+// The combination (candidateBetter, resolvedBetter) classifies the pair:
+//   (true,  false) → candidate Pareto-dominates   → ADL_Fallback
+//   (true,  true ) → incomparable (tied-on-some)  → ADL_Ambiguity
+//   (false, *    ) → candidate no better anywhere → no diagnostic
+static void compareScores(const std::vector<int> &resolvedScores,
+                          const std::vector<int> &candidateScores,
+                          bool &candidateBetter, bool &resolvedBetter) {
+  candidateBetter = false;
+  resolvedBetter = false;
+  for (size_t i = 0; i < resolvedScores.size(); ++i) {
+    if (candidateScores[i] > resolvedScores[i])
+      candidateBetter = true;
+    else if (resolvedScores[i] > candidateScores[i])
+      resolvedBetter = true;
+  }
+}
+
+// Normalize a whole parameter list in place.
+static std::vector<std::string>
+normalizeAll(const std::vector<std::string> &raw) {
+  std::vector<std::string> out;
+  out.reserve(raw.size());
+  for (const auto &s : raw)
+    out.push_back(normalizeTypeForMatching(s));
+  return out;
+}
+
+} // namespace
 
 // --- AnalyzerVisitor ---
 
@@ -65,10 +241,39 @@ bool AnalyzerVisitor::VisitCallExpr(clang::CallExpr *expr) {
     resolvedParamTypes.push_back(
         callee->getParamDecl(i)->getType().getAsString());
 
+  // Build the call-site's actual argument types. IgnoreImpCasts strips
+  // implicit conversions the compiler inserted to satisfy the resolved
+  // overload — we want the type the user wrote so that we can compare it
+  // fairly against candidate overloads.
+  std::vector<std::string> argTypes;
+  argTypes.reserve(expr->getNumArgs());
+  for (unsigned i = 0; i < expr->getNumArgs(); ++i)
+    argTypes.push_back(
+        expr->getArg(i)->IgnoreImpCasts()->getType().getAsString());
+
+  // Normalized copies for string-based matching.
+  auto argTypesN = normalizeAll(argTypes);
+  auto resolvedParamTypesN = normalizeAll(resolvedParamTypes);
+
+  auto resolvedScores = scoreOverload(argTypesN, resolvedParamTypesN);
+
+  auto buildSig = [](const std::string &qname,
+                     const std::vector<std::string> &params) {
+    std::string sig = qname + "(";
+    for (size_t i = 0; i < params.size(); ++i) {
+      if (i > 0)
+        sig += ", ";
+      sig += params[i];
+    }
+    sig += ")";
+    return sig;
+  };
+  std::string resolvedSig = buildSig(qualifiedName, resolvedParamTypes);
+
   for (const auto *entry : overloads) {
-    // Skip overloads that match the resolved callee's signature
-    // (same parameter types). These are the "same" overload even if
-    // declared in a different file.
+    // Skip overloads that match the resolved callee's signature (same
+    // parameter types). These are the "same" overload even if declared in a
+    // different file.
     if (entry->paramTypes == resolvedParamTypes)
       continue;
 
@@ -76,44 +281,55 @@ bool AnalyzerVisitor::VisitCallExpr(clang::CallExpr *expr) {
     if (isFileIncluded(entry->headerPath))
       continue;
 
-    // This overload exists but is invisible. Check if it could be a
-    // better match by looking at argument types.
-    // For now, flag any invisible overload with the same arity as
-    // suspicious — a more sophisticated analysis would do overload
-    // resolution ranking.
+    // Arity mismatch → cannot apply to this call.
     if (entry->paramTypes.size() !=
         static_cast<size_t>(expr->getNumArgs()))
       continue;
 
-    // Build a human-readable signature for the invisible overload.
-    std::string betterSig = entry->qualifiedName + "(";
-    for (size_t i = 0; i < entry->paramTypes.size(); ++i) {
-      if (i > 0)
-        betterSig += ", ";
-      betterSig += entry->paramTypes[i];
-    }
-    betterSig += ")";
+    // Rank the candidate against the call's actual argument types. An
+    // invisible overload is only interesting if it would plausibly be
+    // viable for the call, and if at least one position scores better
+    // than the resolved overload; see the helpers above for the model.
+    auto candidateParamTypesN = normalizeAll(entry->paramTypes);
+    if (!isPlausiblyViable(argTypesN, resolvedParamTypesN,
+                           candidateParamTypesN))
+      continue;
 
-    // Build a signature for the resolved overload.
-    std::string resolvedSig = qualifiedName + "(";
-    for (unsigned i = 0; i < callee->getNumParams(); ++i) {
-      if (i > 0)
-        resolvedSig += ", ";
-      resolvedSig += callee->getParamDecl(i)->getType().getAsString();
-    }
-    resolvedSig += ")";
+    auto candidateScores = scoreOverload(argTypesN, candidateParamTypesN);
+    bool candidateBetter = false, resolvedBetter = false;
+    compareScores(resolvedScores, candidateScores, candidateBetter,
+                  resolvedBetter);
+
+    if (!candidateBetter)
+      continue; // candidate is equal or strictly worse — nothing to say
+
+    std::string candidateSig = buildSig(entry->qualifiedName, entry->paramTypes);
 
     Diagnostic diag;
-    diag.kind = Diagnostic::ADL_Fallback;
     diag.callLocation = formatLocation(expr->getBeginLoc());
     diag.resolvedDecl = resolvedSig;
-    diag.betterDecl = betterSig;
+    diag.betterDecl = candidateSig;
     diag.missingHeader = entry->headerPath;
-    diag.message = "Fragile ADL resolution: " + betterSig + " exists in " +
-                   entry->headerPath +
-                   " but is not visible here. The current call resolves to " +
-                   resolvedSig + ". Include " + entry->headerPath +
-                   " or explicitly qualify the call.";
+
+    if (!resolvedBetter) {
+      // Candidate Pareto-dominates resolved → fragile fallback.
+      diag.kind = Diagnostic::ADL_Fallback;
+      diag.message =
+          "Fragile ADL resolution: " + candidateSig + " exists in " +
+          entry->headerPath +
+          " but is not visible here. The current call resolves to " +
+          resolvedSig + ". Include " + entry->headerPath +
+          " or explicitly qualify the call.";
+    } else {
+      // Each overload wins at some position → including the candidate's
+      // header would make this call ambiguous.
+      diag.kind = Diagnostic::ADL_Ambiguity;
+      diag.message =
+          "Potential ADL ambiguity: " + candidateSig + " exists in " +
+          entry->headerPath +
+          " but is not visible here. Including it would make the call to " +
+          resolvedSig + " an ambiguous overload resolution.";
+    }
 
     diagnostics_.push_back(std::move(diag));
   }
