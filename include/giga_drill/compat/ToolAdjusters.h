@@ -91,8 +91,7 @@ inline clang::tooling::ArgumentsAdjuster getResourceDirAdjuster() {
         return args;
 #ifdef GIGA_DRILL_CLANG_RESOURCE_DIR
     auto result = args;
-    result.push_back("-resource-dir");
-    result.push_back(GIGA_DRILL_CLANG_RESOURCE_DIR);
+    result.push_back("-resource-dir=" GIGA_DRILL_CLANG_RESOURCE_DIR);
     return result;
 #else
     return args;
