@@ -259,6 +259,158 @@ TEST_CASE("Analyzer ignores explicitly qualified calls",
   CHECK(diagnostics.empty());
 }
 
+TEST_CASE(
+    "Analyzer does not warn when resolved operator overload is most specific",
+    "[Analyzer][ADL][operator]") {
+  // Reproduces the math-library false positive: the call is
+  // float * Vector3 and the resolved operator*(float, const Vector3&) is the
+  // most specific overload in the index. Unrelated overloads for Vector3D /
+  // Matrix3 / double should not produce any warnings.
+  GlobalIndex index;
+  index.addFunctionOverload(
+      {"MathLib::operator*", "Core.hpp", {"float", "const Vector3 &"},
+       "Vector3", 10});
+  index.addFunctionOverload(
+      {"MathLib::operator*", "Precision.hpp",
+       {"double", "const Vector3D &"}, "Vector3D", 20});
+  index.addFunctionOverload(
+      {"MathLib::operator*", "Matrix.hpp",
+       {"const Matrix3 &", "const Matrix3 &"}, "Matrix3", 30});
+  index.addFunctionOverload(
+      {"MathLib::operator*", "Matrix.hpp",
+       {"const Matrix3 &", "const Vector3 &"}, "Vector3", 45});
+
+  std::string code = R"(
+    namespace MathLib {
+      struct Vector3 { float x, y, z; };
+      Vector3 operator*(float f, const Vector3 &v) {
+        return Vector3{v.x * f, v.y * f, v.z * f};
+      }
+    }
+    void test() {
+      float f = 2.0f;
+      MathLib::Vector3 v3;
+      auto result = f * v3;
+      (void)result;
+    }
+  )";
+
+  std::vector<Diagnostic> diagnostics;
+  auto action = std::make_unique<AnalyzerAction>(index, diagnostics);
+  REQUIRE(clang::tooling::runToolOnCodeWithArgs(
+      std::move(action), code, {"-std=c++17"}, "test_input.cpp"));
+
+  CHECK(diagnostics.empty());
+}
+
+TEST_CASE("Analyzer does not warn when call matches int overload exactly",
+          "[Analyzer][ADL]") {
+  // Narrowing-direction guard: the visible scale(Vector, int) is an exact
+  // match for scale(v, 42). The invisible scale(Vector, double) would be a
+  // worse match and should not be flagged.
+  GlobalIndex index;
+  index.addFunctionOverload(
+      {"MathLib::scale", "Core.hpp", {"Vector", "int"}, "void", 5});
+  index.addFunctionOverload(
+      {"MathLib::scale", "Extension.hpp", {"Vector", "double"}, "void", 3});
+
+  std::string code = R"(
+    namespace MathLib {
+      struct Vector {};
+      void scale(Vector, int) {}
+    }
+    void test() {
+      MathLib::Vector v;
+      scale(v, 42);
+    }
+  )";
+
+  std::vector<Diagnostic> diagnostics;
+  auto action = std::make_unique<AnalyzerAction>(index, diagnostics);
+  REQUIRE(clang::tooling::runToolOnCodeWithArgs(
+      std::move(action), code, {"-std=c++17"}, "test_input.cpp"));
+
+  CHECK(diagnostics.empty());
+}
+
+TEST_CASE(
+    "Analyzer warns about potential ambiguity between incomparable overloads",
+    "[Analyzer][ADL][ambiguity]") {
+  // pick(Vector, int, double) is visible; pick(Vector, double, int) is
+  // invisible. The call pick(v, 1, 2) with two int numeric arguments is
+  // unambiguous right now (only the first overload is visible) but
+  // including CoreB.hpp would make the resolution ambiguous: each overload
+  // wins on exactly one numeric parameter position. The Vector argument
+  // exists only to trigger ADL into the MathLib namespace.
+  GlobalIndex index;
+  index.addFunctionOverload(
+      {"MathLib::pick", "CoreA.hpp", {"Vector", "int", "double"}, "void", 5});
+  index.addFunctionOverload(
+      {"MathLib::pick", "CoreB.hpp", {"Vector", "double", "int"}, "void", 7});
+
+  std::string code = R"(
+    namespace MathLib {
+      struct Vector {};
+      void pick(Vector, int, double) {}
+    }
+    void test() {
+      MathLib::Vector v;
+      pick(v, 1, 2);
+    }
+  )";
+
+  std::vector<Diagnostic> diagnostics;
+  auto action = std::make_unique<AnalyzerAction>(index, diagnostics);
+  REQUIRE(clang::tooling::runToolOnCodeWithArgs(
+      std::move(action), code, {"-std=c++17"}, "test_input.cpp"));
+
+  REQUIRE(diagnostics.size() == 1);
+  CHECK(diagnostics[0].kind == Diagnostic::ADL_Ambiguity);
+  CHECK(diagnostics[0].missingHeader == "CoreB.hpp");
+  CHECK(diagnostics[0].message.find("ambiguous") != std::string::npos);
+}
+
+TEST_CASE("Analyzer does not warn about ambiguity for unrelated overloads",
+          "[Analyzer][ADL][ambiguity]") {
+  // Same unrelated operator* overloads as the "most specific" test, but
+  // this one asserts that the ambiguity branch also stays silent.
+  GlobalIndex index;
+  index.addFunctionOverload(
+      {"MathLib::operator*", "Core.hpp", {"float", "const Vector3 &"},
+       "Vector3", 10});
+  index.addFunctionOverload(
+      {"MathLib::operator*", "Precision.hpp",
+       {"double", "const Vector3D &"}, "Vector3D", 20});
+  index.addFunctionOverload(
+      {"MathLib::operator*", "Matrix.hpp",
+       {"const Matrix3 &", "const Matrix3 &"}, "Matrix3", 30});
+
+  std::string code = R"(
+    namespace MathLib {
+      struct Vector3 { float x, y, z; };
+      Vector3 operator*(float f, const Vector3 &v) {
+        return Vector3{v.x * f, v.y * f, v.z * f};
+      }
+    }
+    void test() {
+      float f = 2.0f;
+      MathLib::Vector3 v3;
+      auto result = f * v3;
+      (void)result;
+    }
+  )";
+
+  std::vector<Diagnostic> diagnostics;
+  auto action = std::make_unique<AnalyzerAction>(index, diagnostics);
+  REQUIRE(clang::tooling::runToolOnCodeWithArgs(
+      std::move(action), code, {"-std=c++17"}, "test_input.cpp"));
+
+  for (const auto &d : diagnostics) {
+    CHECK(d.kind != Diagnostic::ADL_Ambiguity);
+  }
+  CHECK(diagnostics.empty());
+}
+
 // ============================================================================
 // Analyzer integration tests — CTAD
 // ============================================================================

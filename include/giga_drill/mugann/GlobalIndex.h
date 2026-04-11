@@ -56,6 +56,8 @@ struct CoveragePropertyEntry {
 struct Diagnostic {
   enum Kind {
     ADL_Fallback,
+    ADL_Ambiguity,                // including the missing header would make
+                                  // this call an ambiguous overload resolution
     CTAD_Fallback,
     Coverage_GVAMismatch,         // siblings have different GVA linkage
     Coverage_DiscardableODR,      // method has GVA_DiscardableODR (COMDAT risk)
