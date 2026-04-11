@@ -1,6 +1,7 @@
 #include "giga_drill/mugann/Analyzer.h"
 #include "giga_drill/mugann/Indexer.h"
 #include "giga_drill/compat/ClangVersion.h"
+#include "giga_drill/compat/ToolAdjusters.h"
 
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/DeclCXX.h"
@@ -415,7 +416,7 @@ runAnalysis(const clang::tooling::CompilationDatabase &compDb,
   // Phase 1: Index all translation units.
   GlobalIndex index;
   {
-    clang::tooling::ClangTool tool(compDb, sourceFiles);
+    auto tool = giga_drill::makeClangTool(compDb, sourceFiles);
     IndexerActionFactory factory(index);
     tool.run(&factory);
   }
@@ -427,7 +428,7 @@ runAnalysis(const clang::tooling::CompilationDatabase &compDb,
 
   // Phase 2: Analyze each translation unit against the global index.
   {
-    clang::tooling::ClangTool tool(compDb, sourceFiles);
+    auto tool = giga_drill::makeClangTool(compDb, sourceFiles);
     AnalyzerActionFactory factory(index, diagnostics);
     tool.run(&factory);
   }

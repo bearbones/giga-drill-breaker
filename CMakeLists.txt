@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(giga-drill-breaker LANGUAGES CXX)
+project(giga-drill-breaker LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -8,7 +8,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # --- LLVM/Clang: prefer system packages, fall back to submodule ---
 # Supported LLVM versions, checked in order (newest first).
 # To add a new version, append it to this list.
-set(GIGA_DRILL_SUPPORTED_LLVM_VERSIONS 20 18)
+set(GIGA_DRILL_SUPPORTED_LLVM_VERSIONS 21 20 18)
 
 set(LLVM_SUBMODULE_DIR "${CMAKE_SOURCE_DIR}/extern/llvm-project/llvm")
 
@@ -92,5 +92,8 @@ endif()
 
 add_subdirectory(src)
 
-enable_testing()
-add_subdirectory(tests)
+option(GIGA_DRILL_BUILD_TESTS "Build tests (requires network for Catch2)" ON)
+if(GIGA_DRILL_BUILD_TESTS)
+  enable_testing()
+  add_subdirectory(tests)
+endif()

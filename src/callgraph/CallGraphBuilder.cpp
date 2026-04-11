@@ -1,4 +1,5 @@
 #include "giga_drill/callgraph/CallGraphBuilder.h"
+#include "giga_drill/compat/ToolAdjusters.h"
 
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/DeclCXX.h"
@@ -671,14 +672,14 @@ CallGraph buildCallGraph(const clang::tooling::CompilationDatabase &compDb,
 
   // Pass 1: Index all declarations and class hierarchy.
   {
-    clang::tooling::ClangTool tool(compDb, files);
+    auto tool = giga_drill::makeClangTool(compDb, files);
     IndexerOnlyFactory factory(graph);
     tool.run(&factory);
   }
 
   // Pass 2: Build edges with full knowledge.
   {
-    clang::tooling::ClangTool tool(compDb, files);
+    auto tool = giga_drill::makeClangTool(compDb, files);
     EdgeOnlyFactory factory(graph);
     tool.run(&factory);
   }

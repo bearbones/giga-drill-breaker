@@ -1,5 +1,6 @@
 #include "giga_drill/callgraph/ControlFlowIndex.h"
 #include "giga_drill/callgraph/CallGraph.h"
+#include "giga_drill/compat/ToolAdjusters.h"
 
 #include "clang/AST/ASTConsumer.h"
 #include "clang/AST/ASTContext.h"
@@ -404,7 +405,7 @@ buildControlFlowIndex(const clang::tooling::CompilationDatabase &compDb,
                       const std::vector<std::string> &files,
                       const CallGraph &graph) {
   ControlFlowIndex index;
-  clang::tooling::ClangTool tool(compDb, files);
+  auto tool = giga_drill::makeClangTool(compDb, files);
   ControlFlowContextFactory factory(index, graph);
   tool.run(&factory);
   return index;

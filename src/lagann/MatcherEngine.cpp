@@ -1,5 +1,6 @@
 #include "giga_drill/lagann/MatcherEngine.h"
 #include "giga_drill/compat/ClangVersion.h"
+#include "giga_drill/compat/ToolAdjusters.h"
 
 #include "clang/ASTMatchers/Dynamic/Diagnostics.h"
 #include "clang/ASTMatchers/Dynamic/Parser.h"
@@ -76,7 +77,7 @@ bool MatcherEngine::addRule(const TransformRule &rule, std::string &errorOut) {
 
 int MatcherEngine::run(const clang::tooling::CompilationDatabase &compDb,
                        const std::vector<std::string> &sourceFiles) {
-  clang::tooling::ClangTool tool(compDb, sourceFiles);
+  auto tool = giga_drill::makeClangTool(compDb, sourceFiles);
   return tool.run(
       clang::tooling::newFrontendActionFactory(&finder_).get());
 }
