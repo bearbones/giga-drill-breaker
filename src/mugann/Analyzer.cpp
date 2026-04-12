@@ -1,5 +1,6 @@
 #include "giga_drill/mugann/Analyzer.h"
 #include "giga_drill/mugann/Indexer.h"
+#include "giga_drill/mugann/TypeNormalize.h"
 #include "giga_drill/compat/ClangVersion.h"
 
 #include "clang/AST/ASTContext.h"
@@ -27,56 +28,27 @@ namespace {
 // overloads, so we can't ask Clang's Sema to rank them against a call. These
 // helpers implement a conservative string-based model good enough to (a)
 // suppress the math-library false positives where unrelated overloads share
-// the same operator name and arity, and (b) recognize when a call would
-// become ambiguous if an invisible overload were brought into the TU.
+// the same operator name and arity, (b) recognize when a call would become
+// ambiguous if an invisible overload were brought into the TU, and (c)
+// optionally consult the GlobalIndex's TypeRelationIndex to accept
+// candidates that would only be viable via an inheritance, user-defined
+// conversion, or converting-constructor conversion.
+//
+// The string-based model is intentionally coarser than Clang Sema. Known
+// limitations — documented here so future changes don't silently widen the
+// gap:
+//   - No template argument deduction: function templates (and templated
+//     ctors/conversion ops) are skipped by the indexer.
+//   - Single-hop only: A -> B -> C is not chained.
+//   - Name-based class identity: no ODR, no canonical aliasing beyond what
+//     the indexer's getCanonicalType() pass gives us.
+//   - No overload partial ordering: tied candidates are flagged via
+//     ADL_SameScore (opt-in) rather than ranked against each other.
 
-// Strip whitespace, const/volatile keywords, and trailing references so
-// that e.g. "const MathLib::Vector &" and "MathLib::Vector" compare equal.
-// Interior whitespace is removed so "long long int" stays internally
-// consistent regardless of how getAsString formatted it.
-static std::string normalizeTypeForMatching(llvm::StringRef in) {
-  std::string s = in.str();
-
-  auto isIdent = [](char c) {
-    return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
-  };
-
-  auto stripKeyword = [&](llvm::StringRef kw) {
-    size_t pos = 0;
-    while ((pos = s.find(kw.str(), pos)) != std::string::npos) {
-      bool boundaryLeft = (pos == 0) || !isIdent(s[pos - 1]);
-      bool boundaryRight =
-          (pos + kw.size() == s.size()) || !isIdent(s[pos + kw.size()]);
-      if (boundaryLeft && boundaryRight) {
-        s.erase(pos, kw.size());
-      } else {
-        pos += kw.size();
-      }
-    }
-  };
-
-  stripKeyword("const");
-  stripKeyword("volatile");
-
-  // Strip trailing reference markers.
-  while (!s.empty() && s.back() == '&')
-    s.pop_back();
-
-  // Strip all whitespace so spacing variations don't matter.
-  std::string out;
-  out.reserve(s.size());
-  for (char c : s) {
-    if (c != ' ' && c != '\t' && c != '\n' && c != '\r')
-      out.push_back(c);
-  }
-  return out;
-}
-
-// The fixed set of builtin arithmetic type names. Any normalized type name
-// in this set is assumed to be implicitly convertible to every other name in
-// the set, matching the behaviour of C++ standard conversions. This is what
-// lets the analyzer recognize that e.g. `int` and `double` are mutually
-// viable when deciding whether an alternative overload could apply.
+// The fixed set of builtin arithmetic type names. Kept local to the scorer
+// because the per-position score distinguishes exact-match and
+// arithmetic-convertible on the "builtin" fast path before the convertibility
+// model is consulted.
 static bool isArithmeticTypeName(const std::string &normalized) {
   return llvm::StringSwitch<bool>(normalized)
       .Case("bool", true)
@@ -108,51 +80,53 @@ static bool isArithmeticTypeName(const std::string &normalized) {
       .Default(false);
 }
 
-// Per-position exactness score: 2 for an exact (normalized) match, 1 for a
-// non-exact but possibly-convertible match. We never emit 0 — non-viable
-// overloads are filtered earlier by isPlausiblyViable.
-static int scoreParamMatch(const std::string &argTypeNormalized,
-                            const std::string &paramTypeNormalized) {
-  return argTypeNormalized == paramTypeNormalized ? 2 : 1;
+// Per-position score under either the legacy or the convertibility-model
+// scorer. Return values:
+//   2 — exact normalized match (strong preference)
+//   1 — convertible (legacy arithmetic rule, or a hit in the type relation
+//       index when `modelConvertibility` is true)
+//   0 — not convertible (filter: candidate is dropped by the caller)
+//
+// `res` is the resolved overload's parameter at the same position. We treat
+// a candidate parameter matching the resolved one as a free pass because we
+// know the resolved overload compiled against this argument — whatever
+// conversion the resolved path used must also be available here.
+static int scoreParamMatch(const std::string &arg, const std::string &cand,
+                           const std::string &res,
+                           const GlobalIndex &index,
+                           bool modelConvertibility) {
+  if (cand == arg)
+    return 2;
+  if (cand == res)
+    return 1;
+  if (isArithmeticTypeName(cand) && isArithmeticTypeName(arg))
+    return 1;
+  if (modelConvertibility &&
+      index.typeRelations().isConvertible(arg, cand))
+    return 1;
+  return 0;
 }
 
-// Is the candidate overload something the compiler could even consider for
-// this call? We can't run Sema, so approximate: for every argument position,
-// the candidate's parameter must be (a) exactly the arg type, (b) exactly
-// the resolved overload's parameter (we know that one compiled, so whatever
-// conversion the resolved path uses is also available to the candidate), or
-// (c) both the candidate's parameter and the argument are builtin
-// arithmetic types, in which case a standard conversion exists.
-static bool isPlausiblyViable(
-    const std::vector<std::string> &argTypes,
-    const std::vector<std::string> &resolvedParamTypes,
-    const std::vector<std::string> &candidateParamTypes) {
-  if (candidateParamTypes.size() != argTypes.size() ||
-      resolvedParamTypes.size() != argTypes.size())
-    return false;
-  for (size_t i = 0; i < argTypes.size(); ++i) {
-    const std::string &arg = argTypes[i];
-    const std::string &cand = candidateParamTypes[i];
-    const std::string &res = resolvedParamTypes[i];
-    if (cand == arg)
-      continue;
-    if (cand == res)
-      continue;
-    if (isArithmeticTypeName(cand) && isArithmeticTypeName(arg))
-      continue;
-    return false;
-  }
-  return true;
-}
-
-// Score a whole parameter list against the call's argument types.
+// Score a whole parameter list against the call's argument types. Returns
+// an empty vector when the candidate is not viable (any position scored 0,
+// or arity mismatch).
 static std::vector<int>
 scoreOverload(const std::vector<std::string> &argTypes,
-              const std::vector<std::string> &paramTypes) {
+              const std::vector<std::string> &resolvedParamTypes,
+              const std::vector<std::string> &candidateParamTypes,
+              const GlobalIndex &index, bool modelConvertibility) {
+  if (candidateParamTypes.size() != argTypes.size() ||
+      resolvedParamTypes.size() != argTypes.size())
+    return {};
   std::vector<int> out;
   out.reserve(argTypes.size());
-  for (size_t i = 0; i < argTypes.size(); ++i)
-    out.push_back(scoreParamMatch(argTypes[i], paramTypes[i]));
+  for (size_t i = 0; i < argTypes.size(); ++i) {
+    int s = scoreParamMatch(argTypes[i], candidateParamTypes[i],
+                            resolvedParamTypes[i], index, modelConvertibility);
+    if (s == 0)
+      return {};
+    out.push_back(s);
+  }
   return out;
 }
 
@@ -163,7 +137,8 @@ scoreOverload(const std::vector<std::string> &argTypes,
 // The combination (candidateBetter, resolvedBetter) classifies the pair:
 //   (true,  false) → candidate Pareto-dominates   → ADL_Fallback
 //   (true,  true ) → incomparable (tied-on-some)  → ADL_Ambiguity
-//   (false, *    ) → candidate no better anywhere → no diagnostic
+//   (false, true ) → candidate strictly worse     → no diagnostic
+//   (false, false) → tied on every position       → ADL_SameScore (opt-in)
 static void compareScores(const std::vector<int> &resolvedScores,
                           const std::vector<int> &candidateScores,
                           bool &candidateBetter, bool &resolvedBetter) {
@@ -193,8 +168,10 @@ normalizeAll(const std::vector<std::string> &raw) {
 
 AnalyzerVisitor::AnalyzerVisitor(const GlobalIndex &index,
                                  clang::SourceManager &sm,
-                                 std::vector<Diagnostic> &diagnostics)
-    : index_(index), sm_(sm), diagnostics_(diagnostics) {}
+                                 std::vector<Diagnostic> &diagnostics,
+                                 AnalysisOptions opts)
+    : index_(index), sm_(sm), diagnostics_(diagnostics),
+      opts_(std::move(opts)) {}
 
 bool AnalyzerVisitor::VisitCallExpr(clang::CallExpr *expr) {
   // Only analyze calls in the main file (not in included headers).
@@ -255,7 +232,15 @@ bool AnalyzerVisitor::VisitCallExpr(clang::CallExpr *expr) {
   auto argTypesN = normalizeAll(argTypes);
   auto resolvedParamTypesN = normalizeAll(resolvedParamTypes);
 
-  auto resolvedScores = scoreOverload(argTypesN, resolvedParamTypesN);
+  // The resolved overload's scores — we know Sema picked it, so every
+  // position must be at least convertible. We pass the resolved param list
+  // in as both the "candidate" and "resolved" reference; the identity
+  // shortcut gives each position a score of 2.
+  auto resolvedScores =
+      scoreOverload(argTypesN, resolvedParamTypesN, resolvedParamTypesN,
+                    index_, opts_.modelConvertibility);
+  if (resolvedScores.empty())
+    return true; // something odd with arity — bail out safely.
 
   auto buildSig = [](const std::string &qname,
                      const std::vector<std::string> &params) {
@@ -287,21 +272,46 @@ bool AnalyzerVisitor::VisitCallExpr(clang::CallExpr *expr) {
       continue;
 
     // Rank the candidate against the call's actual argument types. An
-    // invisible overload is only interesting if it would plausibly be
-    // viable for the call, and if at least one position scores better
-    // than the resolved overload; see the helpers above for the model.
+    // empty score vector means the candidate hit a 0 at some position (the
+    // convertibility filter) and should be dropped.
     auto candidateParamTypesN = normalizeAll(entry->paramTypes);
-    if (!isPlausiblyViable(argTypesN, resolvedParamTypesN,
-                           candidateParamTypesN))
+    auto candidateScores =
+        scoreOverload(argTypesN, resolvedParamTypesN, candidateParamTypesN,
+                      index_, opts_.modelConvertibility);
+    if (candidateScores.empty())
       continue;
 
-    auto candidateScores = scoreOverload(argTypesN, candidateParamTypesN);
     bool candidateBetter = false, resolvedBetter = false;
     compareScores(resolvedScores, candidateScores, candidateBetter,
                   resolvedBetter);
 
-    if (!candidateBetter)
-      continue; // candidate is equal or strictly worse — nothing to say
+    if (!candidateBetter) {
+      // Same-score path: neither Pareto-dominates. Emit ADL_SameScore only
+      // when opted in, and only when the score vectors are truly identical
+      // (strictly-worse candidates get `resolvedBetter=true` and are dropped
+      // silently below as before).
+      if (opts_.warnSameScore && !resolvedBetter &&
+          candidateScores == resolvedScores &&
+          entry->paramTypes != resolvedParamTypes) {
+        std::string candidateSig =
+            buildSig(entry->qualifiedName, entry->paramTypes);
+        Diagnostic diag;
+        diag.kind = Diagnostic::ADL_SameScore;
+        diag.callLocation = formatLocation(expr->getBeginLoc());
+        diag.resolvedDecl = resolvedSig;
+        diag.betterDecl = candidateSig;
+        diag.missingHeader = entry->headerPath;
+        diag.message =
+            "Same-score ADL candidate: " + candidateSig + " exists in " +
+            entry->headerPath +
+            " but is not visible here. It ties the resolved overload " +
+            resolvedSig +
+            " on every argument position — inclusion order silently decides "
+            "which one the compiler picks.";
+        diagnostics_.push_back(std::move(diag));
+      }
+      continue; // not Pareto-better: nothing more to say on this candidate
+    }
 
     std::string candidateSig = buildSig(entry->qualifiedName, entry->paramTypes);
 
@@ -448,8 +458,9 @@ AnalyzerVisitor::getFilePath(clang::SourceLocation loc) const {
 
 AnalyzerConsumer::AnalyzerConsumer(const GlobalIndex &index,
                                    clang::SourceManager &sm,
-                                   std::vector<Diagnostic> &diagnostics)
-    : visitor_(index, sm, diagnostics) {}
+                                   std::vector<Diagnostic> &diagnostics,
+                                   AnalysisOptions opts)
+    : visitor_(index, sm, diagnostics, std::move(opts)) {}
 
 void AnalyzerConsumer::HandleTranslationUnit(clang::ASTContext &context) {
   visitor_.TraverseDecl(context.getTranslationUnitDecl());
@@ -458,24 +469,26 @@ void AnalyzerConsumer::HandleTranslationUnit(clang::ASTContext &context) {
 // --- AnalyzerAction ---
 
 AnalyzerAction::AnalyzerAction(const GlobalIndex &index,
-                               std::vector<Diagnostic> &diags)
-    : index_(index), diagnostics_(diags) {}
+                               std::vector<Diagnostic> &diags,
+                               AnalysisOptions opts)
+    : index_(index), diagnostics_(diags), opts_(std::move(opts)) {}
 
 std::unique_ptr<clang::ASTConsumer>
 AnalyzerAction::CreateASTConsumer(clang::CompilerInstance &ci,
                                   llvm::StringRef /*file*/) {
   return std::make_unique<AnalyzerConsumer>(index_, ci.getSourceManager(),
-                                           diagnostics_);
+                                           diagnostics_, opts_);
 }
 
 // --- AnalyzerActionFactory ---
 
 AnalyzerActionFactory::AnalyzerActionFactory(const GlobalIndex &index,
-                                             std::vector<Diagnostic> &diags)
-    : index_(index), diagnostics_(diags) {}
+                                             std::vector<Diagnostic> &diags,
+                                             AnalysisOptions opts)
+    : index_(index), diagnostics_(diags), opts_(std::move(opts)) {}
 
 std::unique_ptr<clang::FrontendAction> AnalyzerActionFactory::create() {
-  return std::make_unique<AnalyzerAction>(index_, diagnostics_);
+  return std::make_unique<AnalyzerAction>(index_, diagnostics_, opts_);
 }
 
 // --- Coverage Analysis ---
@@ -627,7 +640,7 @@ void analyzeCoverageProperties(const GlobalIndex &index,
 std::vector<Diagnostic>
 runAnalysis(const clang::tooling::CompilationDatabase &compDb,
             const std::vector<std::string> &sourceFiles,
-            bool enableCoverageDiag) {
+            const AnalysisOptions &opts) {
   // Phase 1: Index all translation units.
   GlobalIndex index;
   {
@@ -638,17 +651,26 @@ runAnalysis(const clang::tooling::CompilationDatabase &compDb,
 
   // Phase 1.5: Coverage property analysis (index-only, no AST needed).
   std::vector<Diagnostic> diagnostics;
-  if (enableCoverageDiag)
+  if (opts.enableCoverageDiag)
     analyzeCoverageProperties(index, diagnostics);
 
   // Phase 2: Analyze each translation unit against the global index.
   {
     clang::tooling::ClangTool tool(compDb, sourceFiles);
-    AnalyzerActionFactory factory(index, diagnostics);
+    AnalyzerActionFactory factory(index, diagnostics, opts);
     tool.run(&factory);
   }
 
   return diagnostics;
+}
+
+std::vector<Diagnostic>
+runAnalysis(const clang::tooling::CompilationDatabase &compDb,
+            const std::vector<std::string> &sourceFiles,
+            bool enableCoverageDiag) {
+  AnalysisOptions opts;
+  opts.enableCoverageDiag = enableCoverageDiag;
+  return runAnalysis(compDb, sourceFiles, opts);
 }
 
 } // namespace giga_drill

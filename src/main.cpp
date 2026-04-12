@@ -58,6 +58,21 @@ static llvm::cl::list<std::string>
                       llvm::cl::value_desc("name"),
                       llvm::cl::sub(MugannCmd));
 
+static llvm::cl::opt<bool>
+    MugannWarnSameScore("warn-same-score",
+                        llvm::cl::desc("Warn on ADL candidates that tie the "
+                                       "resolved overload on every argument "
+                                       "position"),
+                        llvm::cl::sub(MugannCmd));
+
+static llvm::cl::opt<bool>
+    MugannModelConvertibility("model-convertibility",
+                              llvm::cl::desc("Use indexed type relations "
+                                             "(inheritance, converting ctors, "
+                                             "conversion operators) to decide "
+                                             "candidate viability"),
+                              llvm::cl::sub(MugannCmd));
+
 // ---------------------------------------------------------------------------
 // lagann options
 // ---------------------------------------------------------------------------
@@ -209,8 +224,11 @@ int main(int argc, const char **argv) {
 
     std::vector<std::string> files(MugannSourceFiles.begin(),
                                    MugannSourceFiles.end());
-    auto diagnostics =
-        giga_drill::runAnalysis(*compDb, files, MugannCoverageDiag);
+    giga_drill::AnalysisOptions opts;
+    opts.enableCoverageDiag = MugannCoverageDiag;
+    opts.warnSameScore = MugannWarnSameScore;
+    opts.modelConvertibility = MugannModelConvertibility;
+    auto diagnostics = giga_drill::runAnalysis(*compDb, files, opts);
 
     // Dead code analysis.
     if (MugannDeadCode) {

@@ -1,6 +1,9 @@
 # Build directories
 build*/
 
+# CTest output directory (created when ctest runs outside the build dir)
+Testing/
+
 # Prerequisites
 *.d
 
