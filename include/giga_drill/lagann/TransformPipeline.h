@@ -16,8 +16,10 @@ public:
 
   // Execute all passes sequentially against the given source files.
   // If dryRun is true, replacements are collected but not written to disk.
+  // Multiple build paths can be provided; their compilation databases are
+  // tried in order for each source file (first match wins).
   // Returns 0 on success, nonzero on failure.
-  int execute(const std::string &buildPath,
+  int execute(const std::vector<std::string> &buildPaths,
               const std::vector<std::string> &sourceFiles, bool dryRun = false);
 
   // Retrieve all accumulated replacements across all passes, keyed by file.

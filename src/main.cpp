@@ -3,6 +3,7 @@
 #include "giga_drill/callgraph/CallGraphBuilder.h"
 #include "giga_drill/callgraph/ControlFlowIndex.h"
 #include "giga_drill/callgraph/ControlFlowOracle.h"
+#include "giga_drill/lagann/RulesParser.h"
 #include "giga_drill/lagann/TransformPipeline.h"
 
 #include "clang/Tooling/CompilationDatabase.h"
@@ -68,11 +69,13 @@ static llvm::cl::opt<std::string>
                     llvm::cl::value_desc("file"),
                     llvm::cl::sub(LagannCmd));
 
-static llvm::cl::opt<std::string>
-    LagannBuildPath("build-path",
-                    llvm::cl::desc("Directory containing compile_commands.json"),
-                    llvm::cl::value_desc("dir"),
-                    llvm::cl::sub(LagannCmd));
+static llvm::cl::list<std::string>
+    LagannBuildPaths("build-path",
+                     llvm::cl::desc("Directory containing compile_commands.json"
+                                    " (may be repeated; first match wins)"),
+                     llvm::cl::value_desc("dir"),
+                     llvm::cl::OneOrMore,
+                     llvm::cl::sub(LagannCmd));
 
 static llvm::cl::list<std::string>
     LagannSourceFiles("source",
@@ -248,27 +251,34 @@ int main(int argc, const char **argv) {
       llvm::errs() << "lagann: --rules-json is required\n";
       return 1;
     }
-    if (LagannBuildPath.empty()) {
-      llvm::errs() << "lagann: --build-path is required\n";
-      return 1;
-    }
     if (LagannSourceFiles.empty()) {
       llvm::errs() << "lagann: at least one --source file is required\n";
       return 1;
     }
 
-    // TODO: Parse LagannRulesJson and populate pipeline passes.
-    // For now, demonstrate that the tool links and runs.
-    llvm::outs() << "lagann\n"
-                 << "  rules:      " << LagannRulesJson << "\n"
-                 << "  build-path: " << LagannBuildPath << "\n"
-                 << "  sources:    " << LagannSourceFiles.size() << " file(s)\n"
-                 << "  dry-run:    " << (LagannDryRun ? "yes" : "no") << "\n";
+    auto rulesOrErr = giga_drill::parseRulesFile(LagannRulesJson);
+    if (!rulesOrErr) {
+      llvm::errs() << "lagann: " << llvm::toString(rulesOrErr.takeError())
+                   << "\n";
+      return 1;
+    }
+
+    auto passRulesOrErr = giga_drill::buildPipeline(*rulesOrErr);
+    if (!passRulesOrErr) {
+      llvm::errs() << "lagann: " << llvm::toString(passRulesOrErr.takeError())
+                   << "\n";
+      return 1;
+    }
 
     giga_drill::TransformPipeline pipeline;
+    for (auto &pass : *passRulesOrErr)
+      pipeline.addPass(std::move(pass));
+
+    std::vector<std::string> buildPaths(LagannBuildPaths.begin(),
+                                        LagannBuildPaths.end());
     std::vector<std::string> files(LagannSourceFiles.begin(),
                                    LagannSourceFiles.end());
-    return pipeline.execute(LagannBuildPath, files, LagannDryRun);
+    return pipeline.execute(buildPaths, files, LagannDryRun);
   }
 
   // ---- cfquery --------------------------------------------------------------

@@ -4,6 +4,8 @@ add_library(giga_drill_lib
   mugann/Analyzer.cpp
   mugann/DeadCodeAnalyzer.cpp
   lagann/MatcherEngine.cpp
+  lagann/TemplateEngine.cpp
+  lagann/RulesParser.cpp
   lagann/TransformPipeline.cpp
   callgraph/CallGraph.cpp
   callgraph/CallGraphBuilder.cpp

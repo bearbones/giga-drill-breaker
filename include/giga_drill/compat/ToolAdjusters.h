@@ -91,7 +91,11 @@ inline clang::tooling::ArgumentsAdjuster getResourceDirAdjuster() {
         return args;
 #ifdef GIGA_DRILL_CLANG_RESOURCE_DIR
     auto result = args;
-    result.push_back("-resource-dir=" GIGA_DRILL_CLANG_RESOURCE_DIR);
+    // Use space-separated form: -resource-dir= (Joined) lacks CC1Option
+    // visibility in LLVM 21, so ClangTool's internal cc1 pipeline rejects it.
+    // The Separate form has CC1Option and works in both driver and cc1 modes.
+    result.push_back("-resource-dir");
+    result.push_back(GIGA_DRILL_CLANG_RESOURCE_DIR);
     return result;
 #else
     return args;
