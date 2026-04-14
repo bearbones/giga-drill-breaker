@@ -1,3 +1,8 @@
+// Copyright (c) 2026 The giga-drill-breaker Authors
+// Original author: Alex Mason
+//
+// SPDX-License-Identifier: Apache-2.0
+
 // Example project for testing the cfquery control flow query system.
 // Demonstrates various exception handling and guard patterns.
 

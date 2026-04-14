@@ -1,3 +1,8 @@
+// Copyright (c) 2026 The giga-drill-breaker Authors
+// Original author: Alex Mason
+//
+// SPDX-License-Identifier: Apache-2.0
+
 #include "giga_drill/lagann/MatcherEngine.h"
 #include "giga_drill/lagann/TransformPipeline.h"
 

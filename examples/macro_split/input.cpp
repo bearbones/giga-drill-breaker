@@ -1,3 +1,8 @@
+// Copyright (c) 2026 The giga-drill-breaker Authors
+// Original author: Alex Mason
+//
+// SPDX-License-Identifier: Apache-2.0
+
 // Example: macro invocations with boolean operators to be split/converted.
 //
 // The transforms demonstrated here convert ASSERT(a && b) style calls into

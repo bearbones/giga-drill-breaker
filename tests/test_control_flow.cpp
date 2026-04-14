@@ -1,3 +1,8 @@
+// Copyright (c) 2026 The giga-drill-breaker Authors
+// Original author: Alex Mason
+//
+// SPDX-License-Identifier: Apache-2.0
+
 // test_control_flow.cpp — Tests for the control flow query system.
 
 #include "giga_drill/callgraph/CallGraph.h"

@@ -1,3 +1,8 @@
+// Copyright (c) 2026 The giga-drill-breaker Authors
+// Original author: Alex Mason
+//
+// SPDX-License-Identifier: Apache-2.0
+
 #ifndef GIGA_DRILL_COMPAT_CLANG_VERSION_H
 #define GIGA_DRILL_COMPAT_CLANG_VERSION_H
 

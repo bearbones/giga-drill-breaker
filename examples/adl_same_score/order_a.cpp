@@ -1,3 +1,8 @@
+// Copyright (c) 2026 The giga-drill-breaker Authors
+// Original author: Alex Mason
+//
+// SPDX-License-Identifier: Apache-2.0
+
 // Order A: this TU exists to teach Phase 1 of the mugann pipeline about the
 // float overload in Extension.hpp. Calling scale with a float literal picks
 // scale(Vector, float) unambiguously, so the TU compiles cleanly.

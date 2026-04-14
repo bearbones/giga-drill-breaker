@@ -1,3 +1,8 @@
+// Copyright (c) 2026 The giga-drill-breaker Authors
+// Original author: Alex Mason
+//
+// SPDX-License-Identifier: Apache-2.0
+
 // main.cpp — Entry point for the dead code analysis example project.
 //
 // This file exercises every liveness scenario:

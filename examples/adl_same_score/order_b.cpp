@@ -1,3 +1,8 @@
+// Copyright (c) 2026 The giga-drill-breaker Authors
+// Original author: Alex Mason
+//
+// SPDX-License-Identifier: Apache-2.0
+
 // Order B: Only Core.hpp is visible here, so the call silently resolves to
 // scale(Vector, int). The same-score tie against scale(Vector, float) in
 // Extension.hpp is only visible to mugann's cross-TU index.

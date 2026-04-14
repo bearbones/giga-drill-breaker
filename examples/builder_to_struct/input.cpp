@@ -1,3 +1,8 @@
+// Copyright (c) 2026 The giga-drill-breaker Authors
+// Original author: Alex Mason
+//
+// SPDX-License-Identifier: Apache-2.0
+
 // Example: builder pattern class with nonmember lambda-based configuration.
 //
 // The transforms demonstrated here convert:
