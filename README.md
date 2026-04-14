@@ -3,7 +3,7 @@
 A Clang LibTooling backend for safe, AST-aware C++ refactoring and static
 analysis. It exposes two features as subcommands:
 
-- **mugann** — detect fragile ADL/CTAD resolutions across translation units
+- **mugann** — detect problems such as fragile ADL/CTAD resolutions across translation units. `clang-tidy` wishes.
 - **lagann** — apply rule-driven, multi-pass AST matcher transformations
 
 Designed as a backend for external systems (e.g. a Python script translating
@@ -33,38 +33,30 @@ baked into large C++ codebases.
 
 **Lagann** (ラガン) is Simon's personal core mech. It is small but contains
 the fundamental power: a spiral drill and the ability to *combine* with any
-other machine, boring into it and reshaping it into something new. Lagann does
-not destroy — it transforms. Every combination produces a more powerful form.
+other machine, boring into it and reshaping it into something new.
 
-The `lagann` subcommand does the same thing to source code. It drills into the
-AST and rewrites what it finds, pass by pass. The multi-pass pipeline echoes
+The `lagann` subcommand drills into the
+AST and rewrites what it finds, turn by turn. The multi-pass pipeline echoes
 Lagann's repeated combinations — each pass a new merge, each one producing a
-more evolved result. The source file going in is not the same structure coming
-out.
+more evolved result.
 
 ### mugann — the fragility-hunting subcommand
 
 The **Mugann** (ムガン) are the Anti-Spiral's biomechanical hunter-killers.
 They are dangerous in a very specific way: they give no warning, they look
-inert until triggered, and the hazard is entirely in *how they resolve* — a
-Mugann killed inside Earth's atmosphere detonates with enough force to destroy
-a city. The danger is not visible at the point of encounter. It is latent,
-structural, and catastrophic only when the wrong conditions converge.
+inert until triggered, and were created to impel catastrophe the moment 
+spiral energy (the growing complexity of a repo) grows too successful.
 
-Fragile ADL and CTAD resolutions have exactly this character. The code
-compiles without error. The call site looks normal. But depending on which
-headers happen to be included in a given translation unit, the same unqualified
-call silently resolves to a different overload — or the same CTAD expression
-deduces a different type. The hazard is invisible at the call site and only
-detonates when build order or include structure shifts.
+Fragile ADL and CTAD resolutions pose a similarly latent threat. The code compiles 
+without complaint, but depending on which headers happen to be included in what 
+order in the translation unit, the same unqualified call silently resolves to a 
+different overload — or the same CTAD expression deduces a different type.
+In practice, these often manifest as performance hits, but can yield security 
+vulnerabilities that are very hard to detect.
 
-The `mugann` subcommand hunts these latent threats. It indexes declarations
-across all translation units (building a picture the Anti-Spirals would call
-"the full spiral census") and then re-walks each TU looking for resolutions
-that would change if a different header were in scope. Like the Dai-Gurren
-Brigade learning to lure Mugann into space before destroying them, `mugann`
-surfaces the danger in a controlled setting before it can explode in
-production.
+The `mugann` subcommand surveys these vagaries and pciks them out. It indexes 
+declarations across all translation units and then re-walks each TU looking 
+for resolutions that would change if a different header were in scope.
 
 ---
 
