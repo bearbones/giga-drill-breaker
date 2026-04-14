@@ -1,0 +1,139 @@
+#include "giga_drill/mcp/McpServer.h"
+#include "giga_drill/mcp/McpTools.h"
+
+#include "llvm/Support/raw_ostream.h"
+
+#include <unordered_map>
+
+namespace giga_drill {
+
+McpServer::McpServer(CallGraph graph, ControlFlowIndex cfIndex,
+                     std::vector<std::string> entryPoints)
+    : graph_(std::move(graph)), cfIndex_(std::move(cfIndex)),
+      oracle_(graph_, cfIndex_), entryPoints_(std::move(entryPoints)) {}
+
+int McpServer::run() {
+  llvm::errs() << "mcp-serve: server started, waiting for requests...\n";
+
+  while (true) {
+    auto req = readRequest(stdin, llvm::errs());
+    if (!req)
+      break; // EOF or unrecoverable error.
+
+    llvm::errs() << "mcp-serve: received method: " << req->method << "\n";
+
+    // Notifications have no id and get no response.
+    if (req->isNotification()) {
+      if (req->method == "notifications/initialized") {
+        initialized_ = true;
+        llvm::errs() << "mcp-serve: client initialized\n";
+      }
+      // Silently ignore unknown notifications.
+      continue;
+    }
+
+    dispatch(*req);
+  }
+
+  llvm::errs() << "mcp-serve: shutting down\n";
+  return 0;
+}
+
+void McpServer::dispatch(const McpRequest &req) {
+  if (req.method == "initialize") {
+    writeResult(req.id, handleInitialize(req.params));
+    return;
+  }
+  if (req.method == "tools/list") {
+    writeResult(req.id, handleToolsList());
+    return;
+  }
+  if (req.method == "tools/call") {
+    writeResult(req.id, handleToolsCall(req.params));
+    return;
+  }
+
+  writeError(req.id, kMethodNotFound, "Unknown method: " + req.method);
+}
+
+llvm::json::Value McpServer::handleInitialize(
+    const llvm::json::Object & /*params*/) {
+  llvm::json::Object capabilities;
+  capabilities["tools"] = llvm::json::Object{};
+
+  llvm::json::Object serverInfo;
+  serverInfo["name"] = "giga-drill-breaker";
+  serverInfo["version"] = "0.1.0";
+
+  llvm::json::Object result;
+  result["protocolVersion"] = "2024-11-05";
+  result["capabilities"] = std::move(capabilities);
+  result["serverInfo"] = std::move(serverInfo);
+  return llvm::json::Value(std::move(result));
+}
+
+llvm::json::Value McpServer::handleToolsList() {
+  auto tools = getRegisteredTools();
+  llvm::json::Array toolArray;
+  for (auto &tool : tools) {
+    llvm::json::Object toolObj;
+    toolObj["name"] = std::move(tool.name);
+    toolObj["description"] = std::move(tool.description);
+    toolObj["inputSchema"] = std::move(tool.inputSchema);
+    toolArray.push_back(llvm::json::Value(std::move(toolObj)));
+  }
+
+  llvm::json::Object result;
+  result["tools"] = std::move(toolArray);
+  return llvm::json::Value(std::move(result));
+}
+
+llvm::json::Value McpServer::handleToolsCall(
+    const llvm::json::Object &params) {
+  auto toolName = params.getString("name");
+  if (!toolName) {
+    llvm::json::Object content;
+    content["type"] = "text";
+    content["text"] = "Missing 'name' field in tools/call request";
+    llvm::json::Array contentArr;
+    contentArr.push_back(llvm::json::Value(std::move(content)));
+
+    llvm::json::Object result;
+    result["content"] = std::move(contentArr);
+    result["isError"] = true;
+    return llvm::json::Value(std::move(result));
+  }
+
+  // Look up tool by name.
+  static std::unordered_map<std::string, McpToolHandler> handlerMap;
+  if (handlerMap.empty()) {
+    for (auto &entry : getRegisteredTools())
+      handlerMap[entry.name] = std::move(entry.handler);
+  }
+
+  auto it = handlerMap.find(toolName->str());
+  if (it == handlerMap.end()) {
+    llvm::json::Object content;
+    content["type"] = "text";
+    content["text"] = "Unknown tool: " + toolName->str();
+    llvm::json::Array contentArr;
+    contentArr.push_back(llvm::json::Value(std::move(content)));
+
+    llvm::json::Object result;
+    result["content"] = std::move(contentArr);
+    result["isError"] = true;
+    return llvm::json::Value(std::move(result));
+  }
+
+  // Extract arguments.
+  llvm::json::Object args;
+  if (auto *argsVal = params.get("arguments")) {
+    if (auto *argsObj = argsVal->getAsObject())
+      args = *argsObj;
+  }
+
+  McpToolContext ctx{graph_, oracle_, cfIndex_, entryPoints_};
+  return it->second(args, ctx);
+}
+
+} // namespace giga_drill
