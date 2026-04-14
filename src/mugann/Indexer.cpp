@@ -1,4 +1,20 @@
+// Copyright (c) 2026 The giga-drill-breaker Authors
+// Original author: Alex Mason
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 #include "giga_drill/mugann/Indexer.h"
+#include "giga_drill/mugann/TypeNormalize.h"
 #include "giga_drill/compat/ClangVersion.h"
 
 #include "clang/AST/ASTContext.h"
@@ -67,6 +83,86 @@ bool IndexerVisitor::VisitCXXDeductionGuideDecl(
   }
 
   index_.addDeductionGuide(std::move(entry));
+  return true;
+}
+
+bool IndexerVisitor::VisitCXXRecordDecl(clang::CXXRecordDecl *decl) {
+  // Only record complete, non-implicit class definitions. Forward
+  // declarations and implicit decls have no base list to walk.
+  if (decl->isImplicit())
+    return true;
+  if (!decl->hasDefinition())
+    return true;
+  if (decl->getDefinition() != decl)
+    return true;
+
+  std::string derived =
+      normalizeTypeForMatching(decl->getQualifiedNameAsString());
+
+  auto &rels = index_.mutableTypeRelations();
+  for (const auto &base : decl->bases()) {
+    const clang::CXXRecordDecl *baseDecl =
+        base.getType()->getAsCXXRecordDecl();
+    if (!baseDecl)
+      continue;
+    std::string baseName =
+        normalizeTypeForMatching(baseDecl->getQualifiedNameAsString());
+    rels.addBase(derived, baseName);
+  }
+  return true;
+}
+
+bool IndexerVisitor::VisitCXXConstructorDecl(clang::CXXConstructorDecl *decl) {
+  if (decl->isImplicit())
+    return true;
+  if (decl->isExplicit())
+    return true;
+  // Templates are not modelled — the scorer doesn't do deduction.
+  if (decl->getDescribedFunctionTemplate())
+    return true;
+
+  // A non-explicit single-parameter ctor (or one where every extra parameter
+  // has a default) creates an implicit converting edge: `ToType` is
+  // constructible from `FromType` without user intervention.
+  unsigned required = decl->getMinRequiredArguments();
+  if (required != 1)
+    return true;
+  if (decl->getNumParams() < 1)
+    return true;
+
+  const auto *parent = decl->getParent();
+  if (!parent)
+    return true;
+
+  std::string toType =
+      normalizeTypeForMatching(parent->getQualifiedNameAsString());
+  std::string fromType = normalizeTypeForMatching(
+      decl->getParamDecl(0)->getType().getCanonicalType().getAsString());
+
+  index_.mutableTypeRelations().addCtorEdge(std::move(toType),
+                                            std::move(fromType));
+  return true;
+}
+
+bool IndexerVisitor::VisitCXXConversionDecl(clang::CXXConversionDecl *decl) {
+  if (decl->isImplicit())
+    return true;
+  if (decl->isExplicit())
+    return true;
+  if (decl->getDescribedFunctionTemplate())
+    return true;
+
+  const auto *parent = decl->getParent();
+  if (!parent)
+    return true;
+
+  std::string fromType =
+      normalizeTypeForMatching(parent->getQualifiedNameAsString());
+  std::string toType = normalizeTypeForMatching(
+      decl->getConversionType().getCanonicalType().getAsString());
+
+  index_.mutableTypeRelations().addConvOpEdge(std::move(fromType),
+                                              std::move(toType));
   return true;
 }
 

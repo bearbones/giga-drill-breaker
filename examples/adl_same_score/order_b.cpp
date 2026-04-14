@@ -13,26 +13,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "internal.hpp"
-#include <iostream>
+// Order B: Only Core.hpp is visible here, so the call silently resolves to
+// scale(Vector, int). The same-score tie against scale(Vector, float) in
+// Extension.hpp is only visible to mugann's cross-TU index.
+//
+// The call is intentionally written here in the main file (rather than in
+// an inline helper inside Logic.hpp) so that mugann's VisitCallExpr
+// analyses it — the analyzer skips call sites that aren't in the main
+// file.
+#include "Core.hpp"
 
-namespace internal {
-
-double accumulate_helper(const double* data, int n) {
-    double total = 0.0;
-    for (int i = 0; i < n; ++i) {
-        total += data[i];
-    }
-    return total;
+int main() {
+    MathLib::Vector v;
+    long amount = 3;
+    scale(v, amount);
 }
-
-double old_normalize(double val, double range) {
-    if (range == 0.0) return 0.0;
-    return val / range;
-}
-
-void log_value(const std::string& label, double val) {
-    std::cout << "[DEBUG] " << label << " = " << val << "\n";
-}
-
-} // namespace internal

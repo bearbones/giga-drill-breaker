@@ -12,6 +12,9 @@ add_library(giga_drill_lib
   callgraph/ControlFlowIndex.cpp
   callgraph/ControlFlowContextVisitor.cpp
   callgraph/ControlFlowOracle.cpp
+  mcp/McpProtocol.cpp
+  mcp/McpServer.cpp
+  mcp/McpTools.cpp
 )
 
 target_include_directories(giga_drill_lib PUBLIC

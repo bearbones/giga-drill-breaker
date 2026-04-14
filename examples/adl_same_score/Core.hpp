@@ -13,26 +13,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "internal.hpp"
+#pragma once
 #include <iostream>
 
-namespace internal {
+namespace MathLib {
+    struct Vector {};
 
-double accumulate_helper(const double* data, int n) {
-    double total = 0.0;
-    for (int i = 0; i < n; ++i) {
-        total += data[i];
+    // The int overload ships in Core.hpp — always visible.
+    inline void scale(Vector, int) {
+        std::cout << "Scaled by int (Core)\n";
     }
-    return total;
 }
-
-double old_normalize(double val, double range) {
-    if (range == 0.0) return 0.0;
-    return val / range;
-}
-
-void log_value(const std::string& label, double val) {
-    std::cout << "[DEBUG] " << label << " = " << val << "\n";
-}
-
-} // namespace internal

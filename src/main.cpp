@@ -1,3 +1,18 @@
+// Copyright (c) 2026 The giga-drill-breaker Authors
+// Original author: Alex Mason
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 #include "giga_drill/mugann/Analyzer.h"
 #include "giga_drill/mugann/DeadCodeAnalyzer.h"
 #include "giga_drill/callgraph/CallGraphBuilder.h"
@@ -5,6 +20,7 @@
 #include "giga_drill/callgraph/ControlFlowOracle.h"
 #include "giga_drill/lagann/RulesParser.h"
 #include "giga_drill/lagann/TransformPipeline.h"
+#include "giga_drill/mcp/McpServer.h"
 
 #include "clang/Tooling/CompilationDatabase.h"
 #include "llvm/Support/CommandLine.h"
@@ -25,6 +41,10 @@ static llvm::cl::SubCommand
 static llvm::cl::SubCommand
     CfqueryCmd("cfquery",
                "Query control flow and exception handling context");
+
+static llvm::cl::SubCommand
+    McpServeCmd("mcp-serve",
+                "Start MCP server for interactive call graph queries");
 
 // ---------------------------------------------------------------------------
 // mugann options
@@ -58,6 +78,21 @@ static llvm::cl::list<std::string>
                       llvm::cl::desc("Entry point function names (default: main)"),
                       llvm::cl::value_desc("name"),
                       llvm::cl::sub(MugannCmd));
+
+static llvm::cl::opt<bool>
+    MugannWarnSameScore("warn-same-score",
+                        llvm::cl::desc("Warn on ADL candidates that tie the "
+                                       "resolved overload on every argument "
+                                       "position"),
+                        llvm::cl::sub(MugannCmd));
+
+static llvm::cl::opt<bool>
+    MugannModelConvertibility("model-convertibility",
+                              llvm::cl::desc("Use indexed type relations "
+                                             "(inheritance, converting ctors, "
+                                             "conversion operators) to decide "
+                                             "candidate viability"),
+                              llvm::cl::sub(MugannCmd));
 
 // ---------------------------------------------------------------------------
 // lagann options
@@ -178,6 +213,29 @@ static llvm::cl::opt<unsigned>
                     llvm::cl::sub(CfqueryCmd));
 
 // ---------------------------------------------------------------------------
+// mcp-serve options
+// ---------------------------------------------------------------------------
+
+static llvm::cl::opt<std::string>
+    McpBuildPath("build-path",
+                 llvm::cl::desc("Directory containing compile_commands.json"),
+                 llvm::cl::value_desc("dir"),
+                 llvm::cl::sub(McpServeCmd));
+
+static llvm::cl::list<std::string>
+    McpSourceFiles("source",
+                   llvm::cl::desc("Source files to analyze"),
+                   llvm::cl::value_desc("file"),
+                   llvm::cl::OneOrMore,
+                   llvm::cl::sub(McpServeCmd));
+
+static llvm::cl::list<std::string>
+    McpEntryPoints("entry-point",
+                   llvm::cl::desc("Entry point function names (default: main)"),
+                   llvm::cl::value_desc("name"),
+                   llvm::cl::sub(McpServeCmd));
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -186,9 +244,10 @@ int main(int argc, const char **argv) {
       argc, argv,
       "giga-drill-breaker: AST-based C++ analysis and transformation tool\n"
       "\nSubcommands:\n"
-      "  mugann   Detect fragile ADL/CTAD resolution across translation units\n"
-      "  lagann   Apply rule-driven AST matcher transformations\n"
-      "  cfquery  Query control flow and exception handling context\n");
+      "  mugann     Detect fragile ADL/CTAD resolution across translation units\n"
+      "  lagann     Apply rule-driven AST matcher transformations\n"
+      "  cfquery    Query control flow and exception handling context\n"
+      "  mcp-serve  Start MCP server for interactive call graph queries\n");
 
   // ---- mugann ---------------------------------------------------------------
   if (MugannCmd) {
@@ -212,8 +271,11 @@ int main(int argc, const char **argv) {
 
     std::vector<std::string> files(MugannSourceFiles.begin(),
                                    MugannSourceFiles.end());
-    auto diagnostics =
-        giga_drill::runAnalysis(*compDb, files, MugannCoverageDiag);
+    giga_drill::AnalysisOptions opts;
+    opts.enableCoverageDiag = MugannCoverageDiag;
+    opts.warnSameScore = MugannWarnSameScore;
+    opts.modelConvertibility = MugannModelConvertibility;
+    auto diagnostics = giga_drill::runAnalysis(*compDb, files, opts);
 
     // Dead code analysis.
     if (MugannDeadCode) {
@@ -432,8 +494,52 @@ int main(int argc, const char **argv) {
     return 0;
   }
 
-  llvm::errs() << "No subcommand specified. Use 'mugann', 'lagann', or "
-                  "'cfquery'.\n"
+  // ---- mcp-serve -------------------------------------------------------------
+  if (McpServeCmd) {
+    if (McpBuildPath.empty()) {
+      llvm::errs() << "mcp-serve: --build-path is required\n";
+      return 1;
+    }
+    if (McpSourceFiles.empty()) {
+      llvm::errs() << "mcp-serve: at least one --source file is required\n";
+      return 1;
+    }
+
+    std::string dbError;
+    auto compDb = clang::tooling::CompilationDatabase::loadFromDirectory(
+        McpBuildPath, dbError);
+    if (!compDb) {
+      llvm::errs() << "mcp-serve: error loading compilation database from "
+                   << McpBuildPath << ": " << dbError << "\n";
+      return 1;
+    }
+
+    std::vector<std::string> files(McpSourceFiles.begin(),
+                                   McpSourceFiles.end());
+
+    llvm::errs() << "mcp-serve: building call graph...\n";
+    auto graph = giga_drill::buildCallGraph(*compDb, files);
+    llvm::errs() << "mcp-serve: call graph built ("
+                 << graph.nodeCount() << " nodes, "
+                 << graph.edgeCount() << " edges)\n";
+
+    llvm::errs() << "mcp-serve: building control flow index...\n";
+    auto cfIndex = giga_drill::buildControlFlowIndex(*compDb, files, graph);
+    llvm::errs() << "mcp-serve: control flow index built ("
+                 << cfIndex.size() << " call sites)\n";
+
+    std::vector<std::string> entryPoints(McpEntryPoints.begin(),
+                                         McpEntryPoints.end());
+    if (entryPoints.empty())
+      entryPoints.push_back("main");
+
+    giga_drill::McpServer server(std::move(graph), std::move(cfIndex),
+                                 std::move(entryPoints));
+    return server.run();
+  }
+
+  llvm::errs() << "No subcommand specified. Use 'mugann', 'lagann', "
+                  "'cfquery', or 'mcp-serve'.\n"
                << "Run with --help for usage information.\n";
   return 1;
 }

@@ -13,26 +13,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "internal.hpp"
-#include <iostream>
+#pragma once
+#include "Core.hpp"
 
-namespace internal {
-
-double accumulate_helper(const double* data, int n) {
-    double total = 0.0;
-    for (int i = 0; i < n; ++i) {
-        total += data[i];
+namespace MathLib {
+    // A float overload added by Extension.hpp. Neither int nor float is a
+    // strictly better match for a `long` argument — each reaches the
+    // parameter type via a standard conversion of roughly equivalent rank.
+    // Which one wins depends silently on which header was included first.
+    inline void scale(Vector, float) {
+        std::cout << "Scaled by float (Extension)\n";
     }
-    return total;
 }
-
-double old_normalize(double val, double range) {
-    if (range == 0.0) return 0.0;
-    return val / range;
-}
-
-void log_value(const std::string& label, double val) {
-    std::cout << "[DEBUG] " << label << " = " << val << "\n";
-}
-
-} // namespace internal

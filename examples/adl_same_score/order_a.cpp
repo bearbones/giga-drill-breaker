@@ -13,26 +13,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "internal.hpp"
-#include <iostream>
+// Order A: this TU exists to teach Phase 1 of the mugann pipeline about the
+// float overload in Extension.hpp. Calling scale with a float literal picks
+// scale(Vector, float) unambiguously, so the TU compiles cleanly.
+//
+// Note: if we tried to include both Extension.hpp and Logic.hpp here, the
+// `long amount` call in Logic.hpp would become an *actual* ambiguous call
+// and the TU would fail to compile — which is the point of the whole
+// fragility case. mugann flags that same tie from order_b.cpp's perspective
+// using the cross-TU index.
+#include "Extension.hpp"
 
-namespace internal {
-
-double accumulate_helper(const double* data, int n) {
-    double total = 0.0;
-    for (int i = 0; i < n; ++i) {
-        total += data[i];
-    }
-    return total;
+int main() {
+    MathLib::Vector v;
+    MathLib::scale(v, 1.0f);
 }
-
-double old_normalize(double val, double range) {
-    if (range == 0.0) return 0.0;
-    return val / range;
-}
-
-void log_value(const std::string& label, double val) {
-    std::cout << "[DEBUG] " << label << " = " << val << "\n";
-}
-
-} // namespace internal
