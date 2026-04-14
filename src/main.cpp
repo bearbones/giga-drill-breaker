@@ -19,6 +19,7 @@
 #include "giga_drill/callgraph/ControlFlowIndex.h"
 #include "giga_drill/callgraph/ControlFlowOracle.h"
 #include "giga_drill/lagann/TransformPipeline.h"
+#include "giga_drill/mcp/McpServer.h"
 
 #include "clang/Tooling/CompilationDatabase.h"
 #include "llvm/Support/CommandLine.h"
@@ -39,6 +40,10 @@ static llvm::cl::SubCommand
 static llvm::cl::SubCommand
     CfqueryCmd("cfquery",
                "Query control flow and exception handling context");
+
+static llvm::cl::SubCommand
+    McpServeCmd("mcp-serve",
+                "Start MCP server for interactive call graph queries");
 
 // ---------------------------------------------------------------------------
 // mugann options
@@ -205,6 +210,29 @@ static llvm::cl::opt<unsigned>
                     llvm::cl::sub(CfqueryCmd));
 
 // ---------------------------------------------------------------------------
+// mcp-serve options
+// ---------------------------------------------------------------------------
+
+static llvm::cl::opt<std::string>
+    McpBuildPath("build-path",
+                 llvm::cl::desc("Directory containing compile_commands.json"),
+                 llvm::cl::value_desc("dir"),
+                 llvm::cl::sub(McpServeCmd));
+
+static llvm::cl::list<std::string>
+    McpSourceFiles("source",
+                   llvm::cl::desc("Source files to analyze"),
+                   llvm::cl::value_desc("file"),
+                   llvm::cl::OneOrMore,
+                   llvm::cl::sub(McpServeCmd));
+
+static llvm::cl::list<std::string>
+    McpEntryPoints("entry-point",
+                   llvm::cl::desc("Entry point function names (default: main)"),
+                   llvm::cl::value_desc("name"),
+                   llvm::cl::sub(McpServeCmd));
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -213,9 +241,10 @@ int main(int argc, const char **argv) {
       argc, argv,
       "giga-drill-breaker: AST-based C++ analysis and transformation tool\n"
       "\nSubcommands:\n"
-      "  mugann   Detect fragile ADL/CTAD resolution across translation units\n"
-      "  lagann   Apply rule-driven AST matcher transformations\n"
-      "  cfquery  Query control flow and exception handling context\n");
+      "  mugann     Detect fragile ADL/CTAD resolution across translation units\n"
+      "  lagann     Apply rule-driven AST matcher transformations\n"
+      "  cfquery    Query control flow and exception handling context\n"
+      "  mcp-serve  Start MCP server for interactive call graph queries\n");
 
   // ---- mugann ---------------------------------------------------------------
   if (MugannCmd) {
@@ -455,8 +484,52 @@ int main(int argc, const char **argv) {
     return 0;
   }
 
-  llvm::errs() << "No subcommand specified. Use 'mugann', 'lagann', or "
-                  "'cfquery'.\n"
+  // ---- mcp-serve -------------------------------------------------------------
+  if (McpServeCmd) {
+    if (McpBuildPath.empty()) {
+      llvm::errs() << "mcp-serve: --build-path is required\n";
+      return 1;
+    }
+    if (McpSourceFiles.empty()) {
+      llvm::errs() << "mcp-serve: at least one --source file is required\n";
+      return 1;
+    }
+
+    std::string dbError;
+    auto compDb = clang::tooling::CompilationDatabase::loadFromDirectory(
+        McpBuildPath, dbError);
+    if (!compDb) {
+      llvm::errs() << "mcp-serve: error loading compilation database from "
+                   << McpBuildPath << ": " << dbError << "\n";
+      return 1;
+    }
+
+    std::vector<std::string> files(McpSourceFiles.begin(),
+                                   McpSourceFiles.end());
+
+    llvm::errs() << "mcp-serve: building call graph...\n";
+    auto graph = giga_drill::buildCallGraph(*compDb, files);
+    llvm::errs() << "mcp-serve: call graph built ("
+                 << graph.nodeCount() << " nodes, "
+                 << graph.edgeCount() << " edges)\n";
+
+    llvm::errs() << "mcp-serve: building control flow index...\n";
+    auto cfIndex = giga_drill::buildControlFlowIndex(*compDb, files, graph);
+    llvm::errs() << "mcp-serve: control flow index built ("
+                 << cfIndex.size() << " call sites)\n";
+
+    std::vector<std::string> entryPoints(McpEntryPoints.begin(),
+                                         McpEntryPoints.end());
+    if (entryPoints.empty())
+      entryPoints.push_back("main");
+
+    giga_drill::McpServer server(std::move(graph), std::move(cfIndex),
+                                 std::move(entryPoints));
+    return server.run();
+  }
+
+  llvm::errs() << "No subcommand specified. Use 'mugann', 'lagann', "
+                  "'cfquery', or 'mcp-serve'.\n"
                << "Run with --help for usage information.\n";
   return 1;
 }
