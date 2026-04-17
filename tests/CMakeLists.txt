@@ -14,6 +14,7 @@ add_executable(giga_drill_tests
   test_dead_code.cpp
   test_control_flow.cpp
   test_mcp.cpp
+  test_deep_chains.cpp
 )
 
 target_link_libraries(giga_drill_tests PRIVATE

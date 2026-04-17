@@ -144,7 +144,7 @@ TEST_CASE("parseTemplate errors", "[template][parse]") {
 
 TEST_CASE("fromJSON JsonRulesFile", "[rules][json]") {
   SECTION("minimal valid rules file") {
-    auto json = llvm::json::parse(R"({
+    auto json = llvm::json::parse(R"JSON({
       "passes": [{
         "rules": [{
           "find": {
@@ -156,7 +156,7 @@ TEST_CASE("fromJSON JsonRulesFile", "[rules][json]") {
           }
         }]
       }]
-    })");
+    })JSON");
     REQUIRE(json);
 
     JsonRulesFile rules;
@@ -172,7 +172,7 @@ TEST_CASE("fromJSON JsonRulesFile", "[rules][json]") {
   }
 
   SECTION("full rules file with context and scope") {
-    auto json = llvm::json::parse(R"({
+    auto json = llvm::json::parse(R"JSON({
       "passes": [{
         "name": "test-pass",
         "context": "isExpansionInMainFile()",
@@ -187,7 +187,7 @@ TEST_CASE("fromJSON JsonRulesFile", "[rules][json]") {
           }
         }]
       }]
-    })");
+    })JSON");
     REQUIRE(json);
 
     JsonRulesFile rules;
@@ -199,14 +199,14 @@ TEST_CASE("fromJSON JsonRulesFile", "[rules][json]") {
   }
 
   SECTION("missing required fields") {
-    auto json = llvm::json::parse(R"({
+    auto json = llvm::json::parse(R"JSON({
       "passes": [{
         "rules": [{
           "find": {},
           "replace": {"target": "x"}
         }]
       }]
-    })");
+    })JSON");
     REQUIRE(json);
 
     JsonRulesFile rules;

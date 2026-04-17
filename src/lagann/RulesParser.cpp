@@ -67,20 +67,23 @@ bool fromJSON(const llvm::json::Value &value, JsonRulesFile &out,
 llvm::Expected<JsonRulesFile> parseRulesFile(llvm::StringRef path) {
   auto bufOrErr = llvm::MemoryBuffer::getFile(path);
   if (!bufOrErr)
-    return llvm::createStringError("failed to read rules file '" +
+    return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                   "failed to read rules file '" +
                                    path.str() + "': " +
                                    bufOrErr.getError().message());
 
   auto jsonOrErr = llvm::json::parse(bufOrErr.get()->getBuffer());
   if (!jsonOrErr)
-    return llvm::createStringError("JSON parse error in '" + path.str() +
+    return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                   "JSON parse error in '" + path.str() +
                                    "': " +
                                    llvm::toString(jsonOrErr.takeError()));
 
   JsonRulesFile rules;
   llvm::json::Path::Root root("rules-json");
   if (!fromJSON(*jsonOrErr, rules, root))
-    return llvm::createStringError("invalid rules file structure in '" +
+    return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                   "invalid rules file structure in '" +
                                    path.str() +
                                    "': " + llvm::toString(root.getError()));
 
@@ -103,6 +106,7 @@ buildPipeline(const JsonRulesFile &rulesFile) {
       auto tmplOrErr = parseTemplate(jsonRule.replace.withTempl);
       if (!tmplOrErr)
         return llvm::createStringError(
+            llvm::inconvertibleErrorCode(),
             "template parse error in pass '" + jsonPass.name +
             "': " + llvm::toString(tmplOrErr.takeError()));
 
@@ -118,7 +122,8 @@ buildPipeline(const JsonRulesFile &rulesFile) {
       // Validate scope
       const auto &scope = jsonRule.replace.scope;
       if (scope != "node" && scope != "macro-expansion")
-        return llvm::createStringError("invalid scope '" + scope +
+        return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                       "invalid scope '" + scope +
                                        "'; expected 'node' or "
                                        "'macro-expansion'");
 

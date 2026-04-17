@@ -32,7 +32,7 @@ constexpr int kInternalError = -32603;
 
 /// A parsed JSON-RPC 2.0 request.
 struct McpRequest {
-  llvm::json::Value id;   // number, string, or null for notifications
+  llvm::json::Value id = nullptr; // number, string, or null for notifications
   std::string method;
   llvm::json::Object params;
 
