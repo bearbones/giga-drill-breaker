@@ -74,7 +74,7 @@ flattenBinOp(const clang::Expr *expr, llvm::StringRef op,
 static llvm::Expected<PipeOp> parsePipeOp(llvm::StringRef raw) {
   raw = raw.trim();
   if (raw.empty())
-    return llvm::createStringError("empty pipe operation");
+    return llvm::createStringError(llvm::inconvertibleErrorCode(), "empty pipe operation");
 
   auto parenPos = raw.find('(');
   if (parenPos == llvm::StringRef::npos) {
@@ -89,7 +89,7 @@ static llvm::Expected<PipeOp> parsePipeOp(llvm::StringRef raw) {
   // The arg is typically quoted: ("&&") or (", ")
   auto closePos = rest.rfind(')');
   if (closePos == llvm::StringRef::npos)
-    return llvm::createStringError("unclosed parenthesis in pipe: " + name);
+    return llvm::createStringError(llvm::inconvertibleErrorCode(), "unclosed parenthesis in pipe: " + name);
 
   llvm::StringRef argRaw = rest.substr(0, closePos).trim();
 
@@ -139,7 +139,7 @@ llvm::Expected<ParsedTemplate> parseTemplate(llvm::StringRef templateStr) {
     // Find closing }}
     auto closePos = remaining.find("}}");
     if (closePos == llvm::StringRef::npos)
-      return llvm::createStringError("unclosed {{ in template");
+      return llvm::createStringError(llvm::inconvertibleErrorCode(), "unclosed {{ in template");
 
     llvm::StringRef exprBody = remaining.substr(0, closePos);
     remaining = remaining.substr(closePos + 2);
@@ -147,12 +147,12 @@ llvm::Expected<ParsedTemplate> parseTemplate(llvm::StringRef templateStr) {
     // Parse expression: nodeId | pipe1 | pipe2 ...
     auto parts = splitPipes(exprBody);
     if (parts.empty())
-      return llvm::createStringError("empty expression in template");
+      return llvm::createStringError(llvm::inconvertibleErrorCode(), "empty expression in template");
 
     TemplateExpr expr;
     expr.nodeId = parts[0].trim().str();
     if (expr.nodeId.empty())
-      return llvm::createStringError("empty node ID in template expression");
+      return llvm::createStringError(llvm::inconvertibleErrorCode(), "empty node ID in template expression");
 
     for (size_t i = 1; i < parts.size(); ++i) {
       auto pipeOrErr = parsePipeOp(parts[i]);
@@ -185,7 +185,7 @@ evaluateExpr(const TemplateExpr &texpr,
   auto map = result.Nodes.getMap();
   auto it = map.find(texpr.nodeId);
   if (it == map.end())
-    return llvm::createStringError("bound node not found: " + texpr.nodeId);
+    return llvm::createStringError(llvm::inconvertibleErrorCode(), "bound node not found: " + texpr.nodeId);
 
   const auto &node = it->second;
 
@@ -202,26 +202,28 @@ evaluateExpr(const TemplateExpr &texpr,
   for (const auto &pipe : texpr.pipes) {
     if (pipe.name == "text") {
       if (initialized)
-        return llvm::createStringError("'text' must be first in pipe chain");
+        return llvm::createStringError(llvm::inconvertibleErrorCode(), "'text' must be first in pipe chain");
       textVal = getSourceText(node.getSourceRange(), SM, LangOpts);
       initialized = true;
       isList = false;
     } else if (pipe.name == "name") {
       if (initialized)
-        return llvm::createStringError("'name' must be first in pipe chain");
+        return llvm::createStringError(llvm::inconvertibleErrorCode(), "'name' must be first in pipe chain");
       const auto *nd = node.get<clang::NamedDecl>();
       if (!nd)
         return llvm::createStringError(
+            llvm::inconvertibleErrorCode(),
             "node '" + texpr.nodeId + "' is not a NamedDecl for 'name' pipe");
       textVal = nd->getQualifiedNameAsString();
       initialized = true;
       isList = false;
     } else if (pipe.name == "flatten") {
       if (initialized)
-        return llvm::createStringError("'flatten' must be first in pipe chain");
+        return llvm::createStringError(llvm::inconvertibleErrorCode(), "'flatten' must be first in pipe chain");
       const auto *astExpr = node.get<clang::Expr>();
       if (!astExpr)
         return llvm::createStringError(
+            llvm::inconvertibleErrorCode(),
             "node '" + texpr.nodeId + "' is not an Expr for 'flatten' pipe");
       listVal = flattenBinOp(astExpr, pipe.arg, SM, LangOpts);
       initialized = true;
@@ -229,11 +231,12 @@ evaluateExpr(const TemplateExpr &texpr,
     } else if (pipe.name == "join") {
       if (!initialized || !isList)
         return llvm::createStringError(
+            llvm::inconvertibleErrorCode(),
             "'join' requires a preceding list-producing pipe");
       textVal = llvm::join(listVal.begin(), listVal.end(), pipe.arg);
       isList = false;
     } else {
-      return llvm::createStringError("unknown pipe operation: " + pipe.name);
+      return llvm::createStringError(llvm::inconvertibleErrorCode(), "unknown pipe operation: " + pipe.name);
     }
   }
 
