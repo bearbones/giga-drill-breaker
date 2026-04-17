@@ -159,7 +159,7 @@ TEST_CASE("readRequest parses Content-Length framed messages",
           "[mcp][protocol]") {
   SECTION("valid request") {
     std::string input =
-        "Content-Length: 59\r\n"
+        "Content-Length: 58\r\n"
         "\r\n"
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}";
 
@@ -192,7 +192,7 @@ TEST_CASE("readRequest parses Content-Length framed messages",
 
   SECTION("notification has null id") {
     std::string input =
-        "Content-Length: 50\r\n"
+        "Content-Length: 54\r\n"
         "\r\n"
         "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}";
 
@@ -212,9 +212,9 @@ TEST_CASE("readRequest parses Content-Length framed messages",
 // Tool registration tests
 // ============================================================================
 
-TEST_CASE("getRegisteredTools returns all 8 tools", "[mcp][tools]") {
+TEST_CASE("getRegisteredTools returns all 10 tools", "[mcp][tools]") {
   auto tools = getRegisteredTools();
-  CHECK(tools.size() == 8);
+  CHECK(tools.size() == 10);
 
   // Verify tool names.
   std::set<std::string> names;
@@ -229,6 +229,8 @@ TEST_CASE("getRegisteredTools returns all 8 tools", "[mcp][tools]") {
   CHECK(names.count("query_call_site_context") == 1);
   CHECK(names.count("analyze_dead_code") == 1);
   CHECK(names.count("get_class_hierarchy") == 1);
+  CHECK(names.count("list_entry_points") == 1);
+  CHECK(names.count("graph_summary") == 1);
 }
 
 // ============================================================================
@@ -375,7 +377,7 @@ TEST_CASE("find_call_chain tool", "[mcp][tools]") {
   }
   REQUIRE(handler);
 
-  SECTION("chain from main to readData") {
+  SECTION("chain from main to readData carries edge metadata") {
     llvm::json::Object args;
     args["to"] = "readData";
     auto result = handler(args, ctx);
@@ -386,10 +388,23 @@ TEST_CASE("find_call_chain tool", "[mcp][tools]") {
 
     auto *paths = obj.getArray("paths");
     REQUIRE(paths != nullptr);
-    // First path should be [main, processFile, readData].
+    // First path is main -> processFile -> readData: 2 hops.
     auto *firstPath = (*paths)[0].getAsArray();
     REQUIRE(firstPath != nullptr);
-    CHECK(firstPath->size() == 3);
+    CHECK(firstPath->size() == 2);
+
+    auto *firstHop = (*firstPath)[0].getAsObject();
+    REQUIRE(firstHop != nullptr);
+    CHECK(firstHop->getString("from") == "main");
+    CHECK(firstHop->getString("to") == "processFile");
+    CHECK(firstHop->getString("kind") == "DirectCall");
+    CHECK(firstHop->getString("confidence") == "Proven");
+    CHECK(firstHop->getString("callSite") == "main.cpp:11:3");
+
+    auto *secondHop = (*firstPath)[1].getAsObject();
+    REQUIRE(secondHop != nullptr);
+    CHECK(secondHop->getString("from") == "processFile");
+    CHECK(secondHop->getString("to") == "readData");
   }
 
   SECTION("no chain to orphan") {
@@ -407,6 +422,17 @@ TEST_CASE("find_call_chain tool", "[mcp][tools]") {
     auto result = handler(args, ctx);
     auto obj = parseToolResult(result);
     CHECK(obj.getInteger("pathCount") == 1);
+  }
+
+  SECTION("min_confidence=Proven prunes chains with Plausible hops") {
+    // processFile -> writeLog is Plausible. Requiring Proven should block
+    // every chain through writeLog.
+    llvm::json::Object args;
+    args["to"] = "writeLog";
+    args["min_confidence"] = "Proven";
+    auto result = handler(args, ctx);
+    auto obj = parseToolResult(result);
+    CHECK(obj.getInteger("pathCount") == 0);
   }
 }
 
@@ -532,4 +558,268 @@ TEST_CASE("get_class_hierarchy tool", "[mcp][tools]") {
     auto obj = parseToolResult(result);
     CHECK(obj.getInteger("derivedClassCount") == 0);
   }
+}
+
+// ============================================================================
+// include_confidences filter (regression for inclusive-min surprise)
+// ============================================================================
+
+TEST_CASE("get_callees with include_confidences selects exact tiers",
+          "[mcp][tools]") {
+  auto graph = buildTestGraph();
+  ControlFlowIndex cfIndex;
+  ControlFlowOracle oracle(graph, cfIndex);
+  std::vector<std::string> eps = {"main"};
+  McpToolContext ctx{graph, oracle, cfIndex, eps};
+
+  auto tools = getRegisteredTools();
+  McpToolHandler handler;
+  for (auto &t : tools) {
+    if (t.name == "get_callees") {
+      handler = t.handler;
+      break;
+    }
+  }
+  REQUIRE(handler);
+
+  SECTION("only Plausible excludes Proven") {
+    llvm::json::Object args;
+    args["name"] = "processFile";
+    llvm::json::Array confs;
+    confs.push_back("Plausible");
+    args["include_confidences"] = std::move(confs);
+    auto result = handler(args, ctx);
+    auto obj = parseToolResult(result);
+    CHECK(obj.getInteger("calleeCount") == 1); // only writeLog (Plausible)
+  }
+
+  SECTION("only Proven excludes Plausible") {
+    llvm::json::Object args;
+    args["name"] = "processFile";
+    llvm::json::Array confs;
+    confs.push_back("Proven");
+    args["include_confidences"] = std::move(confs);
+    auto result = handler(args, ctx);
+    auto obj = parseToolResult(result);
+    CHECK(obj.getInteger("calleeCount") == 1); // only readData (Proven)
+  }
+
+  SECTION("invalid value yields error") {
+    llvm::json::Object args;
+    args["name"] = "processFile";
+    llvm::json::Array confs;
+    confs.push_back("NotATier");
+    args["include_confidences"] = std::move(confs);
+    auto result = handler(args, ctx);
+    CHECK(isErrorResult(result));
+  }
+}
+
+// ============================================================================
+// analyze_dead_code filtering and pagination
+// ============================================================================
+
+TEST_CASE("analyze_dead_code filters system headers and paginates",
+          "[mcp][tools]") {
+  auto graph = buildTestGraph();
+  // Add synthetic dead nodes in system and project locations.
+  graph.addNode({"std::sys_dead", "/usr/include/fake.h", 10, false, false, ""});
+  graph.addNode({"project_dead_a", "src/a.cpp", 11, false, false, ""});
+  graph.addNode({"project_dead_b", "src/b.cpp", 12, false, false, ""});
+  ControlFlowIndex cfIndex;
+  ControlFlowOracle oracle(graph, cfIndex);
+  std::vector<std::string> eps = {"main"};
+  McpToolContext ctx{graph, oracle, cfIndex, eps};
+
+  auto tools = getRegisteredTools();
+  McpToolHandler handler;
+  for (auto &t : tools) {
+    if (t.name == "analyze_dead_code") {
+      handler = t.handler;
+      break;
+    }
+  }
+  REQUIRE(handler);
+
+  auto countNamed = [](const llvm::json::Array &arr, const std::string &name) {
+    int n = 0;
+    for (auto &v : arr) {
+      if (auto *o = v.getAsObject()) {
+        if (auto s = o->getString("name"))
+          if (*s == name)
+            ++n;
+      }
+    }
+    return n;
+  };
+
+  SECTION("system functions excluded by default") {
+    llvm::json::Object args;
+    auto result = handler(args, ctx);
+    auto obj = parseToolResult(result);
+    auto *dead = obj.getArray("dead");
+    REQUIRE(dead != nullptr);
+    CHECK(countNamed(*dead, "std::sys_dead") == 0);
+    CHECK(countNamed(*dead, "project_dead_a") == 1);
+  }
+
+  SECTION("include_system surfaces system functions") {
+    llvm::json::Object args;
+    args["include_system"] = true;
+    auto result = handler(args, ctx);
+    auto obj = parseToolResult(result);
+    auto *dead = obj.getArray("dead");
+    REQUIRE(dead != nullptr);
+    CHECK(countNamed(*dead, "std::sys_dead") == 1);
+  }
+
+  SECTION("limit and offset paginate") {
+    llvm::json::Object args;
+    args["limit"] = 1;
+    auto result = handler(args, ctx);
+    auto obj = parseToolResult(result);
+    auto totalDead = obj.getInteger("totalDead");
+    auto deadCount = obj.getInteger("deadCount");
+    REQUIRE(totalDead.has_value());
+    REQUIRE(deadCount.has_value());
+    CHECK(*totalDead >= 2);
+    CHECK(*deadCount == 1);
+    CHECK(obj.getBoolean("truncated") == true);
+  }
+
+  SECTION("name_prefix filters results") {
+    llvm::json::Object args;
+    args["name_prefix"] = "project_dead_";
+    auto result = handler(args, ctx);
+    auto obj = parseToolResult(result);
+    auto *dead = obj.getArray("dead");
+    REQUIRE(dead != nullptr);
+    CHECK(countNamed(*dead, "project_dead_a") == 1);
+    CHECK(countNamed(*dead, "project_dead_b") == 1);
+    CHECK(countNamed(*dead, "orphanFunc") == 0);
+  }
+}
+
+// ============================================================================
+// query_call_site_context validation and not-found surfacing
+// ============================================================================
+
+TEST_CASE("query_call_site_context surfaces malformed and unindexed input",
+          "[mcp][tools]") {
+  auto graph = buildTestGraph();
+  auto cfIndex = buildTestCfIndex();
+  ControlFlowOracle oracle(graph, cfIndex);
+  std::vector<std::string> eps = {"main"};
+  McpToolContext ctx{graph, oracle, cfIndex, eps};
+
+  auto tools = getRegisteredTools();
+  McpToolHandler handler;
+  for (auto &t : tools) {
+    if (t.name == "query_call_site_context") {
+      handler = t.handler;
+      break;
+    }
+  }
+  REQUIRE(handler);
+
+  SECTION("malformed call_site returns isError") {
+    llvm::json::Object args;
+    args["call_site"] = "nope";
+    auto result = handler(args, ctx);
+    CHECK(isErrorResult(result));
+  }
+
+  SECTION("valid format but unindexed site returns isError") {
+    llvm::json::Object args;
+    args["call_site"] = "src/unknown.cpp:99:9";
+    auto result = handler(args, ctx);
+    CHECK(isErrorResult(result));
+  }
+
+  SECTION("non-numeric line/col returns isError") {
+    llvm::json::Object args;
+    args["call_site"] = "foo.cpp:abc:5";
+    auto result = handler(args, ctx);
+    CHECK(isErrorResult(result));
+  }
+}
+
+// ============================================================================
+// list_entry_points and graph_summary introspection tools
+// ============================================================================
+
+TEST_CASE("list_entry_points returns configured entries", "[mcp][tools]") {
+  auto graph = buildTestGraph();
+  ControlFlowIndex cfIndex;
+  ControlFlowOracle oracle(graph, cfIndex);
+  std::vector<std::string> eps = {"main"};
+  McpToolContext ctx{graph, oracle, cfIndex, eps};
+
+  auto tools = getRegisteredTools();
+  McpToolHandler handler;
+  for (auto &t : tools) {
+    if (t.name == "list_entry_points") {
+      handler = t.handler;
+      break;
+    }
+  }
+  REQUIRE(handler);
+
+  llvm::json::Object args;
+  auto result = handler(args, ctx);
+  auto obj = parseToolResult(result);
+  CHECK(obj.getInteger("count") == 1);
+  auto *entries = obj.getArray("entryPoints");
+  REQUIRE(entries != nullptr);
+  REQUIRE(entries->size() == 1);
+  auto *first = (*entries)[0].getAsObject();
+  REQUIRE(first != nullptr);
+  CHECK(first->getString("name") == "main");
+  CHECK(first->getString("file") == "main.cpp");
+}
+
+TEST_CASE("graph_summary produces histograms and top-N fanout",
+          "[mcp][tools]") {
+  auto graph = buildTestGraph();
+  ControlFlowIndex cfIndex;
+  ControlFlowOracle oracle(graph, cfIndex);
+  std::vector<std::string> eps = {"main"};
+  McpToolContext ctx{graph, oracle, cfIndex, eps};
+
+  auto tools = getRegisteredTools();
+  McpToolHandler handler;
+  for (auto &t : tools) {
+    if (t.name == "graph_summary") {
+      handler = t.handler;
+      break;
+    }
+  }
+  REQUIRE(handler);
+
+  llvm::json::Object args;
+  auto result = handler(args, ctx);
+  auto obj = parseToolResult(result);
+
+  CHECK(obj.getInteger("nodeCount") == 8);
+  CHECK(obj.getInteger("edgeCount") == 5);
+  CHECK(obj.getInteger("entryPointCount") == 1);
+
+  auto *confHist = obj.getObject("confidenceHistogram");
+  REQUIRE(confHist != nullptr);
+  CHECK(confHist->getInteger("Proven") == 3);
+  CHECK(confHist->getInteger("Plausible") == 2);
+  CHECK(confHist->getInteger("Unknown") == 0);
+
+  auto *kindHist = obj.getObject("edgeKindHistogram");
+  REQUIRE(kindHist != nullptr);
+  CHECK(kindHist->getInteger("DirectCall") == 4);
+  CHECK(kindHist->getInteger("VirtualDispatch") == 1);
+
+  auto *topCallers = obj.getArray("topFanoutCallers");
+  REQUIRE(topCallers != nullptr);
+  REQUIRE(topCallers->size() >= 1);
+  auto *topCaller = (*topCallers)[0].getAsObject();
+  REQUIRE(topCaller != nullptr);
+  CHECK(topCaller->getString("qualifiedName") == "main");
+  CHECK(topCaller->getInteger("count") == 3);
 }

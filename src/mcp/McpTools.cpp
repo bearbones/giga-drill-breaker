@@ -16,10 +16,16 @@
 #include "giga_drill/mcp/McpTools.h"
 #include "giga_drill/mugann/DeadCodeAnalyzer.h"
 
+#include "llvm/ADT/StringRef.h"
+
 #include <algorithm>
+#include <cctype>
 #include <functional>
+#include <optional>
 #include <set>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace giga_drill {
@@ -139,6 +145,76 @@ static llvm::json::Value edgeToJson(const CallGraphEdge &e) {
 }
 
 // ============================================================================
+// Edge filter shared across get_callees, get_callers, find_call_chain
+// ============================================================================
+
+struct EdgeFilter {
+  std::set<EdgeKind> kinds; // empty = allow all
+  std::set<Confidence> includeConfidences; // non-empty overrides minConf
+  bool useIncludeSet = false;
+  Confidence minConf = Confidence::Unknown;
+
+  bool allows(const CallGraphEdge &e) const {
+    if (!kinds.empty() && !kinds.count(e.kind))
+      return false;
+    if (useIncludeSet)
+      return includeConfidences.count(e.confidence) > 0;
+    return confidenceRank(e.confidence) >= confidenceRank(minConf);
+  }
+};
+
+// Parse an EdgeFilter from tool args. Returns an error message on invalid
+// input (specifically, unrecognized include_confidences values).
+static std::optional<std::string>
+parseEdgeFilter(const llvm::json::Object &args, EdgeFilter &out) {
+  if (auto *kindsArr = args.getArray("edge_kinds")) {
+    for (auto &v : *kindsArr) {
+      if (auto s = v.getAsString())
+        out.kinds.insert(parseEdgeKind(*s));
+    }
+  }
+  if (auto *confs = args.getArray("include_confidences")) {
+    out.useIncludeSet = true;
+    for (auto &v : *confs) {
+      auto s = v.getAsString();
+      if (!s)
+        continue;
+      if (*s != "Proven" && *s != "Plausible" && *s != "Unknown") {
+        return "Invalid value in include_confidences: '" + s->str() +
+               "' (expected Proven, Plausible, or Unknown)";
+      }
+      out.includeConfidences.insert(parseConfidence(*s));
+    }
+  } else if (auto mc = args.getString("min_confidence")) {
+    out.minConf = parseConfidence(*mc);
+  }
+  return std::nullopt;
+}
+
+// ============================================================================
+// System path heuristic for analyze_dead_code filtering
+// ============================================================================
+
+static bool isSystemPath(llvm::StringRef path) {
+  if (path.empty())
+    return false;
+  static constexpr llvm::StringLiteral prefixes[] = {
+      "/usr/include/",      "/usr/lib/",
+      "/usr/local/include/", "/usr/local/lib/",
+      "/Library/Developer/", "/Applications/Xcode.app/",
+      "/opt/homebrew/",
+  };
+  for (auto p : prefixes) {
+    if (path.starts_with(p))
+      return true;
+  }
+  // Compiler-internal include directories, e.g. /opt/llvm-20/lib/clang/20/include.
+  if (path.contains("/lib/clang/") || path.contains("/lib/gcc/"))
+    return true;
+  return false;
+}
+
+// ============================================================================
 // Tool 1: lookup_function
 // ============================================================================
 
@@ -173,25 +249,14 @@ static llvm::json::Value handleGetCallees(const llvm::json::Object &args,
   if (!name)
     return makeErrorResult("Missing required parameter 'name'");
 
-  // Optional filters.
-  std::set<EdgeKind> kindFilter;
-  if (auto *kindsArr = args.getArray("edge_kinds")) {
-    for (auto &v : *kindsArr) {
-      if (auto s = v.getAsString())
-        kindFilter.insert(parseEdgeKind(*s));
-    }
-  }
-
-  Confidence minConf = Confidence::Unknown;
-  if (auto mc = args.getString("min_confidence"))
-    minConf = parseConfidence(*mc);
+  EdgeFilter filter;
+  if (auto err = parseEdgeFilter(args, filter))
+    return makeErrorResult(*err);
 
   auto edges = ctx.graph.calleesOf(name->str());
   llvm::json::Array results;
   for (auto *e : edges) {
-    if (!kindFilter.empty() && !kindFilter.count(e->kind))
-      continue;
-    if (confidenceRank(e->confidence) < confidenceRank(minConf))
+    if (!filter.allows(*e))
       continue;
     results.push_back(edgeToJson(*e));
   }
@@ -213,24 +278,14 @@ static llvm::json::Value handleGetCallers(const llvm::json::Object &args,
   if (!name)
     return makeErrorResult("Missing required parameter 'name'");
 
-  std::set<EdgeKind> kindFilter;
-  if (auto *kindsArr = args.getArray("edge_kinds")) {
-    for (auto &v : *kindsArr) {
-      if (auto s = v.getAsString())
-        kindFilter.insert(parseEdgeKind(*s));
-    }
-  }
-
-  Confidence minConf = Confidence::Unknown;
-  if (auto mc = args.getString("min_confidence"))
-    minConf = parseConfidence(*mc);
+  EdgeFilter filter;
+  if (auto err = parseEdgeFilter(args, filter))
+    return makeErrorResult(*err);
 
   auto edges = ctx.graph.callersOf(name->str());
   llvm::json::Array results;
   for (auto *e : edges) {
-    if (!kindFilter.empty() && !kindFilter.count(e->kind))
-      continue;
-    if (confidenceRank(e->confidence) < confidenceRank(minConf))
+    if (!filter.allows(*e))
       continue;
     results.push_back(edgeToJson(*e));
   }
@@ -260,7 +315,10 @@ static llvm::json::Value handleFindCallChain(const llvm::json::Object &args,
   if (auto md = args.getInteger("max_depth"))
     maxDepth = *md;
 
-  // Determine start nodes.
+  EdgeFilter filter;
+  if (auto err = parseEdgeFilter(args, filter))
+    return makeErrorResult(*err);
+
   std::vector<std::string> starts;
   if (auto from = args.getString("from")) {
     starts.push_back(from->str());
@@ -268,11 +326,16 @@ static llvm::json::Value handleFindCallChain(const llvm::json::Object &args,
     starts = ctx.entryPoints;
   }
 
-  // Reverse DFS from target to start nodes (same algorithm as
-  // ControlFlowOracle::findPathsToTarget).
+  // Reverse DFS from target to start nodes. We track the edge used for every
+  // hop so the response can carry kind/confidence/callSite per hop.
   std::set<std::string> startSet(starts.begin(), starts.end());
-  std::vector<std::vector<std::string>> foundPaths;
-  std::vector<std::string> currentPath;
+  struct FoundPath {
+    std::vector<std::string> nodes;              // start -> ... -> target
+    std::vector<const CallGraphEdge *> edges;    // edges[i]: nodes[i] -> nodes[i+1]
+  };
+  std::vector<FoundPath> foundPaths;
+  std::vector<std::string> currentPath;          // target -> ... -> start
+  std::vector<const CallGraphEdge *> currentEdges; // parallel to edges along currentPath
   std::set<std::string> onPath;
 
   std::function<void(const std::string &, unsigned)> dfs =
@@ -286,16 +349,20 @@ static llvm::json::Value handleFindCallChain(const llvm::json::Object &args,
         onPath.insert(node);
 
         if (startSet.count(node)) {
-          // Found a path — store reversed (start -> ... -> target).
-          std::vector<std::string> path(currentPath.rbegin(),
-                                        currentPath.rend());
-          foundPaths.push_back(std::move(path));
+          FoundPath fp;
+          fp.nodes.assign(currentPath.rbegin(), currentPath.rend());
+          fp.edges.assign(currentEdges.rbegin(), currentEdges.rend());
+          foundPaths.push_back(std::move(fp));
         } else {
           auto callers = ctx.graph.callersOf(node);
           for (auto *edge : callers) {
             if (onPath.count(edge->callerName))
               continue;
+            if (!filter.allows(*edge))
+              continue;
+            currentEdges.push_back(edge);
             dfs(edge->callerName, depth + 1);
+            currentEdges.pop_back();
             if (static_cast<int64_t>(foundPaths.size()) >= maxPaths)
               break;
           }
@@ -308,10 +375,17 @@ static llvm::json::Value handleFindCallChain(const llvm::json::Object &args,
   dfs(to->str(), 0);
 
   llvm::json::Array pathsJson;
-  for (auto &path : foundPaths) {
+  for (auto &fp : foundPaths) {
     llvm::json::Array chain;
-    for (auto &fn : path)
-      chain.push_back(fn);
+    for (auto *edge : fp.edges) {
+      llvm::json::Object hop;
+      hop["from"] = edge->callerName;
+      hop["to"] = edge->calleeName;
+      hop["kind"] = edgeKindToString(edge->kind);
+      hop["confidence"] = confidenceToString(edge->confidence);
+      hop["callSite"] = edge->callSite;
+      chain.push_back(llvm::json::Value(std::move(hop)));
+    }
     pathsJson.push_back(llvm::json::Value(std::move(chain)));
   }
 
@@ -392,7 +466,41 @@ handleQueryCallSiteContext(const llvm::json::Object &args,
   if (!callSite)
     return makeErrorResult("Missing required parameter 'call_site'");
 
-  auto info = ctx.oracle.queryCallSite(callSite->str());
+  // Validate file:line:col format. Split on the rightmost two colons so that
+  // Unix absolute paths are preserved.
+  auto raw = callSite->str();
+  auto lastColon = raw.rfind(':');
+  auto secondLast =
+      lastColon == std::string::npos ? std::string::npos
+                                      : raw.rfind(':', lastColon - 1);
+  auto isDigits = [](llvm::StringRef s) {
+    if (s.empty())
+      return false;
+    for (char c : s)
+      if (!std::isdigit(static_cast<unsigned char>(c)))
+        return false;
+    return true;
+  };
+  if (lastColon == std::string::npos || secondLast == std::string::npos ||
+      secondLast == 0 ||
+      !isDigits(llvm::StringRef(raw).substr(secondLast + 1,
+                                            lastColon - secondLast - 1)) ||
+      !isDigits(llvm::StringRef(raw).substr(lastColon + 1))) {
+    return makeErrorResult(
+        "Invalid call_site format: expected 'file:line:col' (e.g. "
+        "'src/foo.cpp:12:3'), got '" +
+        raw + "'");
+  }
+
+  // Distinguish "not indexed" from "indexed with no enclosing try".
+  if (!ctx.cfIndex.contextAtSite(raw)) {
+    return makeErrorResult(
+        "Call site not indexed: '" + raw +
+        "'. Ensure the path matches the compilation database "
+        "canonicalization (typically an absolute path).");
+  }
+
+  auto info = ctx.oracle.queryCallSite(raw);
 
   llvm::json::Object obj;
   obj["callSite"] = info.callSite;
@@ -456,6 +564,28 @@ static llvm::json::Value handleAnalyzeDeadCode(const llvm::json::Object &args,
   if (auto io = args.getBoolean("include_optimistic"))
     includeOptimistic = *io;
 
+  bool includeSystem = false;
+  if (auto is = args.getBoolean("include_system"))
+    includeSystem = *is;
+
+  std::string namePrefix;
+  if (auto np = args.getString("name_prefix"))
+    namePrefix = np->str();
+  std::string filePrefix;
+  if (auto fp = args.getString("file_prefix"))
+    filePrefix = fp->str();
+
+  int64_t limit = 500;
+  if (auto l = args.getInteger("limit"))
+    limit = *l;
+  int64_t offset = 0;
+  if (auto o = args.getInteger("offset"))
+    offset = *o;
+  if (limit < 0)
+    limit = 0;
+  if (offset < 0)
+    offset = 0;
+
   DeadCodeAnalyzer analyzer(ctx.graph, entryPoints);
   analyzer.analyzePessimistic();
   if (includeOptimistic)
@@ -463,8 +593,26 @@ static llvm::json::Value handleAnalyzeDeadCode(const llvm::json::Object &args,
 
   auto results = analyzer.getResults();
 
-  // Group by liveness.
-  llvm::json::Array alive, optimistic, dead;
+  // Counts of all categories, computed before filtering — aliveCount and
+  // optimisticallyAliveCount are meta-stats, not affected by the dead-list
+  // filters below.
+  int64_t aliveCount = 0, optimisticCount = 0;
+
+  auto passesFilter = [&](const CallGraphNode *node,
+                          const std::string &name) {
+    if (!includeSystem && node && isSystemPath(node->file))
+      return false;
+    if (!namePrefix.empty() && !llvm::StringRef(name).starts_with(namePrefix))
+      return false;
+    if (!filePrefix.empty() &&
+        (!node || !llvm::StringRef(node->file).starts_with(filePrefix)))
+      return false;
+    return true;
+  };
+
+  llvm::json::Array optimistic;
+  // Collect filtered dead entries first so we can paginate.
+  std::vector<llvm::json::Value> deadAll;
   for (auto &kv : results) {
     auto *node = ctx.graph.findNode(kv.first);
     llvm::json::Object entry;
@@ -476,22 +624,36 @@ static llvm::json::Value handleAnalyzeDeadCode(const llvm::json::Object &args,
 
     switch (kv.second) {
     case Liveness::Alive:
-      alive.push_back(llvm::json::Value(std::move(entry)));
+      ++aliveCount;
       break;
     case Liveness::OptimisticallyAlive:
-      optimistic.push_back(llvm::json::Value(std::move(entry)));
+      ++optimisticCount;
+      if (passesFilter(node, kv.first))
+        optimistic.push_back(llvm::json::Value(std::move(entry)));
       break;
     case Liveness::Dead:
-      dead.push_back(llvm::json::Value(std::move(entry)));
+      if (passesFilter(node, kv.first))
+        deadAll.push_back(llvm::json::Value(std::move(entry)));
       break;
     }
   }
 
+  const int64_t totalDead = static_cast<int64_t>(deadAll.size());
+  const int64_t start = std::min(offset, totalDead);
+  const int64_t end = std::min(start + limit, totalDead);
+  llvm::json::Array dead;
+  for (int64_t i = start; i < end; ++i)
+    dead.push_back(std::move(deadAll[i]));
+
   llvm::json::Object obj;
   obj["totalFunctions"] = static_cast<int64_t>(results.size());
-  obj["aliveCount"] = static_cast<int64_t>(alive.size());
-  obj["optimisticallyAliveCount"] = static_cast<int64_t>(optimistic.size());
+  obj["aliveCount"] = aliveCount;
+  obj["optimisticallyAliveCount"] = optimisticCount;
+  obj["totalDead"] = totalDead;
   obj["deadCount"] = static_cast<int64_t>(dead.size());
+  obj["offset"] = offset;
+  obj["limit"] = limit;
+  obj["truncated"] = end < totalDead;
   obj["dead"] = std::move(dead);
   obj["optimisticallyAlive"] = std::move(optimistic);
   // Omit alive list to keep response size down — caller usually wants dead.
@@ -551,6 +713,102 @@ handleGetClassHierarchy(const llvm::json::Object &args,
     obj["virtualMethodOverrides"] = std::move(overridesArr);
   }
 
+  return makeTextResult(llvm::json::Value(std::move(obj)));
+}
+
+// ============================================================================
+// Tool 9: list_entry_points
+// ============================================================================
+
+static llvm::json::Value
+handleListEntryPoints(const llvm::json::Object & /*args*/,
+                      const McpToolContext &ctx) {
+  llvm::json::Array entries;
+  for (auto &ep : ctx.entryPoints) {
+    llvm::json::Object entry;
+    entry["name"] = ep;
+    if (auto *node = ctx.graph.findNode(ep)) {
+      entry["file"] = node->file;
+      entry["line"] = static_cast<int64_t>(node->line);
+      if (!node->enclosingClass.empty())
+        entry["enclosingClass"] = node->enclosingClass;
+    }
+    entries.push_back(llvm::json::Value(std::move(entry)));
+  }
+
+  llvm::json::Object obj;
+  obj["count"] = static_cast<int64_t>(entries.size());
+  obj["entryPoints"] = std::move(entries);
+  return makeTextResult(llvm::json::Value(std::move(obj)));
+}
+
+// ============================================================================
+// Tool 10: graph_summary
+// ============================================================================
+
+static llvm::json::Value
+handleGraphSummary(const llvm::json::Object & /*args*/,
+                   const McpToolContext &ctx) {
+  size_t totalEdges = 0;
+  std::unordered_map<Confidence, size_t> confHist;
+  std::unordered_map<EdgeKind, size_t> kindHist;
+  std::vector<std::pair<std::string, size_t>> callerFanout;
+  std::unordered_map<std::string, size_t> calleeInDegree;
+
+  for (auto *node : ctx.graph.allNodes()) {
+    auto edges = ctx.graph.calleesOf(node->qualifiedName);
+    if (!edges.empty())
+      callerFanout.emplace_back(node->qualifiedName, edges.size());
+    for (auto *e : edges) {
+      ++totalEdges;
+      ++confHist[e->confidence];
+      ++kindHist[e->kind];
+      ++calleeInDegree[e->calleeName];
+    }
+  }
+
+  auto topN = [](std::vector<std::pair<std::string, size_t>> v,
+                 size_t n) -> llvm::json::Array {
+    std::sort(v.begin(), v.end(),
+              [](const auto &a, const auto &b) { return a.second > b.second; });
+    if (v.size() > n)
+      v.resize(n);
+    llvm::json::Array out;
+    for (auto &p : v) {
+      llvm::json::Object e;
+      e["qualifiedName"] = p.first;
+      e["count"] = static_cast<int64_t>(p.second);
+      out.push_back(llvm::json::Value(std::move(e)));
+    }
+    return out;
+  };
+
+  std::vector<std::pair<std::string, size_t>> calleeInVec(
+      calleeInDegree.begin(), calleeInDegree.end());
+
+  llvm::json::Object conf;
+  conf["Proven"] = static_cast<int64_t>(confHist[Confidence::Proven]);
+  conf["Plausible"] = static_cast<int64_t>(confHist[Confidence::Plausible]);
+  conf["Unknown"] = static_cast<int64_t>(confHist[Confidence::Unknown]);
+
+  llvm::json::Object kinds;
+  for (auto kind :
+       {EdgeKind::DirectCall, EdgeKind::VirtualDispatch,
+        EdgeKind::FunctionPointer, EdgeKind::ConstructorCall,
+        EdgeKind::DestructorCall, EdgeKind::OperatorCall,
+        EdgeKind::TemplateInstantiation}) {
+    kinds[edgeKindToString(kind)] = static_cast<int64_t>(kindHist[kind]);
+  }
+
+  llvm::json::Object obj;
+  obj["nodeCount"] = static_cast<int64_t>(ctx.graph.nodeCount());
+  obj["edgeCount"] = static_cast<int64_t>(totalEdges);
+  obj["callSiteCount"] = static_cast<int64_t>(ctx.cfIndex.size());
+  obj["entryPointCount"] = static_cast<int64_t>(ctx.entryPoints.size());
+  obj["confidenceHistogram"] = llvm::json::Value(std::move(conf));
+  obj["edgeKindHistogram"] = llvm::json::Value(std::move(kinds));
+  obj["topFanoutCallers"] = topN(std::move(callerFanout), 5);
+  obj["topFanoutCallees"] = topN(std::move(calleeInVec), 5);
   return makeTextResult(llvm::json::Value(std::move(obj)));
 }
 
@@ -622,7 +880,12 @@ std::vector<McpToolEntry> getRegisteredTools() {
         "Filter by edge kind: DirectCall, VirtualDispatch, FunctionPointer, "
         "ConstructorCall, DestructorCall, OperatorCall, TemplateInstantiation");
     props["min_confidence"] = stringProp(
-        "Minimum confidence: Proven, Plausible, or Unknown (default: Unknown)");
+        "Inclusive minimum confidence tier: Proven, Plausible, or Unknown "
+        "(default: Unknown). Plausible includes both Plausible and Proven "
+        "edges. Use include_confidences to select exact tiers.");
+    props["include_confidences"] = stringArrayProp(
+        "Explicit set of confidence tiers to include (e.g. [\"Plausible\"] "
+        "returns only Plausible edges). Overrides min_confidence.");
     llvm::json::Array req;
     req.push_back("name");
     llvm::json::Object schema;
@@ -644,7 +907,11 @@ std::vector<McpToolEntry> getRegisteredTools() {
     props["edge_kinds"] = stringArrayProp(
         "Filter by edge kind: DirectCall, VirtualDispatch, etc.");
     props["min_confidence"] = stringProp(
-        "Minimum confidence: Proven, Plausible, or Unknown (default: Unknown)");
+        "Inclusive minimum confidence tier: Proven, Plausible, or Unknown "
+        "(default: Unknown). Plausible includes both Plausible and Proven "
+        "edges. Use include_confidences to select exact tiers.");
+    props["include_confidences"] = stringArrayProp(
+        "Explicit set of confidence tiers to include. Overrides min_confidence.");
     llvm::json::Array req;
     req.push_back("name");
     llvm::json::Object schema;
@@ -665,8 +932,19 @@ std::vector<McpToolEntry> getRegisteredTools() {
     props["from"] = stringProp(
         "Source function qualified name (omit to use entry points)");
     props["to"] = stringProp("Target function qualified name");
-    props["max_paths"] = intProp("Maximum number of paths to return (default: 10)");
-    props["max_depth"] = intProp("Maximum chain length (default: 20)");
+    props["max_paths"] =
+        intProp("Maximum number of paths to return (default: 10)");
+    props["max_depth"] = intProp(
+        "Maximum number of edges in a chain, i.e. node count minus one "
+        "(default: 20)");
+    props["edge_kinds"] = stringArrayProp(
+        "Prune hops whose edge kind is not in this set.");
+    props["min_confidence"] = stringProp(
+        "Inclusive minimum confidence tier applied to every hop on the "
+        "path (default: Unknown).");
+    props["include_confidences"] = stringArrayProp(
+        "Explicit set of confidence tiers allowed at every hop. Overrides "
+        "min_confidence.");
     llvm::json::Array req;
     req.push_back("to");
     llvm::json::Object schema;
@@ -676,7 +954,8 @@ std::vector<McpToolEntry> getRegisteredTools() {
 
     tools.push_back({"find_call_chain",
                      "Find call chains from a source function (or entry points) "
-                     "to a target function. Returns all discovered paths.",
+                     "to a target function. Each path is an array of hop "
+                     "objects with {from, to, kind, confidence, callSite}.",
                      llvm::json::Value(std::move(schema)),
                      handleFindCallChain});
   }
@@ -707,7 +986,10 @@ std::vector<McpToolEntry> getRegisteredTools() {
   // 6. query_call_site_context
   {
     llvm::json::Object props;
-    props["call_site"] = stringProp("Call site location as file:line:col");
+    props["call_site"] = stringProp(
+        "Call site location formatted as 'file:line:col'. The file path "
+        "must match the compilation database canonicalization (typically "
+        "an absolute path). Returns isError if the site is not indexed.");
     llvm::json::Array req;
     req.push_back("call_site");
     llvm::json::Object schema;
@@ -730,6 +1012,23 @@ std::vector<McpToolEntry> getRegisteredTools() {
         "Entry point function names (default: configured entry points)");
     props["include_optimistic"] = boolProp(
         "Include optimistically-alive functions (default: true)");
+    props["include_system"] = boolProp(
+        "Include functions whose source file lives in a system include "
+        "directory such as /usr/include or compiler-internal clang/gcc "
+        "include dirs (default: false). Stdlib template instantiations "
+        "otherwise dominate the response.");
+    props["name_prefix"] = stringProp(
+        "Only include dead functions whose qualified name starts with "
+        "this prefix.");
+    props["file_prefix"] = stringProp(
+        "Only include dead functions whose source file path starts with "
+        "this prefix.");
+    props["limit"] = intProp(
+        "Maximum number of dead entries to return after filtering "
+        "(default: 500).");
+    props["offset"] = intProp(
+        "Number of filtered dead entries to skip before returning "
+        "(default: 0). Use with limit to paginate.");
     llvm::json::Object schema;
     schema["type"] = "object";
     schema["properties"] = std::move(props);
@@ -737,7 +1036,9 @@ std::vector<McpToolEntry> getRegisteredTools() {
     tools.push_back({"analyze_dead_code",
                      "Run dead code analysis via call graph reachability. "
                      "Reports dead, optimistically-alive, and alive functions "
-                     "from the configured entry points.",
+                     "from the configured entry points. System-header "
+                     "functions are excluded by default; use include_system "
+                     "to include them.",
                      llvm::json::Value(std::move(schema)),
                      handleAnalyzeDeadCode});
   }
@@ -763,6 +1064,36 @@ std::vector<McpToolEntry> getRegisteredTools() {
                      "methods are overridden in each.",
                      llvm::json::Value(std::move(schema)),
                      handleGetClassHierarchy});
+  }
+
+  // 9. list_entry_points
+  {
+    llvm::json::Object schema;
+    schema["type"] = "object";
+    schema["properties"] = llvm::json::Object{};
+
+    tools.push_back({"list_entry_points",
+                     "List the configured entry-point functions with their "
+                     "file/line when resolved in the call graph. Useful for "
+                     "orientation before calling find_call_chain or "
+                     "analyze_dead_code.",
+                     llvm::json::Value(std::move(schema)),
+                     handleListEntryPoints});
+  }
+
+  // 10. graph_summary
+  {
+    llvm::json::Object schema;
+    schema["type"] = "object";
+    schema["properties"] = llvm::json::Object{};
+
+    tools.push_back({"graph_summary",
+                     "Return aggregate statistics about the call graph: node "
+                     "and edge counts, call-site count, entry-point count, "
+                     "top-5 fan-out callers and callees, and histograms by "
+                     "confidence and edge kind.",
+                     llvm::json::Value(std::move(schema)),
+                     handleGraphSummary});
   }
 
   return tools;
