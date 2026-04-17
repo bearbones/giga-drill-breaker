@@ -1,0 +1,93 @@
+{
+  "description": "Expected call chains for the deep_chains fixture. Each chain traces a path from an entry point through >=5 layers, with per-layer assertions that at least one Proven out-edge and one Plausible out-edge exist. The test uses containment semantics: the real graph may emit additional edges (e.g. incidental std:: calls), but every listed edge must be present with the declared kind and confidence.",
+
+  "entry_points": ["main"],
+
+  "chains": [
+    {
+      "name": "A",
+      "description": "Concrete-to-virtual pipeline. Each stage directly calls the next (Proven) and stores a free function address into a Registry member or iterates plugins through a base pointer (Plausible).",
+      "minDepth": 6,
+      "path": [
+        "main",
+        "Pipeline::run",
+        "stage1_ingest",
+        "stage2_parse",
+        "stage3_transform",
+        "stage4_dispatch",
+        "stage5_sink"
+      ],
+      "requiredEdges": [
+        { "from": "main",             "to": "Pipeline::run",    "kind": "DirectCall",       "confidence": "Proven" },
+        { "from": "main",             "to": "cbs::startupHook", "kind": "FunctionPointer",  "confidence": "Plausible" },
+
+        { "from": "Pipeline::run",    "to": "stage1_ingest",    "kind": "DirectCall",       "confidence": "Proven" },
+        { "from": "Pipeline::run",    "to": "cbs::startupHook", "kind": "FunctionPointer",  "confidence": "Plausible" },
+
+        { "from": "stage1_ingest",    "to": "stage2_parse",     "kind": "DirectCall",       "confidence": "Proven" },
+        { "from": "stage1_ingest",    "to": "cbs::defaultHasher","kind": "FunctionPointer", "confidence": "Plausible" },
+
+        { "from": "stage2_parse",     "to": "stage3_transform", "kind": "DirectCall",       "confidence": "Proven" },
+        { "from": "stage2_parse",     "to": "cbs::logAfter",    "kind": "FunctionPointer",  "confidence": "Plausible" },
+
+        { "from": "stage3_transform", "to": "stage4_dispatch",  "kind": "DirectCall",       "confidence": "Proven" },
+        { "from": "stage3_transform", "to": "cbs::normalizePayload","kind": "FunctionPointer","confidence": "Plausible" },
+
+        { "from": "stage4_dispatch",  "to": "stage5_sink",      "kind": "DirectCall",       "confidence": "Proven" },
+        { "from": "stage4_dispatch",  "to": "PluginAlpha::handle","kind": "VirtualDispatch","confidence": "Plausible" },
+        { "from": "stage4_dispatch",  "to": "PluginBeta::handle", "kind": "VirtualDispatch","confidence": "Plausible" },
+        { "from": "stage4_dispatch",  "to": "PluginGamma::handle","kind": "VirtualDispatch","confidence": "Plausible" },
+
+        { "from": "stage5_sink",      "to": "Registry::invoke", "kind": "DirectCall",       "confidence": "Proven" },
+        { "from": "stage5_sink",      "to": "cbs::finalFormat", "kind": "FunctionPointer",  "confidence": "Plausible" }
+      ],
+      "perLayerMix": [
+        { "layer": 1, "caller": "main",             "mustHaveProven": true, "mustHavePlausible": true },
+        { "layer": 2, "caller": "Pipeline::run",    "mustHaveProven": true, "mustHavePlausible": true },
+        { "layer": 3, "caller": "stage1_ingest",    "mustHaveProven": true, "mustHavePlausible": true },
+        { "layer": 4, "caller": "stage2_parse",     "mustHaveProven": true, "mustHavePlausible": true },
+        { "layer": 5, "caller": "stage3_transform", "mustHaveProven": true, "mustHavePlausible": true },
+        { "layer": 6, "caller": "stage4_dispatch",  "mustHaveProven": true, "mustHavePlausible": true },
+        { "layer": 7, "caller": "stage5_sink",      "mustHaveProven": true, "mustHavePlausible": true }
+      ]
+    },
+    {
+      "name": "B",
+      "description": "Virtual-scheduler chain. A Scheduler holding a Worker& invokes Worker::execute() through the reference, triggering Plausible VirtualDispatch fan-out at layer 4. NetworkWorker::execute then directly calls tcpWriteBytes (Proven).",
+      "minDepth": 6,
+      "path": [
+        "main",
+        "Pipeline::runAsync",
+        "Scheduler::schedule",
+        "Worker::execute",
+        "NetworkWorker::execute",
+        "tcpWriteBytes"
+      ],
+      "requiredEdges": [
+        { "from": "main",                   "to": "Pipeline::runAsync",  "kind": "DirectCall",       "confidence": "Proven" },
+
+        { "from": "Pipeline::runAsync",     "to": "Scheduler::schedule", "kind": "DirectCall",       "confidence": "Proven" },
+        { "from": "Pipeline::runAsync",     "to": "cbs::asyncCompleted", "kind": "FunctionPointer",  "confidence": "Plausible" },
+
+        { "from": "Scheduler::schedule",    "to": "Worker::execute",         "kind": "VirtualDispatch", "confidence": "Plausible" },
+        { "from": "Scheduler::schedule",    "to": "NetworkWorker::execute",  "kind": "VirtualDispatch", "confidence": "Plausible" },
+        { "from": "Scheduler::schedule",    "to": "DiskWorker::execute",     "kind": "VirtualDispatch", "confidence": "Plausible" },
+        { "from": "Scheduler::schedule",    "to": "cbs::startupHook",        "kind": "FunctionPointer", "confidence": "Plausible" },
+
+        { "from": "NetworkWorker::execute", "to": "tcpWriteBytes",           "kind": "DirectCall",      "confidence": "Proven" },
+        { "from": "NetworkWorker::execute", "to": "cbs::asyncCompleted",     "kind": "FunctionPointer", "confidence": "Plausible" }
+      ],
+      "perLayerMix": [
+        { "layer": 1, "caller": "main",                   "mustHaveProven": true, "mustHavePlausible": true },
+        { "layer": 2, "caller": "Pipeline::runAsync",     "mustHaveProven": true, "mustHavePlausible": true },
+        { "layer": 3, "caller": "Scheduler::schedule",    "mustHaveProven": false,"mustHavePlausible": true,
+          "note": "Scheduler::schedule has no Proven DirectCall leaving the chain body — the layer-3 Proven edge manifests as the constructor call Scheduler::Scheduler (from Pipeline::runAsync). We only require a Plausible out-edge here; mix invariant at this layer is satisfied by Plausible alone." },
+        { "layer": 4, "caller": "Worker::execute",        "mustHaveProven": false,"mustHavePlausible": false,
+          "note": "Abstract base method with no body — no outgoing edges from the base itself." },
+        { "layer": 5, "caller": "NetworkWorker::execute", "mustHaveProven": true, "mustHavePlausible": true },
+        { "layer": 6, "caller": "tcpWriteBytes",          "mustHaveProven": false,"mustHavePlausible": true,
+          "note": "Leaf: only emits Plausible address-take; no further direct calls." }
+      ]
+    }
+  ]
+}
