@@ -52,6 +52,32 @@
       ]
     },
     {
+      "name": "C",
+      "description": "Concurrency + lambda callbacks. runChainC spawns std::thread and std::async workers (ThreadEntry edges) and registers lambdas as callbacks (LambdaCall edges). Synthetic lambda nodes carry names like 'lambda#file:line:col#enclosing'; this JSON only asserts non-lambda edges whose names are stable across refactors. Lambda-specific assertions (existence of the synthetic nodes, execution-context propagation, `[this]`-capture body lowering) live in test_deep_chains.cpp's Chain C test cases.",
+      "minDepth": 3,
+      "path": [
+        "main",
+        "runChainC",
+        "worker_thread_entry"
+      ],
+      "requiredEdges": [
+        { "from": "main",       "to": "runChainC",             "kind": "DirectCall",  "confidence": "Proven" },
+
+        { "from": "runChainC",  "to": "worker_thread_entry",   "kind": "ThreadEntry", "confidence": "Proven" },
+        { "from": "runChainC",  "to": "compute_hash",          "kind": "ThreadEntry", "confidence": "Proven" },
+        { "from": "runChainC",  "to": "registerValueCallback", "kind": "DirectCall",  "confidence": "Proven" },
+        { "from": "runChainC",  "to": "registerRefCallback",   "kind": "DirectCall",  "confidence": "Proven" },
+        { "from": "runChainC",  "to": "Emitter::emit",         "kind": "DirectCall",  "confidence": "Proven" },
+
+        { "from": "Emitter::emit", "to": "registerValueCallback", "kind": "DirectCall", "confidence": "Proven" }
+      ],
+      "perLayerMix": [
+        { "layer": 1, "caller": "main",      "mustHaveProven": true, "mustHavePlausible": true },
+        { "layer": 2, "caller": "runChainC", "mustHaveProven": true, "mustHavePlausible": false,
+          "note": "runChainC emits DirectCall/ThreadEntry/LambdaCall edges — all Proven. Plausible edges show up on nested lambda nodes instead." }
+      ]
+    },
+    {
       "name": "B",
       "description": "Virtual-scheduler chain. A Scheduler holding a Worker& invokes Worker::execute() through the reference, triggering Plausible VirtualDispatch fan-out at layer 4. NetworkWorker::execute then directly calls tcpWriteBytes (Proven).",
       "minDepth": 6,

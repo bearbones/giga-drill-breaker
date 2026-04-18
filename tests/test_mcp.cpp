@@ -31,6 +31,71 @@
 using namespace giga_drill;
 
 // ============================================================================
+// Helper: build a Chain-C-shaped graph for callback/concurrency tool tests
+//
+// Mirrors what the real builder produces for examples/deep_chains/runChainC
+// without pulling in a ClangTool invocation. Keeps the MCP tool tests purely
+// unit-level; the end-to-end edge-production behavior lives in
+// test_deep_chains.cpp.
+//
+// Edges exercised:
+//   main      -> runChainC                 DirectCall, Synchronous
+//   runChainC -> worker_thread_entry       ThreadEntry, ThreadSpawn
+//   runChainC -> compute_hash              ThreadEntry, AsyncTask
+//   runChainC -> <lambda-node>             ThreadEntry, ThreadSpawn
+//   runChainC -> <lambda-node>             LambdaCall,  Synchronous
+//   runChainC -> registerValueCallback     DirectCall,  Synchronous
+//   runChainC -> cbs::startupHook          FunctionPointer, Synchronous (Plausible)
+// ============================================================================
+
+static CallGraph buildChainCGraph() {
+  CallGraph g;
+
+  g.addNode({"main", "main.cpp", 75, true, false, ""});
+  g.addNode({"runChainC", "main.cpp", 38, false, false, ""});
+  g.addNode({"worker_thread_entry", "async_workers.cpp", 10, false, false, ""});
+  g.addNode({"compute_hash", "async_workers.cpp", 20, false, false, ""});
+  g.addNode({"registerValueCallback", "lambda_callbacks.cpp", 11, false, false, ""});
+  g.addNode({"cbs::startupHook", "callbacks.cpp", 5, false, false, "cbs"});
+
+  const std::string lam1 = "lambda#main.cpp:49:15#runChainC";
+  const std::string lam2 = "lambda#main.cpp:58:7#runChainC";
+  g.addNode({lam1, "main.cpp", 49, false, false, ""});
+  g.addNode({lam2, "main.cpp", 58, false, false, ""});
+
+  // main -> runChainC: direct call.
+  g.addEdge({"main", "runChainC", EdgeKind::DirectCall,
+             Confidence::Proven, "main.cpp:91:3", 0,
+             ExecutionContext::Synchronous});
+
+  // runChainC -> concurrency targets.
+  g.addEdge({"runChainC", "worker_thread_entry", EdgeKind::ThreadEntry,
+             Confidence::Proven, "main.cpp:40:3", 0,
+             ExecutionContext::ThreadSpawn});
+  g.addEdge({"runChainC", "compute_hash", EdgeKind::ThreadEntry,
+             Confidence::Proven, "main.cpp:43:14", 0,
+             ExecutionContext::AsyncTask});
+  g.addEdge({"runChainC", lam1, EdgeKind::ThreadEntry,
+             Confidence::Proven, "main.cpp:49:15", 0,
+             ExecutionContext::ThreadSpawn});
+
+  // runChainC -> callback registrations (lambda body + direct call).
+  g.addEdge({"runChainC", lam2, EdgeKind::LambdaCall,
+             Confidence::Proven, "main.cpp:58:7", 1,
+             ExecutionContext::Synchronous});
+  g.addEdge({"runChainC", "registerValueCallback", EdgeKind::DirectCall,
+             Confidence::Proven, "main.cpp:57:3", 0,
+             ExecutionContext::Synchronous});
+
+  // runChainC -> function-pointer address-take (Plausible).
+  g.addEdge({"runChainC", "cbs::startupHook", EdgeKind::FunctionPointer,
+             Confidence::Plausible, "main.cpp:45:21", 0,
+             ExecutionContext::Synchronous});
+
+  return g;
+}
+
+// ============================================================================
 // Helper: build a simple test graph
 //
 //   main -> processFile -> readData
@@ -212,9 +277,9 @@ TEST_CASE("readRequest parses Content-Length framed messages",
 // Tool registration tests
 // ============================================================================
 
-TEST_CASE("getRegisteredTools returns all 10 tools", "[mcp][tools]") {
+TEST_CASE("getRegisteredTools returns all 12 tools", "[mcp][tools]") {
   auto tools = getRegisteredTools();
-  CHECK(tools.size() == 10);
+  CHECK(tools.size() == 12);
 
   // Verify tool names.
   std::set<std::string> names;
@@ -231,6 +296,8 @@ TEST_CASE("getRegisteredTools returns all 10 tools", "[mcp][tools]") {
   CHECK(names.count("get_class_hierarchy") == 1);
   CHECK(names.count("list_entry_points") == 1);
   CHECK(names.count("graph_summary") == 1);
+  CHECK(names.count("list_callback_sites") == 1);
+  CHECK(names.count("list_concurrency_entry_points") == 1);
 }
 
 // ============================================================================
@@ -822,4 +889,304 @@ TEST_CASE("graph_summary produces histograms and top-N fanout",
   REQUIRE(topCaller != nullptr);
   CHECK(topCaller->getString("qualifiedName") == "main");
   CHECK(topCaller->getInteger("count") == 3);
+}
+
+// ============================================================================
+// Callback/concurrency MCP tool tests
+//
+// Unit-level coverage for the lambda and thread-entry edges that
+// CallGraphBuilder emits for the deep_chains fixture's Chain C. These tests
+// exercise the MCP tool surface directly against a synthetic graph; the
+// builder-side integration tests live in test_deep_chains.cpp.
+// ============================================================================
+
+namespace {
+McpToolHandler findHandler(const std::vector<McpToolEntry> &tools,
+                           llvm::StringRef name) {
+  for (auto &t : tools)
+    if (t.name == name)
+      return t.handler;
+  return {};
+}
+} // namespace
+
+TEST_CASE("get_callees surfaces ThreadEntry edges with execution context",
+          "[mcp][tools][concurrency]") {
+  auto graph = buildChainCGraph();
+  ControlFlowIndex cfIndex;
+  ControlFlowOracle oracle(graph, cfIndex);
+  std::vector<std::string> eps = {"main"};
+  McpToolContext ctx{graph, oracle, cfIndex, eps};
+
+  auto tools = getRegisteredTools();
+  auto handler = findHandler(tools, "get_callees");
+  REQUIRE(handler);
+
+  SECTION("filter by ThreadEntry returns all three concurrency targets") {
+    llvm::json::Object args;
+    args["name"] = "runChainC";
+    llvm::json::Array kinds;
+    kinds.push_back("ThreadEntry");
+    args["edge_kinds"] = std::move(kinds);
+    auto result = handler(args, ctx);
+    auto obj = parseToolResult(result);
+
+    auto calleeCount = obj.getInteger("calleeCount");
+    REQUIRE(calleeCount.has_value());
+    CHECK(*calleeCount == 3);
+
+    auto *callees = obj.getArray("callees");
+    REQUIRE(callees != nullptr);
+
+    std::set<std::string> targets;
+    std::set<std::string> contexts;
+    for (auto &v : *callees) {
+      auto *o = v.getAsObject();
+      REQUIRE(o != nullptr);
+      CHECK(o->getString("kind") == "ThreadEntry");
+      if (auto t = o->getString("calleeName"))
+        targets.insert(t->str());
+      if (auto c = o->getString("executionContext"))
+        contexts.insert(c->str());
+    }
+    CHECK(targets.count("worker_thread_entry") == 1);
+    CHECK(targets.count("compute_hash") == 1);
+    // At least one synthetic lambda node among the ThreadEntry targets.
+    bool anyLambda = false;
+    for (auto &t : targets)
+      if (llvm::StringRef(t).starts_with("lambda#"))
+        anyLambda = true;
+    CHECK(anyLambda);
+
+    CHECK(contexts.count("ThreadSpawn") == 1);
+    CHECK(contexts.count("AsyncTask") == 1);
+  }
+
+  SECTION("execution_contexts filter narrows to AsyncTask") {
+    llvm::json::Object args;
+    args["name"] = "runChainC";
+    llvm::json::Array ctxs;
+    ctxs.push_back("AsyncTask");
+    args["execution_contexts"] = std::move(ctxs);
+    auto result = handler(args, ctx);
+    auto obj = parseToolResult(result);
+
+    CHECK(obj.getInteger("calleeCount") == 1);
+    auto *callees = obj.getArray("callees");
+    REQUIRE(callees != nullptr);
+    REQUIRE(callees->size() == 1);
+    auto *e0 = (*callees)[0].getAsObject();
+    REQUIRE(e0 != nullptr);
+    CHECK(e0->getString("calleeName") == "compute_hash");
+    CHECK(e0->getString("executionContext") == "AsyncTask");
+  }
+
+  SECTION("invalid execution_contexts value yields error") {
+    llvm::json::Object args;
+    args["name"] = "runChainC";
+    llvm::json::Array ctxs;
+    ctxs.push_back("GreenThreadSomething");
+    args["execution_contexts"] = std::move(ctxs);
+    auto result = handler(args, ctx);
+    CHECK(isErrorResult(result));
+  }
+
+  SECTION("synchronous edges omit executionContext from the response") {
+    // DirectCall from main -> runChainC is Synchronous; edgeToJson must not
+    // emit an "executionContext" key for it (byte-compat with older clients).
+    llvm::json::Object args;
+    args["name"] = "main";
+    auto result = handler(args, ctx);
+    auto obj = parseToolResult(result);
+    auto *callees = obj.getArray("callees");
+    REQUIRE(callees != nullptr);
+    REQUIRE(callees->size() >= 1);
+    auto *first = (*callees)[0].getAsObject();
+    REQUIRE(first != nullptr);
+    CHECK(first->getString("calleeName") == "runChainC");
+    CHECK_FALSE(first->getString("executionContext").has_value());
+  }
+}
+
+TEST_CASE("list_callback_sites groups callback edges by target",
+          "[mcp][tools][callbacks]") {
+  auto graph = buildChainCGraph();
+  ControlFlowIndex cfIndex;
+  ControlFlowOracle oracle(graph, cfIndex);
+  std::vector<std::string> eps = {"main"};
+  McpToolContext ctx{graph, oracle, cfIndex, eps};
+
+  auto tools = getRegisteredTools();
+  auto handler = findHandler(tools, "list_callback_sites");
+  REQUIRE(handler);
+
+  SECTION("returns FunctionPointer and LambdaCall targets grouped by callee") {
+    llvm::json::Object args;
+    auto result = handler(args, ctx);
+    auto obj = parseToolResult(result);
+
+    auto targetCount = obj.getInteger("targetCount");
+    REQUIRE(targetCount.has_value());
+    CHECK(*targetCount >= 2);
+
+    auto *targets = obj.getArray("targets");
+    REQUIRE(targets != nullptr);
+
+    std::set<std::string> names;
+    std::set<std::string> kindsSeen;
+    for (auto &v : *targets) {
+      auto *o = v.getAsObject();
+      REQUIRE(o != nullptr);
+      if (auto t = o->getString("target"))
+        names.insert(t->str());
+      auto *sites = o->getArray("sites");
+      REQUIRE(sites != nullptr);
+      for (auto &s : *sites) {
+        if (auto *so = s.getAsObject())
+          if (auto k = so->getString("kind"))
+            kindsSeen.insert(k->str());
+      }
+    }
+    CHECK(names.count("cbs::startupHook") == 1);
+    bool anyLambda = false;
+    for (auto &n : names)
+      if (llvm::StringRef(n).starts_with("lambda#"))
+        anyLambda = true;
+    CHECK(anyLambda);
+    CHECK(kindsSeen.count("FunctionPointer") == 1);
+    CHECK(kindsSeen.count("LambdaCall") == 1);
+    // ThreadEntry is concurrency, not a callback-site kind — not listed here.
+    CHECK(kindsSeen.count("ThreadEntry") == 0);
+  }
+
+  SECTION("target_prefix narrows results to lambda nodes") {
+    llvm::json::Object args;
+    args["target_prefix"] = "lambda#";
+    auto result = handler(args, ctx);
+    auto obj = parseToolResult(result);
+    auto *targets = obj.getArray("targets");
+    REQUIRE(targets != nullptr);
+    REQUIRE(targets->size() >= 1);
+    for (auto &v : *targets) {
+      auto *o = v.getAsObject();
+      REQUIRE(o != nullptr);
+      auto t = o->getString("target");
+      REQUIRE(t.has_value());
+      CHECK(llvm::StringRef(*t).starts_with("lambda#"));
+    }
+  }
+}
+
+TEST_CASE("list_concurrency_entry_points enumerates ThreadEntry edges",
+          "[mcp][tools][concurrency]") {
+  auto graph = buildChainCGraph();
+  ControlFlowIndex cfIndex;
+  ControlFlowOracle oracle(graph, cfIndex);
+  std::vector<std::string> eps = {"main"};
+  McpToolContext ctx{graph, oracle, cfIndex, eps};
+
+  auto tools = getRegisteredTools();
+  auto handler = findHandler(tools, "list_concurrency_entry_points");
+  REQUIRE(handler);
+
+  SECTION("lists all spawners with correct execution contexts") {
+    llvm::json::Object args;
+    auto result = handler(args, ctx);
+    auto obj = parseToolResult(result);
+
+    auto count = obj.getInteger("count");
+    REQUIRE(count.has_value());
+    CHECK(*count == 3);
+
+    auto *entries = obj.getArray("entries");
+    REQUIRE(entries != nullptr);
+
+    bool sawLambda = false;
+    std::set<std::string> contexts;
+    for (auto &v : *entries) {
+      auto *o = v.getAsObject();
+      REQUIRE(o != nullptr);
+      CHECK(o->getString("spawner") == "runChainC");
+      if (auto t = o->getString("target"))
+        if (llvm::StringRef(*t).starts_with("lambda#"))
+          sawLambda = true;
+      if (auto c = o->getString("executionContext"))
+        contexts.insert(c->str());
+    }
+    CHECK(sawLambda);
+    CHECK(contexts.count("ThreadSpawn") == 1);
+    CHECK(contexts.count("AsyncTask") == 1);
+  }
+
+  SECTION("execution_contexts filter restricts to AsyncTask") {
+    llvm::json::Object args;
+    llvm::json::Array ctxs;
+    ctxs.push_back("AsyncTask");
+    args["execution_contexts"] = std::move(ctxs);
+    auto result = handler(args, ctx);
+    auto obj = parseToolResult(result);
+
+    CHECK(obj.getInteger("count") == 1);
+    auto *entries = obj.getArray("entries");
+    REQUIRE(entries != nullptr);
+    REQUIRE(entries->size() == 1);
+    auto *e0 = (*entries)[0].getAsObject();
+    REQUIRE(e0 != nullptr);
+    CHECK(e0->getString("target") == "compute_hash");
+    CHECK(e0->getString("executionContext") == "AsyncTask");
+  }
+
+  SECTION("invalid execution_contexts value yields error") {
+    llvm::json::Object args;
+    llvm::json::Array ctxs;
+    ctxs.push_back("NotARealContext");
+    args["execution_contexts"] = std::move(ctxs);
+    auto result = handler(args, ctx);
+    CHECK(isErrorResult(result));
+  }
+}
+
+TEST_CASE("find_call_chain propagates executionContext per hop",
+          "[mcp][tools][concurrency]") {
+  auto graph = buildChainCGraph();
+  ControlFlowIndex cfIndex;
+  ControlFlowOracle oracle(graph, cfIndex);
+  std::vector<std::string> eps = {"main"};
+  McpToolContext ctx{graph, oracle, cfIndex, eps};
+
+  auto tools = getRegisteredTools();
+  auto handler = findHandler(tools, "find_call_chain");
+  REQUIRE(handler);
+
+  llvm::json::Object args;
+  args["to"] = "compute_hash";
+  auto result = handler(args, ctx);
+  auto obj = parseToolResult(result);
+
+  auto pathCount = obj.getInteger("pathCount");
+  REQUIRE(pathCount.has_value());
+  REQUIRE(*pathCount >= 1);
+
+  auto *paths = obj.getArray("paths");
+  REQUIRE(paths != nullptr);
+  auto *firstPath = (*paths)[0].getAsArray();
+  REQUIRE(firstPath != nullptr);
+  REQUIRE(firstPath->size() == 2);
+
+  // First hop: main -> runChainC, DirectCall, no executionContext field.
+  auto *hop0 = (*firstPath)[0].getAsObject();
+  REQUIRE(hop0 != nullptr);
+  CHECK(hop0->getString("from") == "main");
+  CHECK(hop0->getString("to") == "runChainC");
+  CHECK(hop0->getString("kind") == "DirectCall");
+  CHECK_FALSE(hop0->getString("executionContext").has_value());
+
+  // Second hop: runChainC -> compute_hash, ThreadEntry, AsyncTask.
+  auto *hop1 = (*firstPath)[1].getAsObject();
+  REQUIRE(hop1 != nullptr);
+  CHECK(hop1->getString("from") == "runChainC");
+  CHECK(hop1->getString("to") == "compute_hash");
+  CHECK(hop1->getString("kind") == "ThreadEntry");
+  CHECK(hop1->getString("confidence") == "Proven");
+  CHECK(hop1->getString("executionContext") == "AsyncTask");
 }

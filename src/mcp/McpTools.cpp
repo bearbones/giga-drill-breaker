@@ -86,8 +86,38 @@ static const char *edgeKindToString(EdgeKind k) {
     return "OperatorCall";
   case EdgeKind::TemplateInstantiation:
     return "TemplateInstantiation";
+  case EdgeKind::LambdaCall:
+    return "LambdaCall";
+  case EdgeKind::ThreadEntry:
+    return "ThreadEntry";
   }
   return "Unknown";
+}
+
+static const char *executionContextToString(ExecutionContext c) {
+  switch (c) {
+  case ExecutionContext::Synchronous:
+    return "Synchronous";
+  case ExecutionContext::ThreadSpawn:
+    return "ThreadSpawn";
+  case ExecutionContext::AsyncTask:
+    return "AsyncTask";
+  case ExecutionContext::PackagedTask:
+    return "PackagedTask";
+  case ExecutionContext::Invoke:
+    return "Invoke";
+  }
+  return "Synchronous";
+}
+
+static std::optional<ExecutionContext>
+parseExecutionContext(llvm::StringRef s) {
+  if (s == "Synchronous") return ExecutionContext::Synchronous;
+  if (s == "ThreadSpawn") return ExecutionContext::ThreadSpawn;
+  if (s == "AsyncTask") return ExecutionContext::AsyncTask;
+  if (s == "PackagedTask") return ExecutionContext::PackagedTask;
+  if (s == "Invoke") return ExecutionContext::Invoke;
+  return std::nullopt;
 }
 
 static const char *confidenceToString(Confidence c) {
@@ -110,6 +140,8 @@ static EdgeKind parseEdgeKind(llvm::StringRef s) {
   if (s == "DestructorCall") return EdgeKind::DestructorCall;
   if (s == "OperatorCall") return EdgeKind::OperatorCall;
   if (s == "TemplateInstantiation") return EdgeKind::TemplateInstantiation;
+  if (s == "LambdaCall") return EdgeKind::LambdaCall;
+  if (s == "ThreadEntry") return EdgeKind::ThreadEntry;
   return EdgeKind::DirectCall; // fallback
 }
 
@@ -141,6 +173,8 @@ static llvm::json::Value edgeToJson(const CallGraphEdge &e) {
   obj["callSite"] = e.callSite;
   if (e.indirectionDepth > 0)
     obj["indirectionDepth"] = static_cast<int64_t>(e.indirectionDepth);
+  if (e.execContext != ExecutionContext::Synchronous)
+    obj["executionContext"] = executionContextToString(e.execContext);
   return llvm::json::Value(std::move(obj));
 }
 
@@ -153,9 +187,12 @@ struct EdgeFilter {
   std::set<Confidence> includeConfidences; // non-empty overrides minConf
   bool useIncludeSet = false;
   Confidence minConf = Confidence::Unknown;
+  std::set<ExecutionContext> execContexts; // empty = allow all
 
   bool allows(const CallGraphEdge &e) const {
     if (!kinds.empty() && !kinds.count(e.kind))
+      return false;
+    if (!execContexts.empty() && !execContexts.count(e.execContext))
       return false;
     if (useIncludeSet)
       return includeConfidences.count(e.confidence) > 0;
@@ -187,6 +224,20 @@ parseEdgeFilter(const llvm::json::Object &args, EdgeFilter &out) {
     }
   } else if (auto mc = args.getString("min_confidence")) {
     out.minConf = parseConfidence(*mc);
+  }
+  if (auto *ctxArr = args.getArray("execution_contexts")) {
+    for (auto &v : *ctxArr) {
+      auto s = v.getAsString();
+      if (!s)
+        continue;
+      auto parsed = parseExecutionContext(*s);
+      if (!parsed) {
+        return "Invalid value in execution_contexts: '" + s->str() +
+               "' (expected Synchronous, ThreadSpawn, AsyncTask, "
+               "PackagedTask, or Invoke)";
+      }
+      out.execContexts.insert(*parsed);
+    }
   }
   return std::nullopt;
 }
@@ -384,6 +435,8 @@ static llvm::json::Value handleFindCallChain(const llvm::json::Object &args,
       hop["kind"] = edgeKindToString(edge->kind);
       hop["confidence"] = confidenceToString(edge->confidence);
       hop["callSite"] = edge->callSite;
+      if (edge->execContext != ExecutionContext::Synchronous)
+        hop["executionContext"] = executionContextToString(edge->execContext);
       chain.push_back(llvm::json::Value(std::move(hop)));
     }
     pathsJson.push_back(llvm::json::Value(std::move(chain)));
@@ -796,7 +849,8 @@ handleGraphSummary(const llvm::json::Object & /*args*/,
        {EdgeKind::DirectCall, EdgeKind::VirtualDispatch,
         EdgeKind::FunctionPointer, EdgeKind::ConstructorCall,
         EdgeKind::DestructorCall, EdgeKind::OperatorCall,
-        EdgeKind::TemplateInstantiation}) {
+        EdgeKind::TemplateInstantiation, EdgeKind::LambdaCall,
+        EdgeKind::ThreadEntry}) {
     kinds[edgeKindToString(kind)] = static_cast<int64_t>(kindHist[kind]);
   }
 
@@ -809,6 +863,107 @@ handleGraphSummary(const llvm::json::Object & /*args*/,
   obj["edgeKindHistogram"] = llvm::json::Value(std::move(kinds));
   obj["topFanoutCallers"] = topN(std::move(callerFanout), 5);
   obj["topFanoutCallees"] = topN(std::move(calleeInVec), 5);
+  return makeTextResult(llvm::json::Value(std::move(obj)));
+}
+
+// ============================================================================
+// Tool 11: list_callback_sites
+// ============================================================================
+
+static llvm::json::Value
+handleListCallbackSites(const llvm::json::Object &args,
+                        const McpToolContext &ctx) {
+  auto targetFilter = args.getString("target_prefix");
+
+  // Group callback-like edges by calleeName.
+  std::map<std::string, std::vector<const CallGraphEdge *>> byTarget;
+  for (auto *node : ctx.graph.allNodes()) {
+    for (auto *e : ctx.graph.calleesOf(node->qualifiedName)) {
+      if (e->kind != EdgeKind::FunctionPointer &&
+          e->kind != EdgeKind::LambdaCall)
+        continue;
+      if (targetFilter && !llvm::StringRef(e->calleeName)
+                               .starts_with(*targetFilter))
+        continue;
+      byTarget[e->calleeName].push_back(e);
+    }
+  }
+
+  llvm::json::Array targets;
+  for (auto &kv : byTarget) {
+    llvm::json::Array sites;
+    for (auto *e : kv.second) {
+      llvm::json::Object site;
+      site["caller"] = e->callerName;
+      site["callSite"] = e->callSite;
+      site["kind"] = edgeKindToString(e->kind);
+      site["confidence"] = confidenceToString(e->confidence);
+      if (e->indirectionDepth > 0)
+        site["indirectionDepth"] = static_cast<int64_t>(e->indirectionDepth);
+      if (e->execContext != ExecutionContext::Synchronous)
+        site["executionContext"] = executionContextToString(e->execContext);
+      sites.push_back(llvm::json::Value(std::move(site)));
+    }
+    llvm::json::Object entry;
+    entry["target"] = kv.first;
+    entry["siteCount"] = static_cast<int64_t>(kv.second.size());
+    entry["sites"] = std::move(sites);
+    targets.push_back(llvm::json::Value(std::move(entry)));
+  }
+
+  llvm::json::Object obj;
+  obj["targetCount"] = static_cast<int64_t>(targets.size());
+  obj["targets"] = std::move(targets);
+  return makeTextResult(llvm::json::Value(std::move(obj)));
+}
+
+// ============================================================================
+// Tool 12: list_concurrency_entry_points
+// ============================================================================
+
+static llvm::json::Value
+handleListConcurrencyEntryPoints(const llvm::json::Object &args,
+                                 const McpToolContext &ctx) {
+  std::set<ExecutionContext> ctxFilter;
+  if (auto *arr = args.getArray("execution_contexts")) {
+    for (auto &v : *arr) {
+      auto s = v.getAsString();
+      if (!s)
+        continue;
+      auto parsed = parseExecutionContext(*s);
+      if (!parsed) {
+        return makeErrorResult(
+            "Invalid value in execution_contexts: '" + s->str() +
+            "' (expected Synchronous, ThreadSpawn, AsyncTask, "
+            "PackagedTask, or Invoke)");
+      }
+      ctxFilter.insert(*parsed);
+    }
+  }
+
+  llvm::json::Array entries;
+  size_t total = 0;
+  for (auto *node : ctx.graph.allNodes()) {
+    for (auto *e : ctx.graph.calleesOf(node->qualifiedName)) {
+      if (e->kind != EdgeKind::ThreadEntry)
+        continue;
+      if (!ctxFilter.empty() && !ctxFilter.count(e->execContext))
+        continue;
+      ++total;
+      llvm::json::Object entry;
+      entry["spawner"] = e->callerName;
+      entry["target"] = e->calleeName;
+      entry["executionContext"] =
+          executionContextToString(e->execContext);
+      entry["callSite"] = e->callSite;
+      entry["confidence"] = confidenceToString(e->confidence);
+      entries.push_back(llvm::json::Value(std::move(entry)));
+    }
+  }
+
+  llvm::json::Object obj;
+  obj["count"] = static_cast<int64_t>(total);
+  obj["entries"] = std::move(entries);
   return makeTextResult(llvm::json::Value(std::move(obj)));
 }
 
@@ -878,7 +1033,8 @@ std::vector<McpToolEntry> getRegisteredTools() {
     props["name"] = stringProp("Qualified name of the caller function");
     props["edge_kinds"] = stringArrayProp(
         "Filter by edge kind: DirectCall, VirtualDispatch, FunctionPointer, "
-        "ConstructorCall, DestructorCall, OperatorCall, TemplateInstantiation");
+        "ConstructorCall, DestructorCall, OperatorCall, TemplateInstantiation, "
+        "LambdaCall, ThreadEntry");
     props["min_confidence"] = stringProp(
         "Inclusive minimum confidence tier: Proven, Plausible, or Unknown "
         "(default: Unknown). Plausible includes both Plausible and Proven "
@@ -886,6 +1042,9 @@ std::vector<McpToolEntry> getRegisteredTools() {
     props["include_confidences"] = stringArrayProp(
         "Explicit set of confidence tiers to include (e.g. [\"Plausible\"] "
         "returns only Plausible edges). Overrides min_confidence.");
+    props["execution_contexts"] = stringArrayProp(
+        "Filter by execution context: Synchronous, ThreadSpawn, AsyncTask, "
+        "PackagedTask, Invoke. Default: all contexts.");
     llvm::json::Array req;
     req.push_back("name");
     llvm::json::Object schema;
@@ -905,13 +1064,18 @@ std::vector<McpToolEntry> getRegisteredTools() {
     llvm::json::Object props;
     props["name"] = stringProp("Qualified name of the callee function");
     props["edge_kinds"] = stringArrayProp(
-        "Filter by edge kind: DirectCall, VirtualDispatch, etc.");
+        "Filter by edge kind: DirectCall, VirtualDispatch, FunctionPointer, "
+        "ConstructorCall, DestructorCall, OperatorCall, TemplateInstantiation, "
+        "LambdaCall, ThreadEntry");
     props["min_confidence"] = stringProp(
         "Inclusive minimum confidence tier: Proven, Plausible, or Unknown "
         "(default: Unknown). Plausible includes both Plausible and Proven "
         "edges. Use include_confidences to select exact tiers.");
     props["include_confidences"] = stringArrayProp(
         "Explicit set of confidence tiers to include. Overrides min_confidence.");
+    props["execution_contexts"] = stringArrayProp(
+        "Filter by execution context: Synchronous, ThreadSpawn, AsyncTask, "
+        "PackagedTask, Invoke. Default: all contexts.");
     llvm::json::Array req;
     req.push_back("name");
     llvm::json::Object schema;
@@ -955,7 +1119,9 @@ std::vector<McpToolEntry> getRegisteredTools() {
     tools.push_back({"find_call_chain",
                      "Find call chains from a source function (or entry points) "
                      "to a target function. Each path is an array of hop "
-                     "objects with {from, to, kind, confidence, callSite}.",
+                     "objects with {from, to, kind, confidence, callSite, "
+                     "executionContext?}. executionContext is only emitted on "
+                     "ThreadEntry hops and other non-Synchronous edges.",
                      llvm::json::Value(std::move(schema)),
                      handleFindCallChain});
   }
@@ -1094,6 +1260,49 @@ std::vector<McpToolEntry> getRegisteredTools() {
                      "confidence and edge kind.",
                      llvm::json::Value(std::move(schema)),
                      handleGraphSummary});
+  }
+
+  // 11. list_callback_sites
+  {
+    llvm::json::Object props;
+    props["target_prefix"] = stringProp(
+        "Optional qualified-name prefix; only targets whose name starts "
+        "with this prefix are returned.");
+    llvm::json::Object schema;
+    schema["type"] = "object";
+    schema["properties"] = std::move(props);
+
+    tools.push_back({"list_callback_sites",
+                     "List every callback registration or invocation site "
+                     "grouped by target. Covers FunctionPointer and "
+                     "LambdaCall edges, including synthetic lambda "
+                     "targets named 'lambda#file:line:col#enclosing'. "
+                     "Returns {target, siteCount, sites:[{caller, callSite, "
+                     "kind, confidence, indirectionDepth?, "
+                     "executionContext?}]}.",
+                     llvm::json::Value(std::move(schema)),
+                     handleListCallbackSites});
+  }
+
+  // 12. list_concurrency_entry_points
+  {
+    llvm::json::Object props;
+    props["execution_contexts"] = stringArrayProp(
+        "Filter by execution context: ThreadSpawn, AsyncTask, "
+        "PackagedTask, Invoke. Default: all ThreadEntry contexts.");
+    llvm::json::Object schema;
+    schema["type"] = "object";
+    schema["properties"] = std::move(props);
+
+    tools.push_back({"list_concurrency_entry_points",
+                     "List every ThreadEntry edge: functions (including "
+                     "synthetic lambda targets) that are handed to "
+                     "std::thread, std::jthread, std::async, "
+                     "std::packaged_task, std::invoke, or std::bind. "
+                     "Returns {count, entries:[{spawner, target, "
+                     "executionContext, callSite, confidence}]}.",
+                     llvm::json::Value(std::move(schema)),
+                     handleListConcurrencyEntryPoints});
   }
 
   return tools;

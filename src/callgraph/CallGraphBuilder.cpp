@@ -50,6 +50,70 @@ static std::string formatLocationHelper(clang::SourceManager &sm,
          std::to_string(col);
 }
 
+// Stable synthetic name for a lambda closure: "lambda#file:line:col#enclosing".
+// Both phases must compute the identical name so Phase 2 edges land on the
+// Phase 1 node. The canonical location is the lambda's closure class
+// begin-loc, which equals the LambdaExpr begin-loc (`[`).
+static std::string lambdaQualifiedName(clang::SourceManager &sm,
+                                       clang::SourceLocation loc,
+                                       const std::string &enclosing) {
+  std::string site = formatLocationHelper(sm, loc);
+  std::string parent = enclosing.empty() ? std::string("<tu>") : enclosing;
+  return "lambda#" + site + "#" + parent;
+}
+
+// Unwrap implicit/temporary/functional-cast wrappers and ask: does this
+// expression denote a LambdaExpr? Handles the common
+// std::function<…>(lambda) and std::thread(lambda, args…) argument shapes.
+static const clang::LambdaExpr *asLambdaExpr(const clang::Expr *expr) {
+  if (!expr)
+    return nullptr;
+  const clang::Expr *cur = expr->IgnoreParenImpCasts();
+  while (cur) {
+    if (auto *le = llvm::dyn_cast<clang::LambdaExpr>(cur))
+      return le;
+    if (auto *mt = llvm::dyn_cast<clang::MaterializeTemporaryExpr>(cur)) {
+      cur = mt->getSubExpr();
+      continue;
+    }
+    if (auto *bt = llvm::dyn_cast<clang::CXXBindTemporaryExpr>(cur)) {
+      cur = bt->getSubExpr();
+      continue;
+    }
+    if (auto *fc = llvm::dyn_cast<clang::CXXFunctionalCastExpr>(cur)) {
+      cur = fc->getSubExpr();
+      continue;
+    }
+    if (auto *cst = llvm::dyn_cast<clang::CastExpr>(cur)) {
+      cur = cst->getSubExpr();
+      continue;
+    }
+    if (auto *ce = llvm::dyn_cast<clang::CXXConstructExpr>(cur)) {
+      if (ce->getNumArgs() >= 1) {
+        cur = ce->getArg(0);
+        continue;
+      }
+    }
+    break;
+  }
+  return nullptr;
+}
+
+// Map a well-known concurrency-spawner qualified name to its ExecutionContext.
+// Returns Synchronous for non-spawners; callers check for != Synchronous.
+static ExecutionContext spawnerContextFor(llvm::StringRef qualifiedName) {
+  if (qualifiedName == "std::thread::thread" ||
+      qualifiedName == "std::jthread::jthread")
+    return ExecutionContext::ThreadSpawn;
+  if (qualifiedName == "std::async")
+    return ExecutionContext::AsyncTask;
+  if (qualifiedName == "std::packaged_task::packaged_task")
+    return ExecutionContext::PackagedTask;
+  if (qualifiedName == "std::invoke" || qualifiedName == "std::bind")
+    return ExecutionContext::Invoke;
+  return ExecutionContext::Synchronous;
+}
+
 // ============================================================================
 // CallGraphIndexerVisitor (Phase 1)
 // ============================================================================
@@ -71,7 +135,25 @@ std::string CallGraphIndexerVisitor::formatLocation(
 std::string CallGraphIndexerVisitor::getCurrentFunction() const {
   if (funcStack_.empty())
     return "";
-  return funcStack_.back()->getQualifiedNameAsString();
+  auto *top = funcStack_.back();
+  if (auto *md = llvm::dyn_cast<clang::CXXMethodDecl>(top)) {
+    if (md->getParent() && md->getParent()->isLambda()) {
+      // Find the nearest non-lambda enclosing function.
+      std::string enclosing;
+      for (auto it = funcStack_.rbegin() + 1; it != funcStack_.rend(); ++it) {
+        auto *fd = *it;
+        if (auto *mm = llvm::dyn_cast<clang::CXXMethodDecl>(fd)) {
+          if (mm->getParent() && mm->getParent()->isLambda())
+            continue;
+        }
+        enclosing = fd->getQualifiedNameAsString();
+        break;
+      }
+      return lambdaQualifiedName(sm_, md->getParent()->getBeginLoc(),
+                                 enclosing);
+    }
+  }
+  return top->getQualifiedNameAsString();
 }
 
 bool CallGraphIndexerVisitor::TraverseFunctionDecl(
@@ -203,6 +285,49 @@ void CallGraphIndexerVisitor::computeEffectiveImpls(
   }
 }
 
+bool CallGraphIndexerVisitor::TraverseLambdaExpr(clang::LambdaExpr *expr) {
+  // While inside the lambda body, bodyFunc_ should be the call operator so
+  // nested VisitReturnStmt / visitor methods attribute to the lambda node.
+  auto *op = expr->getCallOperator();
+  if (op)
+    funcStack_.push_back(op);
+  bool result = RecursiveASTVisitor::TraverseLambdaExpr(expr);
+  if (op)
+    funcStack_.pop_back();
+  return result;
+}
+
+bool CallGraphIndexerVisitor::VisitLambdaExpr(clang::LambdaExpr *expr) {
+  // At this point TraverseLambdaExpr has already pushed the call operator, so
+  // skip the top frame when searching for the real enclosing function.
+  std::string enclosing;
+  auto begin = funcStack_.rbegin();
+  if (begin != funcStack_.rend()) {
+    if (auto *md = llvm::dyn_cast<clang::CXXMethodDecl>(*begin)) {
+      if (md->getParent() && md->getParent()->isLambda())
+        ++begin;
+    }
+  }
+  for (auto it = begin; it != funcStack_.rend(); ++it) {
+    auto *fd = *it;
+    if (auto *md = llvm::dyn_cast<clang::CXXMethodDecl>(fd)) {
+      if (md->getParent() && md->getParent()->isLambda())
+        continue;
+    }
+    enclosing = fd->getQualifiedNameAsString();
+    break;
+  }
+
+  CallGraphNode node;
+  node.qualifiedName =
+      lambdaQualifiedName(sm_, expr->getBeginLoc(), enclosing);
+  node.file = getFilePath(expr->getBeginLoc());
+  node.line = sm_.getSpellingLineNumber(expr->getBeginLoc());
+  node.enclosingClass = enclosing;
+  graph_.addNode(std::move(node));
+  return true;
+}
+
 bool CallGraphIndexerVisitor::VisitReturnStmt(clang::ReturnStmt *stmt) {
   auto *retVal = stmt->getRetValue();
   if (!retVal)
@@ -244,7 +369,24 @@ std::string CallGraphEdgeVisitor::formatLocation(
 std::string CallGraphEdgeVisitor::getCurrentFunction() const {
   if (funcStack_.empty())
     return "";
-  return funcStack_.back()->getQualifiedNameAsString();
+  auto *top = funcStack_.back();
+  if (auto *md = llvm::dyn_cast<clang::CXXMethodDecl>(top)) {
+    if (md->getParent() && md->getParent()->isLambda()) {
+      std::string enclosing;
+      for (auto it = funcStack_.rbegin() + 1; it != funcStack_.rend(); ++it) {
+        auto *fd = *it;
+        if (auto *mm = llvm::dyn_cast<clang::CXXMethodDecl>(fd)) {
+          if (mm->getParent() && mm->getParent()->isLambda())
+            continue;
+        }
+        enclosing = fd->getQualifiedNameAsString();
+        break;
+      }
+      return lambdaQualifiedName(sm_, md->getParent()->getBeginLoc(),
+                                 enclosing);
+    }
+  }
+  return top->getQualifiedNameAsString();
 }
 
 bool CallGraphEdgeVisitor::isInUserCode(clang::SourceLocation loc) const {
@@ -276,12 +418,93 @@ bool CallGraphEdgeVisitor::TraverseCXXConstructorDecl(
   return result;
 }
 
+bool CallGraphEdgeVisitor::TraverseLambdaExpr(clang::LambdaExpr *expr) {
+  auto *op = expr->getCallOperator();
+  if (op)
+    funcStack_.push_back(op);
+  bool result = RecursiveASTVisitor::TraverseLambdaExpr(expr);
+  if (op)
+    funcStack_.pop_back();
+  return result;
+}
+
 bool CallGraphEdgeVisitor::TraverseCXXDestructorDecl(
     clang::CXXDestructorDecl *decl) {
   funcStack_.push_back(decl);
   bool result = RecursiveASTVisitor::TraverseCXXDestructorDecl(decl);
   funcStack_.pop_back();
   return result;
+}
+
+std::string CallGraphEdgeVisitor::enclosingNonLambdaName() const {
+  for (auto it = funcStack_.rbegin(); it != funcStack_.rend(); ++it) {
+    auto *fd = *it;
+    if (auto *md = llvm::dyn_cast<clang::CXXMethodDecl>(fd)) {
+      if (md->getParent() && md->getParent()->isLambda())
+        continue;
+    }
+    return fd->getQualifiedNameAsString();
+  }
+  return "";
+}
+
+void CallGraphEdgeVisitor::processCallableArgs(
+    llvm::ArrayRef<clang::Expr *> args, const std::string &caller,
+    clang::SourceLocation callSite, ExecutionContext spawnerCtx) {
+  const bool isSpawner = spawnerCtx != ExecutionContext::Synchronous;
+  const EdgeKind ptrEdgeKind =
+      isSpawner ? EdgeKind::ThreadEntry : EdgeKind::FunctionPointer;
+  const EdgeKind lambdaEdgeKind =
+      isSpawner ? EdgeKind::ThreadEntry : EdgeKind::LambdaCall;
+  const std::string siteStr = formatLocation(callSite);
+
+  for (auto *argExpr : args) {
+    if (!argExpr)
+      continue;
+    auto *arg = argExpr->IgnoreParenImpCasts();
+
+    // Lambda passed as argument (direct, or wrapped in std::function /
+    // packaged_task / bind trampolines).
+    if (auto *le = asLambdaExpr(argExpr)) {
+      std::string lambdaName = lambdaQualifiedName(
+          sm_, le->getBeginLoc(), enclosingNonLambdaName());
+      graph_.addEdge({caller, lambdaName, lambdaEdgeKind, Confidence::Proven,
+                      siteStr, 1, spawnerCtx});
+      continue;
+    }
+
+    // Unwrap `&f` (explicit address-take of a function or member function).
+    if (auto *uo = llvm::dyn_cast<clang::UnaryOperator>(arg)) {
+      if (uo->getOpcode() == clang::UO_AddrOf)
+        arg = uo->getSubExpr()->IgnoreParenImpCasts();
+    }
+
+    if (auto *dre = llvm::dyn_cast<clang::DeclRefExpr>(arg)) {
+      if (auto *funcDecl =
+              llvm::dyn_cast<clang::FunctionDecl>(dre->getDecl())) {
+        graph_.addEdge({caller, funcDecl->getQualifiedNameAsString(),
+                        ptrEdgeKind, Confidence::Proven, siteStr, 1,
+                        spawnerCtx});
+        handledRefs_.insert(dre);
+      } else if (auto *varDecl =
+                     llvm::dyn_cast<clang::VarDecl>(dre->getDecl())) {
+        auto fnIt = varFuncSources_.find(varDecl);
+        if (fnIt != varFuncSources_.end()) {
+          for (const auto &funcName : fnIt->second) {
+            graph_.addEdge({caller, funcName, ptrEdgeKind,
+                            Confidence::Proven, siteStr, 2, spawnerCtx});
+          }
+          handledRefs_.insert(dre);
+        }
+        auto lamIt = varLambdaSources_.find(varDecl);
+        if (lamIt != varLambdaSources_.end()) {
+          graph_.addEdge({caller, lamIt->second, lambdaEdgeKind,
+                          Confidence::Proven, siteStr, 1, spawnerCtx});
+          handledRefs_.insert(dre);
+        }
+      }
+    }
+  }
 }
 
 bool CallGraphEdgeVisitor::VisitCallExpr(clang::CallExpr *expr) {
@@ -301,32 +524,18 @@ bool CallGraphEdgeVisitor::VisitCallExpr(clang::CallExpr *expr) {
     }
   }
 
-  // Process arguments: detect function pointers passed as arguments.
-  for (unsigned i = 0; i < expr->getNumArgs(); ++i) {
-    auto *arg = expr->getArg(i)->IgnoreParenImpCasts();
-    if (auto *dre = llvm::dyn_cast<clang::DeclRefExpr>(arg)) {
-      if (auto *funcDecl =
-              llvm::dyn_cast<clang::FunctionDecl>(dre->getDecl())) {
-        // Function passed directly as argument: Proven, depth=1.
-        graph_.addEdge({caller, funcDecl->getQualifiedNameAsString(),
-                        EdgeKind::FunctionPointer, Confidence::Proven,
-                        formatLocation(expr->getBeginLoc()), 1});
-        handledRefs_.insert(dre);
-      } else if (auto *varDecl =
-                     llvm::dyn_cast<clang::VarDecl>(dre->getDecl())) {
-        // Variable possibly holding a function pointer from a return value.
-        auto it = varFuncSources_.find(varDecl);
-        if (it != varFuncSources_.end()) {
-          for (const auto &funcName : it->second) {
-            graph_.addEdge({caller, funcName, EdgeKind::FunctionPointer,
-                            Confidence::Proven,
-                            formatLocation(expr->getBeginLoc()), 2});
-          }
-          handledRefs_.insert(dre);
-        }
-      }
-    }
+  // Spawner? (std::async, std::invoke, std::bind, etc. — CallExpr forms.)
+  ExecutionContext spawnerCtx = ExecutionContext::Synchronous;
+  if (auto *direct = expr->getDirectCallee()) {
+    spawnerCtx = spawnerContextFor(direct->getQualifiedNameAsString());
   }
+
+  // Process arguments: detect function pointers and lambdas as callables.
+  std::vector<clang::Expr *> args;
+  args.reserve(expr->getNumArgs());
+  for (unsigned i = 0; i < expr->getNumArgs(); ++i)
+    args.push_back(expr->getArg(i));
+  processCallableArgs(args, caller, expr->getBeginLoc(), spawnerCtx);
 
   auto *callee = expr->getDirectCallee();
   if (!callee)
@@ -443,8 +652,20 @@ bool CallGraphEdgeVisitor::VisitCXXConstructExpr(
   if (!ctor || ctor->isImplicit())
     return true;
 
-  // Add constructor edge.
+  // Concurrency spawner via constructor (e.g. `std::thread t(&fn, arg)`).
+  // Emit ThreadEntry edges for each callable argument in addition to the
+  // normal ConstructorCall edge.
   std::string ctorName = ctor->getQualifiedNameAsString();
+  ExecutionContext spawnerCtx = spawnerContextFor(ctorName);
+  if (spawnerCtx != ExecutionContext::Synchronous) {
+    std::vector<clang::Expr *> args;
+    args.reserve(expr->getNumArgs());
+    for (unsigned i = 0; i < expr->getNumArgs(); ++i)
+      args.push_back(expr->getArg(i));
+    processCallableArgs(args, caller, expr->getBeginLoc(), spawnerCtx);
+  }
+
+  // Add constructor edge.
   graph_.addNode({ctorName, getFilePath(ctor->getLocation()),
                   sm_.getSpellingLineNumber(ctor->getLocation()), false, false,
                   ctor->getParent()->getQualifiedNameAsString()});
@@ -473,6 +694,23 @@ bool CallGraphEdgeVisitor::VisitVarDecl(clang::VarDecl *decl) {
         if (!returns.empty())
           varFuncSources_[decl] = std::move(returns);
       }
+    }
+
+    // Track locals initialized from a lambda expression (e.g.
+    // `auto cb = [=](int x){ ... };` then later `std::thread(cb)`).
+    if (auto *le = asLambdaExpr(init)) {
+      std::string enclosing;
+      for (auto it = funcStack_.rbegin(); it != funcStack_.rend(); ++it) {
+        auto *fd = *it;
+        if (auto *md = llvm::dyn_cast<clang::CXXMethodDecl>(fd)) {
+          if (md->getParent() && md->getParent()->isLambda())
+            continue;
+        }
+        enclosing = fd->getQualifiedNameAsString();
+        break;
+      }
+      varLambdaSources_[decl] =
+          lambdaQualifiedName(sm_, le->getBeginLoc(), enclosing);
     }
   }
 
