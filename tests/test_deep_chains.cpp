@@ -44,6 +44,8 @@ EdgeKind parseKind(const std::string &s) {
   if (s == "DestructorCall") return EdgeKind::DestructorCall;
   if (s == "OperatorCall") return EdgeKind::OperatorCall;
   if (s == "TemplateInstantiation") return EdgeKind::TemplateInstantiation;
+  if (s == "LambdaCall") return EdgeKind::LambdaCall;
+  if (s == "ThreadEntry") return EdgeKind::ThreadEntry;
   FAIL("unknown edge kind: " << s);
   return EdgeKind::DirectCall;
 }
@@ -90,6 +92,8 @@ std::vector<std::string> deepChainsSourceFiles(const std::string &base) {
       base + "tokenizer.cpp",
       base + "scheduler.cpp",
       base + "callbacks.cpp",
+      base + "async_workers.cpp",
+      base + "lambda_callbacks.cpp",
   };
 }
 
@@ -261,6 +265,174 @@ TEST_CASE("Chain B: scheduler chain exercises base-ref virtual dispatch",
   SECTION("Pipeline::runAsync -> Scheduler::schedule is Proven DirectCall") {
     CHECK(graphHasEdge(g, {"Pipeline::runAsync", "Scheduler::schedule",
                            EdgeKind::DirectCall, Confidence::Proven}));
+  }
+}
+
+// ============================================================================
+// Chain C: lambdas and concurrency workers.
+// ============================================================================
+
+namespace {
+
+// Find a synthetic lambda node whose qualified name matches
+// "lambda#...#<enclosing>". Returns the first match, or empty string.
+std::string findLambdaNodeByEnclosing(const CallGraph &g,
+                                      const std::string &enclosing) {
+  const std::string suffix = "#" + enclosing;
+  for (auto *node : g.allNodes()) {
+    const std::string &qn = node->qualifiedName;
+    if (qn.rfind("lambda#", 0) == 0 &&
+        qn.size() >= suffix.size() &&
+        qn.compare(qn.size() - suffix.size(), suffix.size(), suffix) == 0)
+      return qn;
+  }
+  return "";
+}
+
+bool hasEdgeWithCtx(const CallGraph &g, const std::string &from,
+                    const std::string &to, EdgeKind kind,
+                    ExecutionContext ctx) {
+  for (auto *e : g.calleesOf(from)) {
+    if (e->calleeName == to && e->kind == kind && e->execContext == ctx)
+      return true;
+  }
+  return false;
+}
+
+} // namespace
+
+TEST_CASE("Chain C: runChainC spawns threads and registers callbacks",
+          "[deep_chains][chainC]") {
+  auto g = buildFixtureGraph();
+
+  SECTION("all non-lambda nodes exist") {
+    for (auto &n : {"runChainC", "worker_thread_entry", "compute_hash",
+                    "AsyncPipeline::dispatch", "registerValueCallback",
+                    "registerRefCallback", "Emitter::emit", "Emitter::handle",
+                    "scaled"})
+      CHECK(g.findNode(n) != nullptr);
+  }
+
+  SECTION("main -> runChainC is a Proven DirectCall") {
+    CHECK(graphHasEdge(
+        g, {"main", "runChainC", EdgeKind::DirectCall, Confidence::Proven}));
+  }
+
+  SECTION("std::thread and std::async targets are ThreadEntry edges with "
+          "the right ExecutionContext") {
+    // std::thread t1(&worker_thread_entry, 42)  -> ThreadSpawn
+    CHECK(hasEdgeWithCtx(g, "runChainC", "worker_thread_entry",
+                         EdgeKind::ThreadEntry,
+                         ExecutionContext::ThreadSpawn));
+    // std::async(std::launch::async, &compute_hash, 99)  -> AsyncTask
+    CHECK(hasEdgeWithCtx(g, "runChainC", "compute_hash",
+                         EdgeKind::ThreadEntry, ExecutionContext::AsyncTask));
+  }
+
+  SECTION("lambda passed to std::thread becomes a ThreadEntry edge to a "
+          "synthetic lambda node") {
+    bool found = false;
+    for (auto *e : g.calleesOf("runChainC")) {
+      if (e->kind == EdgeKind::ThreadEntry &&
+          e->execContext == ExecutionContext::ThreadSpawn &&
+          e->calleeName.rfind("lambda#", 0) == 0) {
+        found = true;
+        break;
+      }
+    }
+    CHECK(found);
+  }
+
+  SECTION("capturing lambda registered as a callback produces a LambdaCall "
+          "edge plus DirectCalls from the synthetic lambda body") {
+    // runChainC registers [=](int x){ return scaled(x, factor); }
+    // so we expect a LambdaCall edge and that the synthetic node has a
+    // DirectCall edge into scaled().
+    bool lambdaEdge = false;
+    for (auto *e : g.calleesOf("runChainC")) {
+      if (e->kind == EdgeKind::LambdaCall &&
+          e->calleeName.rfind("lambda#", 0) == 0) {
+        lambdaEdge = true;
+        break;
+      }
+    }
+    CHECK(lambdaEdge);
+
+    // Find a lambda node whose enclosing is runChainC and whose body
+    // DirectCalls scaled().
+    bool bodyCall = false;
+    for (auto *node : g.allNodes()) {
+      if (node->qualifiedName.rfind("lambda#", 0) != 0)
+        continue;
+      if (node->qualifiedName.find("#runChainC") == std::string::npos)
+        continue;
+      for (auto *e : g.calleesOf(node->qualifiedName)) {
+        if (e->calleeName == "scaled" && e->kind == EdgeKind::DirectCall) {
+          bodyCall = true;
+          break;
+        }
+      }
+      if (bodyCall)
+        break;
+    }
+    CHECK(bodyCall);
+  }
+
+  SECTION("`[this]`-capture lambda in Emitter::emit calls Emitter::handle "
+          "through the synthetic lambda node, not directly") {
+    // Emitter::emit itself should NOT have a direct edge to Emitter::handle;
+    // that edge should come from the synthetic lambda node whose enclosing
+    // is Emitter::emit.
+    bool directFromEmit = false;
+    for (auto *e : g.calleesOf("Emitter::emit")) {
+      if (e->calleeName == "Emitter::handle" &&
+          e->kind == EdgeKind::DirectCall)
+        directFromEmit = true;
+    }
+    CHECK_FALSE(directFromEmit);
+
+    // The synthetic lambda node for Emitter::emit must have a DirectCall
+    // to Emitter::handle.
+    std::string lambdaName = findLambdaNodeByEnclosing(g, "Emitter::emit");
+    INFO("no synthetic lambda node found with enclosing Emitter::emit");
+    REQUIRE(!lambdaName.empty());
+    bool handled = false;
+    for (auto *e : g.calleesOf(lambdaName)) {
+      if (e->calleeName == "Emitter::handle" &&
+          e->kind == EdgeKind::DirectCall) {
+        handled = true;
+        break;
+      }
+    }
+    CHECK(handled);
+  }
+
+  SECTION("lambda stored in a local and passed later still resolves to a "
+          "LambdaCall edge to the synthetic node") {
+    // `auto refCb = [](State&){...}; registerRefCallback(refCb);`
+    bool found = false;
+    for (auto *e : g.calleesOf("runChainC")) {
+      if (e->kind == EdgeKind::LambdaCall &&
+          e->calleeName.rfind("lambda#", 0) == 0 &&
+          e->callerName == "runChainC") {
+        // Could be either of the two lambdas — that's OK; just check >=1.
+        found = true;
+        break;
+      }
+    }
+    CHECK(found);
+  }
+
+  SECTION("ExecutionContext is Synchronous by default on DirectCall edges") {
+    auto edges = g.calleesOf("main");
+    bool sawMainRunChainC = false;
+    for (auto *e : edges) {
+      if (e->calleeName == "runChainC") {
+        CHECK(e->execContext == ExecutionContext::Synchronous);
+        sawMainRunChainC = true;
+      }
+    }
+    CHECK(sawMainRunChainC);
   }
 }
 

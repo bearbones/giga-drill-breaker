@@ -26,6 +26,8 @@ srcs=(
   tokenizer.cpp
   scheduler.cpp
   callbacks.cpp
+  async_workers.cpp
+  lambda_callbacks.cpp
 )
 
 {

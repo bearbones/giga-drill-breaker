@@ -29,13 +29,33 @@ enum class EdgeKind {
   ConstructorCall,
   DestructorCall,
   OperatorCall,
-  TemplateInstantiation
+  TemplateInstantiation,
+  // A lambda expression or closure object invoked directly or through
+  // std::function. Distinct from FunctionPointer because closures carry
+  // captured state.
+  LambdaCall,
+  // A callable handed to a concurrency primitive (std::thread, std::jthread,
+  // std::async, std::packaged_task, std::invoke, std::bind). The edge points
+  // from the spawner to the target callable; execContext records which
+  // primitive triggered the edge.
+  ThreadEntry
 };
 
 enum class Confidence {
   Proven,
   Plausible,
   Unknown
+};
+
+// Where the callee runs relative to the caller. Recorded on CallGraphEdge so
+// MCP clients can answer "does this callback run synchronously or on another
+// thread/task?" without a second index join.
+enum class ExecutionContext {
+  Synchronous,
+  ThreadSpawn,
+  AsyncTask,
+  PackagedTask,
+  Invoke
 };
 
 struct CallGraphNode {
@@ -54,6 +74,7 @@ struct CallGraphEdge {
   Confidence confidence;
   std::string callSite;
   unsigned indirectionDepth = 0;
+  ExecutionContext execContext = ExecutionContext::Synchronous;
 };
 
 class CallGraph {

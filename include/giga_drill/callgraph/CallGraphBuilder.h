@@ -43,6 +43,8 @@ public:
   bool TraverseCXXMethodDecl(clang::CXXMethodDecl *decl);
   bool TraverseCXXConstructorDecl(clang::CXXConstructorDecl *decl);
   bool TraverseCXXDestructorDecl(clang::CXXDestructorDecl *decl);
+  bool TraverseLambdaExpr(clang::LambdaExpr *expr);
+  bool VisitLambdaExpr(clang::LambdaExpr *expr);
   bool VisitReturnStmt(clang::ReturnStmt *stmt);
 
 private:
@@ -69,6 +71,7 @@ public:
   bool TraverseCXXMethodDecl(clang::CXXMethodDecl *decl);
   bool TraverseCXXConstructorDecl(clang::CXXConstructorDecl *decl);
   bool TraverseCXXDestructorDecl(clang::CXXDestructorDecl *decl);
+  bool TraverseLambdaExpr(clang::LambdaExpr *expr);
 
   bool VisitCallExpr(clang::CallExpr *expr);
   bool VisitCXXConstructExpr(clang::CXXConstructExpr *expr);
@@ -88,6 +91,10 @@ private:
   // Track vars assigned from functions that return function pointers.
   std::map<const clang::VarDecl *, std::set<std::string>> varFuncSources_;
 
+  // Track local vars initialized from a LambdaExpr so concurrency spawners
+  // and downstream callers can resolve the synthetic lambda name.
+  std::map<const clang::VarDecl *, std::string> varLambdaSources_;
+
   std::string getFilePath(clang::SourceLocation loc) const;
   std::string formatLocation(clang::SourceLocation loc) const;
   std::string getCurrentFunction() const;
@@ -99,6 +106,20 @@ private:
   void addConcreteTypeEdges(const std::string &caller,
                             const clang::CXXRecordDecl *cls,
                             clang::SourceLocation loc);
+
+  // Shared argument scan for both CallExpr and CXXConstructExpr spawners.
+  // Emits edges from `caller` for every argument that resolves to a callable
+  // (FunctionDecl, LambdaExpr, or a local var tracked in varFuncSources_ /
+  // varLambdaSources_). If `spawnerCtx` is Synchronous, emits FunctionPointer
+  // edges; otherwise emits ThreadEntry edges with the given context.
+  void processCallableArgs(llvm::ArrayRef<clang::Expr *> args,
+                           const std::string &caller,
+                           clang::SourceLocation callSite,
+                           ExecutionContext spawnerCtx);
+
+  // Resolve the enclosing non-lambda function's qualified name (for synthetic
+  // lambda naming).
+  std::string enclosingNonLambdaName() const;
 };
 
 // Consumer that runs both phases per TU (for single-TU tests).
