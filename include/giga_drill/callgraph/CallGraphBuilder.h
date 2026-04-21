@@ -16,6 +16,7 @@
 #pragma once
 
 #include "giga_drill/callgraph/CallGraph.h"
+#include "giga_drill/callgraph/CollapseFilter.h"
 
 #include "clang/AST/ASTConsumer.h"
 #include "clang/AST/RecursiveASTVisitor.h"
@@ -66,6 +67,7 @@ public:
   CallGraphEdgeVisitor(CallGraph &graph, clang::SourceManager &sm);
 
   void setASTContext(clang::ASTContext *ctx) { ctx_ = ctx; }
+  void setCollapseFilter(const CollapseFilter *filter) { collapse_ = filter; }
 
   bool TraverseFunctionDecl(clang::FunctionDecl *decl);
   bool TraverseCXXMethodDecl(clang::CXXMethodDecl *decl);
@@ -82,6 +84,7 @@ private:
   CallGraph &graph_;
   clang::SourceManager &sm_;
   clang::ASTContext *ctx_ = nullptr;
+  const CollapseFilter *collapse_ = nullptr;
   std::vector<clang::FunctionDecl *> funcStack_;
 
   // Track DeclRefExprs that are direct callees or function-pointer arguments,
@@ -99,6 +102,8 @@ private:
   std::string formatLocation(clang::SourceLocation loc) const;
   std::string getCurrentFunction() const;
   bool isInUserCode(clang::SourceLocation loc) const;
+  bool isCollapsedEdge(clang::SourceLocation callerLoc,
+                       clang::SourceLocation calleeLoc) const;
 
   void handleVirtualDispatch(const std::string &caller,
                              clang::CXXMethodDecl *method,
@@ -155,7 +160,10 @@ private:
 };
 
 // Build a call graph from a compilation database (multi-TU, two-pass).
+// If collapsePaths is non-empty, internal edges within collapsed paths are
+// skipped (boundary edges from non-collapsed callers are preserved).
 CallGraph buildCallGraph(const clang::tooling::CompilationDatabase &compDb,
-                         const std::vector<std::string> &files);
+                         const std::vector<std::string> &files,
+                         const std::vector<std::string> &collapsePaths = {});
 
 } // namespace giga_drill

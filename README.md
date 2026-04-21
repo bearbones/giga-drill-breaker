@@ -1,62 +1,15 @@
 # giga-drill-breaker
 
 A Clang LibTooling backend for safe, AST-aware C++ refactoring and static
-analysis. It exposes two features as subcommands:
+analysis. It exposes four features as subcommands:
 
 - **mugann** — detect problems such as fragile ADL/CTAD resolutions across translation units. `clang-tidy` wishes.
 - **lagann** — apply rule-driven, multi-pass AST matcher transformations
+- **cfquery** — query control flow, exception handling, and call site guard context from the command line
+- **mcp-serve** — start an MCP (Model Context Protocol) server for interactive call graph queries, designed for LLM-assisted code analysis
 
 Designed as a backend for external systems (e.g. a Python script translating
-a custom DSL) that generate matcher/replacement rule specifications.
-
-The names are drawn from *Tengen Toppa Gurren Lagann* (TTGL). See
-[Naming](#naming) for the full breakdown.
-
----
-
-## Naming
-
-The project and its subcommands are named after elements from the 2007 mecha
-anime *Tengen Toppa Gurren Lagann* (天元突破グレンラガン, "Heaven-Piercing
-Gurren Lagann"). The central motif of TTGL is the spiral drill — an
-unstoppable force that breaks through any limit by evolving and combining.
-
-### giga-drill-breaker
-
-The **Giga Drill Breaker** (ギガドリルブレイク) is Gurren Lagann's signature
-finishing move: the mech generates a colossal spiral drill and drives it
-through whatever stands in its way — up to and including the laws of physics.
-The name fits a tool whose job is to break through the structural limitations
-baked into large C++ codebases.
-
-### lagann — the transformation subcommand
-
-**Lagann** (ラガン) is Simon's personal core mech. It is small but contains
-the fundamental power: a spiral drill and the ability to *combine* with any
-other machine, boring into it and reshaping it into something new.
-
-The `lagann` subcommand drills into the
-AST and rewrites what it finds, turn by turn. The multi-pass pipeline echoes
-Lagann's repeated combinations — each pass a new merge, each one producing a
-more evolved result.
-
-### mugann — the fragility-hunting subcommand
-
-The **Mugann** (ムガン) are the Anti-Spiral's biomechanical hunter-killers.
-They are dangerous in a very specific way: they give no warning, they look
-inert until triggered, and were created to impel catastrophe the moment 
-spiral energy (the growing complexity of a repo) grows too successful.
-
-Fragile ADL and CTAD resolutions pose a similarly latent threat. The code compiles 
-without complaint, but depending on which headers happen to be included in what 
-order in the translation unit, the same unqualified call silently resolves to a 
-different overload — or the same CTAD expression deduces a different type.
-In practice, these often manifest as performance hits, but can yield security 
-vulnerabilities that are very hard to detect.
-
-The `mugann` subcommand surveys these vagaries and pciks them out. It indexes 
-declarations across all translation units and then re-walks each TU looking 
-for resolutions that would change if a different header were in scope.
+a custom DSL, or an LLM agent performing security audits via the MCP server).
 
 ---
 
@@ -161,6 +114,74 @@ src/logic.cpp:42:5: Fragile ADL resolution: MathLib::scale(Vector, double) exist
 The `--dry-run` flag collects replacements without writing them to disk,
 which is useful for previewing changes.
 
+### cfquery — Query Control Flow and Exception Context
+
+One-shot CLI queries against a compilation database. Useful for quick
+investigations of individual files.
+
+```bash
+# Dump all call sites with guards and try/catch context
+./build/giga-drill-breaker cfquery \
+  --build-path /path/to/compile_commands_dir \
+  --source SecurityModule.cpp \
+  --mode dump
+
+# Query exception protection for a specific function
+./build/giga-drill-breaker cfquery \
+  --build-path /path/to/compile_commands_dir \
+  --source SecurityModule.cpp \
+  --mode query --query-type exception-protection \
+  --function "RBX::Security::ServerSecurityInstance::onClientChallengeResponse"
+
+# Query call site context (try/catch, guards) at a specific location
+./build/giga-drill-breaker cfquery \
+  --build-path /path/to/compile_commands_dir \
+  --source ServerReplicator.cpp \
+  --mode query --query-type call-site-context \
+  --call-site "ServerReplicator.cpp:2342:13"
+```
+
+**Query types**: `exception-protection`, `call-site-context`, `all-path-contexts`,
+`throw-propagation`, `nearest-catches`
+
+**Edge collapse** — reduce noise from header-inlined utility code:
+```bash
+./build/giga-drill-breaker cfquery \
+  --build-path /path/to/compile_commands_dir \
+  --source SecurityModule.cpp \
+  --collapse-paths Client/Math \
+  --collapse-paths Client/Core \
+  --mode dump
+```
+
+This skips internal edges where both caller and callee are in collapsed
+paths, while preserving boundary edges (calls from non-collapsed code into
+the collapsed region).
+
+### mcp-serve — Interactive Call Graph MCP Server
+
+Starts a persistent MCP server that pre-bakes a call graph and control flow
+index from multiple source files, then serves interactive queries via
+JSON-RPC over stdio.
+
+```bash
+./build/giga-drill-breaker mcp-serve \
+  --build-path /path/to/compile_commands_dir \
+  --source file1.cpp --source file2.cpp --source file3.cpp \
+  --entry-point "main" \
+  --collapse-paths Client/Math \
+  --collapse-paths Client/Core
+```
+
+**MCP tools exposed**: `lookup_function`, `get_callees`, `get_callers`,
+`find_call_chain`, `query_exception_safety`, `query_call_site_context`,
+`analyze_dead_code`, `get_class_hierarchy`
+
+**Key difference from cfquery**: `mcp-serve` indexes all specified sources
+into a unified cross-TU call graph held in memory. `cfquery` parses per
+invocation and is limited to single-TU context. For security audits or
+multi-file analysis, always use `mcp-serve`.
+
 ---
 
 ## Project Structure
@@ -177,9 +198,19 @@ include/giga_drill/
   lagann/                       Public headers — transform pipeline feature
     MatcherEngine.h             Dynamic matcher parsing and execution
     TransformPipeline.h         Multi-pass transform orchestration
+  callgraph/                    Public headers — call graph and control flow
+    CallGraph.h                 Call graph data structure (nodes, edges, hierarchy)
+    CallGraphBuilder.h          Two-phase AST visitors for graph construction
+    CollapseFilter.h            Path-based edge collapse filtering
+    ControlFlowIndex.h          Per-call-site try/catch and guard context
+    ControlFlowOracle.h         Exception safety and path queries
+  mcp/                          Public headers — MCP server
+    McpServer.h                 JSON-RPC MCP server (holds graph in memory)
+    McpTools.h                  MCP tool implementations
+    McpProtocol.h               JSON-RPC protocol framing
 
 src/
-  main.cpp                      CLI entry point (mugann / lagann subcommands)
+  main.cpp                      CLI entry point (mugann / lagann / cfquery / mcp-serve)
   mugann/                       mugann implementation
     GlobalIndex.cpp
     Indexer.cpp
@@ -187,6 +218,17 @@ src/
   lagann/                       lagann implementation
     MatcherEngine.cpp
     TransformPipeline.cpp
+  callgraph/                    callgraph implementation
+    CallGraph.cpp
+    CallGraphBuilder.cpp        Two-phase: index nodes, then build edges
+    CollapseFilter.cpp          Path-component matching for edge collapse
+    ControlFlowIndex.cpp
+    ControlFlowContextVisitor.cpp  Phase 3: try/catch and guard context
+    ControlFlowOracle.cpp
+  mcp/                          mcp-serve implementation
+    McpServer.cpp               JSON-RPC dispatch loop
+    McpProtocol.cpp             Content-Length framing
+    McpTools.cpp                Tool handlers (lookup, callers, callees, etc.)
   CMakeLists.txt
 
 tests/                          Catch2 test suite
@@ -293,5 +335,32 @@ in boilerplate (1130 → 482 bytes) achievable via AST rewriting.
 | Analyzer (two-phase phase 2) | Complete |
 | mugann CLI subcommand | Complete |
 | lagann CLI subcommand | Complete (JSON parsing TODO) |
+| Call graph builder (two-phase) | Complete |
+| Control flow index (phase 3) | Complete |
+| Edge collapse filtering | Complete |
+| cfquery CLI subcommand | Complete |
+| MCP server (mcp-serve) | Complete |
+| MCP tools (8 tools) | Complete |
 | Test suite (unit) | Complete |
 | Test suite (integration stubs) | Stubs present, impl pending |
+
+---
+
+## Naming
+
+The project and its subcommands are named after elements from the 2007 mecha
+anime *Tengen Toppa Gurren Lagann* (TTGL). The central motif is the spiral
+drill — an unstoppable force that breaks through any limit.
+
+- **giga-drill-breaker** — the Giga Drill Breaker finishing move: a colossal
+  spiral drill that pierces through whatever stands in its way. Fits a tool
+  that breaks through structural limitations in large C++ codebases.
+
+- **lagann** — Simon's core mech, whose nature is *transformation and
+  combination*: it bores into other machines and reshapes them. The `lagann`
+  subcommand drills into the AST and rewrites source code turn by turn.
+
+- **mugann** — the Anti-Spiral's hunter-killers. They appear inert and give
+  no warning; the danger is in *how they resolve*. Fragile ADL/CTAD
+  resolutions have the same character: they compile silently and only
+  detonate when include order shifts.

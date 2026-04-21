@@ -11,14 +11,19 @@ others) working in this repository. Read it before making changes.
 and source-to-source transformation. It uses Clang's AST (Abstract Syntax
 Tree) infrastructure to:
 
-1. **Detect fragile ADL/CTAD resolutions** — header-order-sensitive name
-   lookups that silently resolve to different declarations depending on what
-   is included.
-2. **Apply AST matcher transformations** — rule-driven rewrites of C++ source
-   code using Clang's dynamic matcher DSL.
+1. **Detect fragile ADL/CTAD resolutions** (`mugann`) — header-order-sensitive
+   name lookups that silently resolve to different declarations depending on
+   what is included.
+2. **Apply AST matcher transformations** (`lagann`) — rule-driven rewrites of
+   C++ source code using Clang's dynamic matcher DSL.
+3. **Query control flow and exception context** (`cfquery`) — one-shot CLI
+   queries for call site guards, try/catch scopes, and exception safety.
+4. **Interactive call graph MCP server** (`mcp-serve`) — pre-bakes a multi-TU
+   call graph and control flow index, then serves interactive queries via
+   JSON-RPC for LLM-assisted code analysis (security audits, dead code, etc.).
 
-It is designed to be called by external tooling (e.g. a Python orchestrator)
-that supplies matcher/rule specifications.
+It is designed to be called by external tooling (e.g. a Python orchestrator,
+or an LLM agent using the MCP server for security vulnerability analysis).
 
 ---
 
@@ -45,7 +50,7 @@ combines, and breaks through any limit.
 
 ## Feature Layout
 
-The codebase is split into two named feature folders:
+The codebase is split into four feature areas:
 
 ### `mugann` — ADL/CTAD Analysis
 
@@ -73,16 +78,54 @@ The main entry point is `giga_drill::runAnalysis(compDb, files)` defined in
 
 The main entry point is `giga_drill::TransformPipeline::execute(buildPath, files, dryRun)`.
 
+### `callgraph` — Call Graph and Control Flow Analysis
+
+**Headers:** `include/giga_drill/callgraph/`
+**Sources:** `src/callgraph/`
+
+| File | Purpose |
+|---|---|
+| `CallGraph.h/.cpp` | Graph data structure: nodes (functions), edges (calls), class hierarchy, virtual overrides |
+| `CallGraphBuilder.h/.cpp` | Two-phase AST visitor: Phase 1 indexes nodes/hierarchy, Phase 2 builds edges |
+| `CollapseFilter.h/.cpp` | Path-based edge collapse — skips internal edges in specified directories |
+| `ControlFlowIndex.h/.cpp` | Per-call-site record of enclosing try/catch scopes and conditional guards |
+| `ControlFlowContextVisitor.cpp` | Phase 3 AST visitor: snapshots exception/guard context at each call site |
+| `ControlFlowOracle.h/.cpp` | Query engine: exception safety, path analysis, call site context |
+
+**Three-phase build** (used by both `cfquery` and `mcp-serve`):
+1. `buildCallGraph(compDb, files, collapsePaths)` — Phase 1 (index) + Phase 2 (edges)
+2. `buildControlFlowIndex(compDb, files, graph, collapsePaths)` — Phase 3 (CF context)
+
+**Edge collapse**: When `collapsePaths` is non-empty, edges where BOTH caller and callee
+are in collapsed paths are skipped. Boundary edges (non-collapsed caller → collapsed callee)
+are preserved. This reduces noise from utility/math headers while keeping entry points visible.
+
+### `mcp` — MCP Server
+
+**Headers:** `include/giga_drill/mcp/`
+**Sources:** `src/mcp/`
+
+| File | Purpose |
+|---|---|
+| `McpServer.h/.cpp` | JSON-RPC dispatch loop, holds call graph + CF index in memory |
+| `McpProtocol.h/.cpp` | Content-Length framing for MCP stdio transport |
+| `McpTools.h/.cpp` | Tool implementations: lookup, callers, callees, call chains, exception safety, dead code, class hierarchy |
+
+**8 MCP tools**: `lookup_function`, `get_callees`, `get_callers`, `find_call_chain`,
+`query_exception_safety`, `query_call_site_context`, `analyze_dead_code`, `get_class_hierarchy`
+
 ---
 
 ## CLI Entry Point
 
-`src/main.cpp` uses LLVM's `CommandLine` library with two `cl::SubCommand`
+`src/main.cpp` uses LLVM's `CommandLine` library with four `cl::SubCommand`
 objects:
 
 ```
-giga-drill-breaker mugann --build-path <dir> --source <files...>
-giga-drill-breaker lagann --rules-json <file> --build-path <dir> --source <files...> [--dry-run]
+giga-drill-breaker mugann     --build-path <dir> --source <files...>
+giga-drill-breaker lagann     --rules-json <file> --build-path <dir> --source <files...> [--dry-run]
+giga-drill-breaker cfquery    --build-path <dir> --source <files...> --mode <dump|query> [--collapse-paths <pattern>...]
+giga-drill-breaker mcp-serve  --build-path <dir> --source <files...> [--entry-point <name>...] [--collapse-paths <pattern>...]
 ```
 
 Each subcommand has its own scoped options (declared with `llvm::cl::sub(...)`).
@@ -90,6 +133,24 @@ To add a new subcommand, follow the pattern in `main.cpp`:
 1. Declare a `static llvm::cl::SubCommand MyCmd("name", "description")`.
 2. Declare option variables with `llvm::cl::sub(MyCmd)`.
 3. Add an `if (MyCmd) { ... }` branch in `main()`.
+
+### cfquery vs mcp-serve
+
+- **cfquery**: One-shot CLI tool. Parses AST per invocation, outputs JSON to stdout. Best for quick single-file investigations.
+- **mcp-serve**: Persistent server. Pre-bakes a unified cross-TU call graph at startup, then serves interactive queries via JSON-RPC over stdio. **Always use mcp-serve for security audits or multi-file analysis** — cfquery is single-TU and cannot see cross-file callers.
+
+### Edge Collapse (--collapse-paths)
+
+Both `cfquery` and `mcp-serve` accept `--collapse-paths` to reduce noise from
+header-inlined utility code. Patterns are path component substrings:
+
+```bash
+--collapse-paths Client/Math --collapse-paths Client/Core
+```
+
+This matches paths containing `/Client/Math/` or `/Client/Core/` as directory
+components. Internal edges (both endpoints in collapsed paths) are skipped;
+boundary edges (non-collapsed caller → collapsed callee) are preserved.
 
 ---
 
@@ -105,7 +166,7 @@ To add a new subcommand, follow the pattern in `main.cpp`:
   provides `GIGA_DRILL_LLVM_AT_LEAST(major)` for version-conditional code.
 
 `src/CMakeLists.txt`:
-- Builds `giga_drill_lib` from `mugann/*.cpp` and `lagann/*.cpp`.
+- Builds `giga_drill_lib` from `mugann/*.cpp`, `lagann/*.cpp`, `callgraph/*.cpp`, and `mcp/*.cpp`.
 - Builds `giga-drill-breaker` executable from `main.cpp`.
 - Links against: `clangTooling`, `clangDynamicASTMatchers`, `clangASTMatchers`,
   `clangAST`, `clangBasic`, `clangFrontend`, `clangSema`, `clangSerialization`,
@@ -247,6 +308,14 @@ Commit convention: descriptive imperative messages, no ticket numbers required.
 | `TransformPipeline` | Write final replacements to disk when `!dryRun` |
 | Tests | Implement full integration tests in `test_transforms.cpp` (currently stubs) |
 | Matcher DSL | Define and document the JSON schema for rules files |
+| `mcp-serve` | Add `--source-glob` flag for directory-based source selection |
+| `find_call_chain` | Annotate path edges with try/catch depth and caught types |
+| `call-site-context` | Include catch handler type and body summary in response |
+| Concurrency | `query_raii_scopes_at_callsite` — list RAII objects live at a call site |
+| Concurrency | `query_locks_held(function)` — trace callers to find implicit locks |
+| Concurrency | `query_same_lock(fn_a, fn_b)` — confirm two functions share a lock |
+| Scaling | Parallel multi-TU graph construction (currently serial) |
+| Scaling | Incremental indexing with binary serialization |
 
 ---
 

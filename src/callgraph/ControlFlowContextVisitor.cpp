@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "giga_drill/callgraph/CollapseFilter.h"
 #include "giga_drill/callgraph/ControlFlowIndex.h"
 #include "giga_drill/callgraph/CallGraph.h"
 #include "giga_drill/compat/ToolAdjusters.h"
@@ -64,6 +65,7 @@ public:
       : index_(index), graph_(graph), sm_(sm) {}
 
   void setASTContext(clang::ASTContext *ctx) { ctx_ = ctx; }
+  void setCollapseFilter(const CollapseFilter *filter) { collapse_ = filter; }
 
   // -- Function traversal (push/pop funcStack_) ----------------------------
 
@@ -162,6 +164,11 @@ public:
     std::string calleeName;
     if (auto *callee = expr->getDirectCallee()) {
       calleeName = callee->getQualifiedNameAsString();
+      // Skip internal edges within collapsed paths.
+      if (!funcStack_.empty() &&
+          isCollapsedEdge(funcStack_.back()->getLocation(),
+                          callee->getLocation()))
+        return true;
     } else {
       // Indirect call — record with placeholder name.
       calleeName = "<indirect>";
@@ -206,6 +213,11 @@ public:
     if (!ctor || ctor->isImplicit())
       return true;
 
+    // Skip internal edges within collapsed paths.
+    if (!funcStack_.empty() &&
+        isCollapsedEdge(funcStack_.back()->getLocation(), ctor->getLocation()))
+      return true;
+
     std::string calleeName = ctor->getQualifiedNameAsString();
     CallSiteContext ctx = buildContext(caller, calleeName,
                                        expr->getBeginLoc());
@@ -218,6 +230,7 @@ private:
   const CallGraph &graph_;
   clang::SourceManager &sm_;
   clang::ASTContext *ctx_ = nullptr;
+  const CollapseFilter *collapse_ = nullptr;
 
   std::vector<clang::FunctionDecl *> funcStack_;
 
@@ -254,6 +267,16 @@ private:
     if (loc.isInvalid())
       return false;
     return !sm_.isInSystemHeader(sm_.getSpellingLoc(loc));
+  }
+
+  bool isCollapsedEdge(clang::SourceLocation callerLoc,
+                       clang::SourceLocation calleeLoc) const {
+    if (!collapse_ || collapse_->empty())
+      return false;
+    auto callerFile = sm_.getFilename(sm_.getSpellingLoc(callerLoc));
+    auto calleeFile = sm_.getFilename(sm_.getSpellingLoc(calleeLoc));
+    return collapse_->isCollapsed(callerFile) &&
+           collapse_->isCollapsed(calleeFile);
   }
 
   CatchHandlerInfo analyzeCatchClause(clang::CXXCatchStmt *catchStmt) {
@@ -366,8 +389,11 @@ namespace {
 class ControlFlowContextConsumer : public clang::ASTConsumer {
 public:
   ControlFlowContextConsumer(ControlFlowIndex &index, const CallGraph &graph,
-                             clang::SourceManager &sm)
-      : visitor_(index, graph, sm) {}
+                             clang::SourceManager &sm,
+                             const CollapseFilter *collapse)
+      : visitor_(index, graph, sm) {
+    visitor_.setCollapseFilter(collapse);
+  }
 
   void HandleTranslationUnit(clang::ASTContext &ctx) override {
     visitor_.setASTContext(&ctx);
@@ -380,33 +406,38 @@ private:
 
 class ControlFlowContextAction : public clang::ASTFrontendAction {
 public:
-  ControlFlowContextAction(ControlFlowIndex &index, const CallGraph &graph)
-      : index_(index), graph_(graph) {}
+  ControlFlowContextAction(ControlFlowIndex &index, const CallGraph &graph,
+                            const CollapseFilter *collapse)
+      : index_(index), graph_(graph), collapse_(collapse) {}
 
   std::unique_ptr<clang::ASTConsumer>
   CreateASTConsumer(clang::CompilerInstance &ci, llvm::StringRef) override {
-    return std::make_unique<ControlFlowContextConsumer>(index_, graph_,
-                                                        ci.getSourceManager());
+    return std::make_unique<ControlFlowContextConsumer>(
+        index_, graph_, ci.getSourceManager(), collapse_);
   }
 
 private:
   ControlFlowIndex &index_;
   const CallGraph &graph_;
+  const CollapseFilter *collapse_;
 };
 
 class ControlFlowContextFactory
     : public clang::tooling::FrontendActionFactory {
 public:
-  ControlFlowContextFactory(ControlFlowIndex &index, const CallGraph &graph)
-      : index_(index), graph_(graph) {}
+  ControlFlowContextFactory(ControlFlowIndex &index, const CallGraph &graph,
+                             const CollapseFilter *collapse)
+      : index_(index), graph_(graph), collapse_(collapse) {}
 
   std::unique_ptr<clang::FrontendAction> create() override {
-    return std::make_unique<ControlFlowContextAction>(index_, graph_);
+    return std::make_unique<ControlFlowContextAction>(index_, graph_,
+                                                       collapse_);
   }
 
 private:
   ControlFlowIndex &index_;
   const CallGraph &graph_;
+  const CollapseFilter *collapse_;
 };
 
 } // anonymous namespace
@@ -418,10 +449,13 @@ private:
 ControlFlowIndex
 buildControlFlowIndex(const clang::tooling::CompilationDatabase &compDb,
                       const std::vector<std::string> &files,
-                      const CallGraph &graph) {
+                      const CallGraph &graph,
+                      const std::vector<std::string> &collapsePaths) {
   ControlFlowIndex index;
+  CollapseFilter collapseFilter(collapsePaths);
   auto tool = giga_drill::makeClangTool(compDb, files);
-  ControlFlowContextFactory factory(index, graph);
+  ControlFlowContextFactory factory(
+      index, graph, collapseFilter.empty() ? nullptr : &collapseFilter);
   tool.run(&factory);
   return index;
 }

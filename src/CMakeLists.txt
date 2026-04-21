@@ -9,6 +9,7 @@ add_library(giga_drill_lib
   lagann/TransformPipeline.cpp
   callgraph/CallGraph.cpp
   callgraph/CallGraphBuilder.cpp
+  callgraph/CollapseFilter.cpp
   callgraph/ControlFlowIndex.cpp
   callgraph/ControlFlowContextVisitor.cpp
   callgraph/ControlFlowOracle.cpp

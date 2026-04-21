@@ -395,6 +395,17 @@ bool CallGraphEdgeVisitor::isInUserCode(clang::SourceLocation loc) const {
   return !sm_.isInSystemHeader(sm_.getSpellingLoc(loc));
 }
 
+bool CallGraphEdgeVisitor::isCollapsedEdge(
+    clang::SourceLocation callerLoc,
+    clang::SourceLocation calleeLoc) const {
+  if (!collapse_ || collapse_->empty())
+    return false;
+  std::string callerFile = getFilePath(callerLoc);
+  std::string calleeFile = getFilePath(calleeLoc);
+  return collapse_->isCollapsed(callerFile) &&
+         collapse_->isCollapsed(calleeFile);
+}
+
 bool CallGraphEdgeVisitor::TraverseFunctionDecl(clang::FunctionDecl *decl) {
   funcStack_.push_back(decl);
   bool result = RecursiveASTVisitor::TraverseFunctionDecl(decl);
@@ -515,6 +526,14 @@ bool CallGraphEdgeVisitor::VisitCallExpr(clang::CallExpr *expr) {
   // Skip calls from within system headers.
   if (!isInUserCode(expr->getBeginLoc()))
     return true;
+
+  // Skip internal edges within collapsed paths (keep boundary edges).
+  auto *directCallee = expr->getDirectCallee();
+  if (directCallee && !funcStack_.empty()) {
+    if (isCollapsedEdge(funcStack_.back()->getLocation(),
+                        directCallee->getLocation()))
+      return true;
+  }
 
   // Record the callee DeclRefExpr so VisitDeclRefExpr won't double-count it.
   if (auto *calleeExpr = expr->getCallee()) {
@@ -650,6 +669,11 @@ bool CallGraphEdgeVisitor::VisitCXXConstructExpr(
 
   auto *ctor = expr->getConstructor();
   if (!ctor || ctor->isImplicit())
+    return true;
+
+  // Skip internal edges within collapsed paths.
+  if (!funcStack_.empty() &&
+      isCollapsedEdge(funcStack_.back()->getLocation(), ctor->getLocation()))
     return true;
 
   // Concurrency spawner via constructor (e.g. `std::thread t(&fn, arg)`).
@@ -793,6 +817,11 @@ bool CallGraphEdgeVisitor::VisitDeclRefExpr(clang::DeclRefExpr *expr) {
   if (!isInUserCode(expr->getBeginLoc()))
     return true;
 
+  // Skip internal edges within collapsed paths.
+  if (!funcStack_.empty() &&
+      isCollapsedEdge(funcStack_.back()->getLocation(), funcDecl->getLocation()))
+    return true;
+
   // This is a function reference in a non-call, non-argument context.
   // Treat as address-taken: Plausible edge.
   graph_.addEdge({caller, funcDecl->getQualifiedNameAsString(),
@@ -883,8 +912,11 @@ private:
 
 class EdgeOnlyConsumer : public clang::ASTConsumer {
 public:
-  EdgeOnlyConsumer(CallGraph &graph, clang::SourceManager &sm)
-      : visitor_(graph, sm) {}
+  EdgeOnlyConsumer(CallGraph &graph, clang::SourceManager &sm,
+                   const CollapseFilter *collapse)
+      : visitor_(graph, sm) {
+    visitor_.setCollapseFilter(collapse);
+  }
   void HandleTranslationUnit(clang::ASTContext &ctx) override {
     visitor_.setASTContext(&ctx);
     visitor_.TraverseDecl(ctx.getTranslationUnitDecl());
@@ -896,32 +928,39 @@ private:
 
 class EdgeOnlyAction : public clang::ASTFrontendAction {
 public:
-  explicit EdgeOnlyAction(CallGraph &g) : graph_(g) {}
+  EdgeOnlyAction(CallGraph &g, const CollapseFilter *collapse)
+      : graph_(g), collapse_(collapse) {}
   std::unique_ptr<clang::ASTConsumer>
   CreateASTConsumer(clang::CompilerInstance &ci, llvm::StringRef) override {
-    return std::make_unique<EdgeOnlyConsumer>(graph_, ci.getSourceManager());
+    return std::make_unique<EdgeOnlyConsumer>(graph_, ci.getSourceManager(),
+                                              collapse_);
   }
 
 private:
   CallGraph &graph_;
+  const CollapseFilter *collapse_;
 };
 
 class EdgeOnlyFactory : public clang::tooling::FrontendActionFactory {
 public:
-  explicit EdgeOnlyFactory(CallGraph &g) : graph_(g) {}
+  EdgeOnlyFactory(CallGraph &g, const CollapseFilter *collapse)
+      : graph_(g), collapse_(collapse) {}
   std::unique_ptr<clang::FrontendAction> create() override {
-    return std::make_unique<EdgeOnlyAction>(graph_);
+    return std::make_unique<EdgeOnlyAction>(graph_, collapse_);
   }
 
 private:
   CallGraph &graph_;
+  const CollapseFilter *collapse_;
 };
 
 } // anonymous namespace
 
 CallGraph buildCallGraph(const clang::tooling::CompilationDatabase &compDb,
-                         const std::vector<std::string> &files) {
+                         const std::vector<std::string> &files,
+                         const std::vector<std::string> &collapsePaths) {
   CallGraph graph;
+  CollapseFilter collapseFilter(collapsePaths);
 
   // Pass 1: Index all declarations and class hierarchy.
   {
@@ -931,9 +970,11 @@ CallGraph buildCallGraph(const clang::tooling::CompilationDatabase &compDb,
   }
 
   // Pass 2: Build edges with full knowledge.
+  // Internal edges within collapsed paths are skipped.
   {
     auto tool = giga_drill::makeClangTool(compDb, files);
-    EdgeOnlyFactory factory(graph);
+    EdgeOnlyFactory factory(graph,
+                            collapseFilter.empty() ? nullptr : &collapseFilter);
     tool.run(&factory);
   }
 

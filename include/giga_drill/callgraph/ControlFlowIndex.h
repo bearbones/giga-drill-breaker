@@ -128,9 +128,12 @@ private:
 
 // Build a ControlFlowIndex from a compilation database (Phase 3, after call
 // graph construction). The CallGraph is used to resolve callee noexcept specs.
+// If collapsePaths is non-empty, call site contexts within collapsed paths are
+// skipped (same filtering as buildCallGraph).
 ControlFlowIndex
 buildControlFlowIndex(const clang::tooling::CompilationDatabase &compDb,
                       const std::vector<std::string> &files,
-                      const CallGraph &graph);
+                      const CallGraph &graph,
+                      const std::vector<std::string> &collapsePaths = {});
 
 } // namespace giga_drill
