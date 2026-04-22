@@ -125,8 +125,13 @@ void PchCache::buildFromCompileCommands(
     }
 
     // Construct command: clang++ -x c++-header <flags> <pch_src> -emit-pch -o <out>
+    // Include our resource-dir so the PCH sees the same built-in headers
+    // as the TU parses (which also get resource-dir injected).
     std::string cmd = clangBin_;
     cmd += " -x c++-header";
+#ifdef GIGA_DRILL_CLANG_RESOURCE_DIR
+    cmd += " -resource-dir '" GIGA_DRILL_CLANG_RESOURCE_DIR "'";
+#endif
     for (const auto &f : flags) {
       cmd += " '";
       cmd += f;

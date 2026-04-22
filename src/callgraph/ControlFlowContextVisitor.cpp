@@ -20,6 +20,46 @@
 #include "giga_drill/compat/ToolAdjusters.h"
 
 #include "llvm/Support/ThreadPool.h"
+#include "llvm/Support/raw_ostream.h"
+
+#include <atomic>
+#include <csignal>
+#include <csetjmp>
+
+// Crash guard — same mechanism as CallGraphBuilder.cpp.
+// These are defined there and shared via the signal handler table.
+namespace {
+thread_local sigjmp_buf tl_cfJumpBuf;
+thread_local volatile sig_atomic_t tl_cfGuardActive = 0;
+std::atomic<unsigned> g_cfCrashCount{0};
+
+void cfCrashHandler(int sig) {
+  if (tl_cfGuardActive) {
+    tl_cfGuardActive = 0;
+    g_cfCrashCount.fetch_add(1, std::memory_order_relaxed);
+    siglongjmp(tl_cfJumpBuf, sig);
+  }
+  std::signal(sig, SIG_DFL);
+  std::raise(sig);
+}
+
+bool runCfToolGuarded(const clang::tooling::CompilationDatabase &compDb,
+                      const std::string &file,
+                      clang::tooling::FrontendActionFactory &factory,
+                      const giga_drill::PchCache *pchCache) {
+  tl_cfGuardActive = 1;
+  int sig = sigsetjmp(tl_cfJumpBuf, 1);
+  if (sig != 0) {
+    llvm::errs() << "CRASH (signal " << sig << ") in CF index for " << file
+                 << " — skipping\n";
+    return false;
+  }
+  auto tool = giga_drill::makeClangTool(compDb, {file}, pchCache);
+  tool.run(&factory);
+  tl_cfGuardActive = 0;
+  return true;
+}
+} // anonymous namespace
 
 #include "clang/AST/ASTConsumer.h"
 #include "clang/AST/ASTContext.h"
@@ -461,6 +501,10 @@ buildControlFlowIndex(const clang::tooling::CompilationDatabase &compDb,
   const CollapseFilter *collapsePtr =
       collapseFilter.empty() ? nullptr : &collapseFilter;
 
+  auto prevSegv = std::signal(SIGSEGV, cfCrashHandler);
+  auto prevBus = std::signal(SIGBUS, cfCrashHandler);
+  g_cfCrashCount.store(0, std::memory_order_relaxed);
+
   bool parallel = threadCount != 1 && files.size() > 1;
 
   if (parallel) {
@@ -468,18 +512,25 @@ buildControlFlowIndex(const clang::tooling::CompilationDatabase &compDb,
         llvm::hardware_concurrency(threadCount));
     for (const auto &file : files) {
       pool.async([&compDb, &index, &graph, collapsePtr, pchCache, file]() {
-        auto tool = giga_drill::makeClangTool(compDb, {file}, pchCache);
         ControlFlowContextFactory factory(index, graph, collapsePtr);
-        tool.run(&factory);
+        runCfToolGuarded(compDb, file, factory, pchCache);
       });
     }
     pool.wait();
   } else {
-    auto tool = giga_drill::makeClangTool(compDb, files, pchCache);
-    ControlFlowContextFactory factory(index, graph, collapsePtr);
-    tool.run(&factory);
+    for (const auto &file : files) {
+      ControlFlowContextFactory factory(index, graph, collapsePtr);
+      runCfToolGuarded(compDb, file, factory, pchCache);
+    }
   }
 
+  unsigned crashes = g_cfCrashCount.load(std::memory_order_relaxed);
+  if (crashes > 0) {
+    llvm::errs() << "cfindex: " << crashes << " TU(s) crashed and were skipped\n";
+  }
+
+  std::signal(SIGSEGV, prevSegv);
+  std::signal(SIGBUS, prevBus);
   return index;
 }
 

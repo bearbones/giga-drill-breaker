@@ -54,3 +54,7 @@ endif()
 
 add_executable(giga-drill-breaker main.cpp)
 target_link_libraries(giga-drill-breaker PRIVATE giga_drill_lib)
+
+# Embed the default --clang path for PCH compilation into the executable.
+target_compile_definitions(giga-drill-breaker PRIVATE
+  "GIGA_DRILL_DEFAULT_CLANG=\"${GIGA_DRILL_DEFAULT_CLANG}\"")

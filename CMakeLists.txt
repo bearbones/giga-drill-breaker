@@ -5,6 +5,17 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# --- Organization override hook ---
+# Forks can add cmake/org-overrides.cmake to customize dependency resolution,
+# set CMAKE_PREFIX_PATH, define wrapper targets, etc. This file is gitignored
+# upstream and committed in org forks. See docs/toolchain-portability.md.
+include(cmake/org-overrides.cmake OPTIONAL)
+
+# --- Options ---
+option(GIGA_DRILL_USE_SUBMODULE "Fall back to extern/llvm-project submodule if no system LLVM" ON)
+set(GIGA_DRILL_DEFAULT_CLANG "clang++" CACHE STRING
+    "Default clang++ binary for PCH compilation (--clang default)")
+
 # --- LLVM/Clang: prefer system packages, fall back to submodule ---
 # Supported LLVM versions, checked in order (newest first).
 # To add a new version, append it to this list.
@@ -57,7 +68,7 @@ if(LLVM_FOUND AND Clang_FOUND)
   message(STATUS "Using system Clang from ${Clang_DIR}")
   include_directories(SYSTEM ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
   add_definitions(${LLVM_DEFINITIONS})
-elseif(EXISTS "${LLVM_SUBMODULE_DIR}/CMakeLists.txt")
+elseif(GIGA_DRILL_USE_SUBMODULE AND EXISTS "${LLVM_SUBMODULE_DIR}/CMakeLists.txt")
   message(STATUS "Using LLVM/Clang from submodule")
   set(LLVM_ENABLE_PROJECTS "clang" CACHE STRING "" FORCE)
   set(LLVM_TARGETS_TO_BUILD "X86;AArch64" CACHE STRING "" FORCE)

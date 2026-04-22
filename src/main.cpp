@@ -235,7 +235,7 @@ static llvm::cl::opt<std::string>
     CfqueryClang("clang",
         llvm::cl::desc("Path to clang++ binary for PCH compilation"),
         llvm::cl::value_desc("path"),
-        llvm::cl::init("clang++"),
+        llvm::cl::init(GIGA_DRILL_DEFAULT_CLANG),
         llvm::cl::sub(CfqueryCmd));
 
 // ---------------------------------------------------------------------------
@@ -283,7 +283,7 @@ static llvm::cl::opt<std::string>
     McpClang("clang",
         llvm::cl::desc("Path to clang++ binary for PCH compilation"),
         llvm::cl::value_desc("path"),
-        llvm::cl::init("clang++"),
+        llvm::cl::init(GIGA_DRILL_DEFAULT_CLANG),
         llvm::cl::sub(McpServeCmd));
 
 // ---------------------------------------------------------------------------

@@ -17,6 +17,73 @@
 #include "giga_drill/compat/ToolAdjusters.h"
 
 #include "llvm/Support/ThreadPool.h"
+#include "llvm/Support/raw_ostream.h"
+
+#include <atomic>
+#include <csignal>
+#include <csetjmp>
+
+namespace {
+
+// Per-thread crash recovery using setjmp/longjmp + signal handler.
+// When a TU triggers SIGSEGV/SIGBUS during AST traversal, the signal
+// handler longjmps back to the setjmp point, skipping that TU.
+thread_local sigjmp_buf tl_jumpBuf;
+thread_local volatile sig_atomic_t tl_guardActive = 0;
+
+std::atomic<unsigned> g_crashCount{0};
+
+void crashSignalHandler(int sig) {
+  if (tl_guardActive) {
+    tl_guardActive = 0;
+    g_crashCount.fetch_add(1, std::memory_order_relaxed);
+    siglongjmp(tl_jumpBuf, sig);
+  }
+  // Not in a guarded region — re-raise to get default behavior.
+  std::signal(sig, SIG_DFL);
+  std::raise(sig);
+}
+
+/// Install crash signal handlers. Returns previous handlers for restoration.
+struct SavedHandlers {
+  void (*segv)(int);
+  void (*bus)(int);
+};
+
+SavedHandlers installCrashGuard() {
+  SavedHandlers saved;
+  saved.segv = std::signal(SIGSEGV, crashSignalHandler);
+  saved.bus = std::signal(SIGBUS, crashSignalHandler);
+  return saved;
+}
+
+void restoreCrashGuard(const SavedHandlers &saved) {
+  std::signal(SIGSEGV, saved.segv);
+  std::signal(SIGBUS, saved.bus);
+}
+
+/// Run a ClangTool on a single file with crash recovery.
+/// Returns true if the TU was processed without crashing.
+bool runToolGuarded(const clang::tooling::CompilationDatabase &compDb,
+                    const std::string &file,
+                    clang::tooling::FrontendActionFactory &factory,
+                    const giga_drill::PchCache *pchCache) {
+  tl_guardActive = 1;
+  int sig = sigsetjmp(tl_jumpBuf, 1);
+  if (sig != 0) {
+    // Returned from signal handler — TU crashed.
+    llvm::errs() << "CRASH (signal " << sig << ") processing " << file
+                 << " — skipping\n";
+    return false;
+  }
+
+  auto tool = giga_drill::makeClangTool(compDb, {file}, pchCache);
+  tool.run(&factory);
+  tl_guardActive = 0;
+  return true;
+}
+
+} // anonymous namespace
 
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/DeclCXX.h"
@@ -968,6 +1035,9 @@ CallGraph buildCallGraph(const clang::tooling::CompilationDatabase &compDb,
   const CollapseFilter *collapsePtr =
       collapseFilter.empty() ? nullptr : &collapseFilter;
 
+  auto saved = installCrashGuard();
+  g_crashCount.store(0, std::memory_order_relaxed);
+
   bool parallel = threadCount != 1 && files.size() > 1;
 
   if (parallel) {
@@ -977,9 +1047,8 @@ CallGraph buildCallGraph(const clang::tooling::CompilationDatabase &compDb,
     // Pass 1: Parallel index of all declarations and class hierarchy.
     for (const auto &file : files) {
       pool.async([&compDb, &graph, pchCache, file]() {
-        auto tool = giga_drill::makeClangTool(compDb, {file}, pchCache);
         IndexerOnlyFactory factory(graph);
-        tool.run(&factory);
+        runToolGuarded(compDb, file, factory, pchCache);
       });
     }
     pool.wait();
@@ -987,26 +1056,30 @@ CallGraph buildCallGraph(const clang::tooling::CompilationDatabase &compDb,
     // Pass 2: Parallel edge building with full hierarchy knowledge.
     for (const auto &file : files) {
       pool.async([&compDb, &graph, collapsePtr, pchCache, file]() {
-        auto tool = giga_drill::makeClangTool(compDb, {file}, pchCache);
         EdgeOnlyFactory factory(graph, collapsePtr);
-        tool.run(&factory);
+        runToolGuarded(compDb, file, factory, pchCache);
       });
     }
     pool.wait();
   } else {
-    // Serial path (single file or --threads=1).
-    {
-      auto tool = giga_drill::makeClangTool(compDb, files, pchCache);
+    // Serial path — process per-file for crash isolation.
+    for (const auto &file : files) {
       IndexerOnlyFactory factory(graph);
-      tool.run(&factory);
+      runToolGuarded(compDb, file, factory, pchCache);
     }
-    {
-      auto tool = giga_drill::makeClangTool(compDb, files, pchCache);
+    for (const auto &file : files) {
       EdgeOnlyFactory factory(graph, collapsePtr);
-      tool.run(&factory);
+      runToolGuarded(compDb, file, factory, pchCache);
     }
   }
 
+  unsigned crashes = g_crashCount.load(std::memory_order_relaxed);
+  if (crashes > 0) {
+    llvm::errs() << "callgraph: " << crashes << " TU(s) crashed and were skipped"
+                 << " (" << files.size() << " total)\n";
+  }
+
+  restoreCrashGuard(saved);
   return graph;
 }
 
