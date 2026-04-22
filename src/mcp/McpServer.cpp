@@ -22,7 +22,7 @@
 
 namespace giga_drill {
 
-McpServer::McpServer(CallGraph graph, ControlFlowIndex cfIndex,
+McpServer::McpServer(CallGraph &&graph, ControlFlowIndex &&cfIndex,
                      std::vector<std::string> entryPoints)
     : graph_(std::move(graph)), cfIndex_(std::move(cfIndex)),
       oracle_(graph_, cfIndex_), entryPoints_(std::move(entryPoints)) {}

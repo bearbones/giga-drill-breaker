@@ -17,7 +17,22 @@
 
 namespace giga_drill {
 
+ControlFlowIndex::ControlFlowIndex(ControlFlowIndex &&other) noexcept
+    : contexts_(std::move(other.contexts_)),
+      byCallee_(std::move(other.byCallee_)),
+      byCaller_(std::move(other.byCaller_)),
+      bySite_(std::move(other.bySite_)) {}
+
+ControlFlowIndex &ControlFlowIndex::operator=(ControlFlowIndex &&other) noexcept {
+  contexts_ = std::move(other.contexts_);
+  byCallee_ = std::move(other.byCallee_);
+  byCaller_ = std::move(other.byCaller_);
+  bySite_ = std::move(other.bySite_);
+  return *this;
+}
+
 void ControlFlowIndex::addCallSiteContext(CallSiteContext ctx) {
+  std::lock_guard<std::mutex> lock(mutex_);
   size_t idx = contexts_.size();
   byCallee_[ctx.calleeName].push_back(idx);
   byCaller_[ctx.callerName].push_back(idx);

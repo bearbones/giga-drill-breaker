@@ -218,6 +218,12 @@ static llvm::cl::list<std::string>
         llvm::cl::value_desc("pattern"),
         llvm::cl::sub(CfqueryCmd));
 
+static llvm::cl::opt<unsigned>
+    CfqueryThreads("threads",
+        llvm::cl::desc("Number of threads (0 = hardware_concurrency, 1 = serial)"),
+        llvm::cl::init(0),
+        llvm::cl::sub(CfqueryCmd));
+
 // ---------------------------------------------------------------------------
 // mcp-serve options
 // ---------------------------------------------------------------------------
@@ -245,6 +251,12 @@ static llvm::cl::list<std::string>
     McpCollapsePaths("collapse-paths",
         llvm::cl::desc("Path patterns to collapse (internal edges skipped)"),
         llvm::cl::value_desc("pattern"),
+        llvm::cl::sub(McpServeCmd));
+
+static llvm::cl::opt<unsigned>
+    McpThreads("threads",
+        llvm::cl::desc("Number of threads (0 = hardware_concurrency, 1 = serial)"),
+        llvm::cl::init(0),
         llvm::cl::sub(McpServeCmd));
 
 // ---------------------------------------------------------------------------
@@ -381,11 +393,13 @@ int main(int argc, const char **argv) {
                                            CfqueryCollapsePaths.end());
 
     // Phase 1+2: Build call graph.
-    auto graph = giga_drill::buildCallGraph(*compDb, files, collapsePaths);
+    auto graph = giga_drill::buildCallGraph(*compDb, files, collapsePaths,
+                                              CfqueryThreads);
 
     // Phase 3: Build control flow index.
     auto cfIndex = giga_drill::buildControlFlowIndex(*compDb, files, graph,
-                                                      collapsePaths);
+                                                      collapsePaths,
+                                                      CfqueryThreads);
 
     // Dump mode: serialize the full index as JSON.
     if (CfqueryModeOpt == CfqueryDump) {
@@ -534,15 +548,19 @@ int main(int argc, const char **argv) {
     std::vector<std::string> collapsePaths(McpCollapsePaths.begin(),
                                            McpCollapsePaths.end());
 
-    llvm::errs() << "mcp-serve: building call graph...\n";
-    auto graph = giga_drill::buildCallGraph(*compDb, files, collapsePaths);
+    llvm::errs() << "mcp-serve: building call graph ("
+                 << files.size() << " files, "
+                 << McpThreads << " threads)...\n";
+    auto graph = giga_drill::buildCallGraph(*compDb, files, collapsePaths,
+                                             McpThreads);
     llvm::errs() << "mcp-serve: call graph built ("
                  << graph.nodeCount() << " nodes, "
                  << graph.edgeCount() << " edges)\n";
 
     llvm::errs() << "mcp-serve: building control flow index...\n";
     auto cfIndex = giga_drill::buildControlFlowIndex(*compDb, files, graph,
-                                                      collapsePaths);
+                                                      collapsePaths,
+                                                      McpThreads);
     llvm::errs() << "mcp-serve: control flow index built ("
                  << cfIndex.size() << " call sites)\n";
 

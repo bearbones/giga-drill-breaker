@@ -15,6 +15,7 @@
 
 #pragma once
 
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -93,6 +94,12 @@ struct CallSiteContext {
 
 class ControlFlowIndex {
 public:
+  ControlFlowIndex() = default;
+  ControlFlowIndex(ControlFlowIndex &&other) noexcept;
+  ControlFlowIndex &operator=(ControlFlowIndex &&other) noexcept;
+  ControlFlowIndex(const ControlFlowIndex &) = delete;
+  ControlFlowIndex &operator=(const ControlFlowIndex &) = delete;
+
   void addCallSiteContext(CallSiteContext ctx);
 
   // Look up context at a specific call site (file:line:col).
@@ -120,6 +127,7 @@ public:
   std::vector<const CallSiteContext *> allContexts() const;
 
 private:
+  mutable std::mutex mutex_;
   std::vector<CallSiteContext> contexts_;
   std::unordered_map<std::string, std::vector<size_t>> byCallee_;
   std::unordered_map<std::string, std::vector<size_t>> byCaller_;
@@ -130,10 +138,12 @@ private:
 // graph construction). The CallGraph is used to resolve callee noexcept specs.
 // If collapsePaths is non-empty, call site contexts within collapsed paths are
 // skipped (same filtering as buildCallGraph).
+// threadCount=0 uses hardware_concurrency; threadCount=1 forces serial.
 ControlFlowIndex
 buildControlFlowIndex(const clang::tooling::CompilationDatabase &compDb,
                       const std::vector<std::string> &files,
                       const CallGraph &graph,
-                      const std::vector<std::string> &collapsePaths = {});
+                      const std::vector<std::string> &collapsePaths = {},
+                      unsigned threadCount = 0);
 
 } // namespace giga_drill

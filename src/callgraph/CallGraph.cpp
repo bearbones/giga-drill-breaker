@@ -19,7 +19,30 @@
 
 namespace giga_drill {
 
+CallGraph::CallGraph(CallGraph &&other) noexcept
+    : nodes_(std::move(other.nodes_)),
+      edges_(std::move(other.edges_)),
+      outEdges_(std::move(other.outEdges_)),
+      inEdges_(std::move(other.inEdges_)),
+      derivedClasses_(std::move(other.derivedClasses_)),
+      methodOverrides_(std::move(other.methodOverrides_)),
+      effectiveImplClasses_(std::move(other.effectiveImplClasses_)),
+      functionReturns_(std::move(other.functionReturns_)) {}
+
+CallGraph &CallGraph::operator=(CallGraph &&other) noexcept {
+  nodes_ = std::move(other.nodes_);
+  edges_ = std::move(other.edges_);
+  outEdges_ = std::move(other.outEdges_);
+  inEdges_ = std::move(other.inEdges_);
+  derivedClasses_ = std::move(other.derivedClasses_);
+  methodOverrides_ = std::move(other.methodOverrides_);
+  effectiveImplClasses_ = std::move(other.effectiveImplClasses_);
+  functionReturns_ = std::move(other.functionReturns_);
+  return *this;
+}
+
 void CallGraph::addNode(CallGraphNode node) {
+  std::lock_guard<std::mutex> lock(mutex_);
   auto name = node.qualifiedName;
   auto it = nodes_.find(name);
   if (it == nodes_.end()) {
@@ -40,6 +63,7 @@ void CallGraph::addNode(CallGraphNode node) {
 }
 
 void CallGraph::addEdge(CallGraphEdge edge) {
+  std::lock_guard<std::mutex> lock(mutex_);
   size_t idx = edges_.size();
   outEdges_[edge.callerName].push_back(idx);
   inEdges_[edge.calleeName].push_back(idx);
@@ -92,6 +116,7 @@ CallGraph::findNode(const std::string &qualifiedName) const {
 
 void CallGraph::addDerivedClass(const std::string &baseClass,
                                 const std::string &derivedClass) {
+  std::lock_guard<std::mutex> lock(mutex_);
   auto &vec = derivedClasses_[baseClass];
   if (std::find(vec.begin(), vec.end(), derivedClass) == vec.end())
     vec.push_back(derivedClass);
@@ -130,6 +155,7 @@ CallGraph::getAllDerivedClasses(const std::string &baseClass) const {
 
 void CallGraph::addMethodOverride(const std::string &baseMethod,
                                   const std::string &overrideMethod) {
+  std::lock_guard<std::mutex> lock(mutex_);
   auto &vec = methodOverrides_[baseMethod];
   if (std::find(vec.begin(), vec.end(), overrideMethod) == vec.end())
     vec.push_back(overrideMethod);
@@ -147,6 +173,7 @@ CallGraph::getOverrides(const std::string &baseMethod) const {
 
 void CallGraph::addEffectiveImpl(const std::string &concreteClass,
                                  const std::string &implMethod) {
+  std::lock_guard<std::mutex> lock(mutex_);
   effectiveImplClasses_[implMethod].insert(concreteClass);
 }
 
@@ -162,6 +189,7 @@ CallGraph::getClassesForImpl(const std::string &implMethod) const {
 
 void CallGraph::addFunctionReturn(const std::string &funcName,
                                   const std::string &returnedFunc) {
+  std::lock_guard<std::mutex> lock(mutex_);
   functionReturns_[funcName].insert(returnedFunc);
 }
 

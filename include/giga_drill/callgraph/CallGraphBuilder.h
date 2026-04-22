@@ -162,8 +162,10 @@ private:
 // Build a call graph from a compilation database (multi-TU, two-pass).
 // If collapsePaths is non-empty, internal edges within collapsed paths are
 // skipped (boundary edges from non-collapsed callers are preserved).
+// threadCount=0 uses hardware_concurrency; threadCount=1 forces serial.
 CallGraph buildCallGraph(const clang::tooling::CompilationDatabase &compDb,
                          const std::vector<std::string> &files,
-                         const std::vector<std::string> &collapsePaths = {});
+                         const std::vector<std::string> &collapsePaths = {},
+                         unsigned threadCount = 0);
 
 } // namespace giga_drill

@@ -27,7 +27,7 @@ namespace giga_drill {
 
 class McpServer {
 public:
-  McpServer(CallGraph graph, ControlFlowIndex cfIndex,
+  McpServer(CallGraph &&graph, ControlFlowIndex &&cfIndex,
             std::vector<std::string> entryPoints);
 
   /// Run the MCP stdio loop. Returns 0 on clean shutdown.

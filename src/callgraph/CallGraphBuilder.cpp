@@ -16,6 +16,8 @@
 #include "giga_drill/callgraph/CallGraphBuilder.h"
 #include "giga_drill/compat/ToolAdjusters.h"
 
+#include "llvm/Support/ThreadPool.h"
+
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/DeclCXX.h"
 #include "clang/AST/DeclTemplate.h"
@@ -958,24 +960,50 @@ private:
 
 CallGraph buildCallGraph(const clang::tooling::CompilationDatabase &compDb,
                          const std::vector<std::string> &files,
-                         const std::vector<std::string> &collapsePaths) {
+                         const std::vector<std::string> &collapsePaths,
+                         unsigned threadCount) {
   CallGraph graph;
   CollapseFilter collapseFilter(collapsePaths);
+  const CollapseFilter *collapsePtr =
+      collapseFilter.empty() ? nullptr : &collapseFilter;
 
-  // Pass 1: Index all declarations and class hierarchy.
-  {
-    auto tool = giga_drill::makeClangTool(compDb, files);
-    IndexerOnlyFactory factory(graph);
-    tool.run(&factory);
-  }
+  bool parallel = threadCount != 1 && files.size() > 1;
 
-  // Pass 2: Build edges with full knowledge.
-  // Internal edges within collapsed paths are skipped.
-  {
-    auto tool = giga_drill::makeClangTool(compDb, files);
-    EdgeOnlyFactory factory(graph,
-                            collapseFilter.empty() ? nullptr : &collapseFilter);
-    tool.run(&factory);
+  if (parallel) {
+    llvm::DefaultThreadPool pool(
+        llvm::hardware_concurrency(threadCount));
+
+    // Pass 1: Parallel index of all declarations and class hierarchy.
+    for (const auto &file : files) {
+      pool.async([&compDb, &graph, file]() {
+        auto tool = giga_drill::makeClangTool(compDb, {file});
+        IndexerOnlyFactory factory(graph);
+        tool.run(&factory);
+      });
+    }
+    pool.wait();
+
+    // Pass 2: Parallel edge building with full hierarchy knowledge.
+    for (const auto &file : files) {
+      pool.async([&compDb, &graph, collapsePtr, file]() {
+        auto tool = giga_drill::makeClangTool(compDb, {file});
+        EdgeOnlyFactory factory(graph, collapsePtr);
+        tool.run(&factory);
+      });
+    }
+    pool.wait();
+  } else {
+    // Serial path (single file or --threads=1).
+    {
+      auto tool = giga_drill::makeClangTool(compDb, files);
+      IndexerOnlyFactory factory(graph);
+      tool.run(&factory);
+    }
+    {
+      auto tool = giga_drill::makeClangTool(compDb, files);
+      EdgeOnlyFactory factory(graph, collapsePtr);
+      tool.run(&factory);
+    }
   }
 
   return graph;

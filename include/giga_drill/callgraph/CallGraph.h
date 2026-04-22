@@ -15,6 +15,7 @@
 
 #pragma once
 
+#include <mutex>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -79,6 +80,12 @@ struct CallGraphEdge {
 
 class CallGraph {
 public:
+  CallGraph() = default;
+  CallGraph(CallGraph &&other) noexcept;
+  CallGraph &operator=(CallGraph &&other) noexcept;
+  CallGraph(const CallGraph &) = delete;
+  CallGraph &operator=(const CallGraph &) = delete;
+
   void addNode(CallGraphNode node);
   void addEdge(CallGraphEdge edge);
 
@@ -119,6 +126,7 @@ public:
   getFunctionReturns(const std::string &funcName) const;
 
 private:
+  mutable std::mutex mutex_;
   std::unordered_map<std::string, CallGraphNode> nodes_;
   std::vector<CallGraphEdge> edges_;
   std::unordered_map<std::string, std::vector<size_t>> outEdges_;
