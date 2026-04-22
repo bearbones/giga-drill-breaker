@@ -961,7 +961,8 @@ private:
 CallGraph buildCallGraph(const clang::tooling::CompilationDatabase &compDb,
                          const std::vector<std::string> &files,
                          const std::vector<std::string> &collapsePaths,
-                         unsigned threadCount) {
+                         unsigned threadCount,
+                         const PchCache *pchCache) {
   CallGraph graph;
   CollapseFilter collapseFilter(collapsePaths);
   const CollapseFilter *collapsePtr =
@@ -975,8 +976,8 @@ CallGraph buildCallGraph(const clang::tooling::CompilationDatabase &compDb,
 
     // Pass 1: Parallel index of all declarations and class hierarchy.
     for (const auto &file : files) {
-      pool.async([&compDb, &graph, file]() {
-        auto tool = giga_drill::makeClangTool(compDb, {file});
+      pool.async([&compDb, &graph, pchCache, file]() {
+        auto tool = giga_drill::makeClangTool(compDb, {file}, pchCache);
         IndexerOnlyFactory factory(graph);
         tool.run(&factory);
       });
@@ -985,8 +986,8 @@ CallGraph buildCallGraph(const clang::tooling::CompilationDatabase &compDb,
 
     // Pass 2: Parallel edge building with full hierarchy knowledge.
     for (const auto &file : files) {
-      pool.async([&compDb, &graph, collapsePtr, file]() {
-        auto tool = giga_drill::makeClangTool(compDb, {file});
+      pool.async([&compDb, &graph, collapsePtr, pchCache, file]() {
+        auto tool = giga_drill::makeClangTool(compDb, {file}, pchCache);
         EdgeOnlyFactory factory(graph, collapsePtr);
         tool.run(&factory);
       });
@@ -995,12 +996,12 @@ CallGraph buildCallGraph(const clang::tooling::CompilationDatabase &compDb,
   } else {
     // Serial path (single file or --threads=1).
     {
-      auto tool = giga_drill::makeClangTool(compDb, files);
+      auto tool = giga_drill::makeClangTool(compDb, files, pchCache);
       IndexerOnlyFactory factory(graph);
       tool.run(&factory);
     }
     {
-      auto tool = giga_drill::makeClangTool(compDb, files);
+      auto tool = giga_drill::makeClangTool(compDb, files, pchCache);
       EdgeOnlyFactory factory(graph, collapsePtr);
       tool.run(&factory);
     }

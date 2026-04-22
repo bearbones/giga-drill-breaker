@@ -20,6 +20,7 @@
 #include "giga_drill/callgraph/ControlFlowOracle.h"
 #include "giga_drill/lagann/RulesParser.h"
 #include "giga_drill/lagann/TransformPipeline.h"
+#include "giga_drill/compat/PchCache.h"
 #include "giga_drill/mcp/McpServer.h"
 
 #include "clang/Tooling/CompilationDatabase.h"
@@ -224,6 +225,19 @@ static llvm::cl::opt<unsigned>
         llvm::cl::init(0),
         llvm::cl::sub(CfqueryCmd));
 
+static llvm::cl::opt<std::string>
+    CfqueryPchDir("pch-dir",
+        llvm::cl::desc("Directory for compiled PCH cache (enables PCH reuse)"),
+        llvm::cl::value_desc("dir"),
+        llvm::cl::sub(CfqueryCmd));
+
+static llvm::cl::opt<std::string>
+    CfqueryClang("clang",
+        llvm::cl::desc("Path to clang++ binary for PCH compilation"),
+        llvm::cl::value_desc("path"),
+        llvm::cl::init("clang++"),
+        llvm::cl::sub(CfqueryCmd));
+
 // ---------------------------------------------------------------------------
 // mcp-serve options
 // ---------------------------------------------------------------------------
@@ -257,6 +271,19 @@ static llvm::cl::opt<unsigned>
     McpThreads("threads",
         llvm::cl::desc("Number of threads (0 = hardware_concurrency, 1 = serial)"),
         llvm::cl::init(0),
+        llvm::cl::sub(McpServeCmd));
+
+static llvm::cl::opt<std::string>
+    McpPchDir("pch-dir",
+        llvm::cl::desc("Directory for compiled PCH cache (enables PCH reuse)"),
+        llvm::cl::value_desc("dir"),
+        llvm::cl::sub(McpServeCmd));
+
+static llvm::cl::opt<std::string>
+    McpClang("clang",
+        llvm::cl::desc("Path to clang++ binary for PCH compilation"),
+        llvm::cl::value_desc("path"),
+        llvm::cl::init("clang++"),
         llvm::cl::sub(McpServeCmd));
 
 // ---------------------------------------------------------------------------
@@ -392,14 +419,23 @@ int main(int argc, const char **argv) {
     std::vector<std::string> collapsePaths(CfqueryCollapsePaths.begin(),
                                            CfqueryCollapsePaths.end());
 
+    // Pre-compile PCH headers if --pch-dir is set.
+    std::unique_ptr<giga_drill::PchCache> pchCache;
+    if (!CfqueryPchDir.empty()) {
+      pchCache = std::make_unique<giga_drill::PchCache>(
+          CfqueryPchDir.getValue(), CfqueryClang.getValue());
+      pchCache->buildFromCompileCommands(*compDb, files);
+    }
+    const giga_drill::PchCache *pchPtr = pchCache.get();
+
     // Phase 1+2: Build call graph.
     auto graph = giga_drill::buildCallGraph(*compDb, files, collapsePaths,
-                                              CfqueryThreads);
+                                              CfqueryThreads, pchPtr);
 
     // Phase 3: Build control flow index.
     auto cfIndex = giga_drill::buildControlFlowIndex(*compDb, files, graph,
                                                       collapsePaths,
-                                                      CfqueryThreads);
+                                                      CfqueryThreads, pchPtr);
 
     // Dump mode: serialize the full index as JSON.
     if (CfqueryModeOpt == CfqueryDump) {
@@ -548,11 +584,21 @@ int main(int argc, const char **argv) {
     std::vector<std::string> collapsePaths(McpCollapsePaths.begin(),
                                            McpCollapsePaths.end());
 
+    // Pre-compile PCH headers if --pch-dir is set.
+    std::unique_ptr<giga_drill::PchCache> pchCache;
+    if (!McpPchDir.empty()) {
+      llvm::errs() << "mcp-serve: building PCH cache...\n";
+      pchCache = std::make_unique<giga_drill::PchCache>(
+          McpPchDir.getValue(), McpClang.getValue());
+      pchCache->buildFromCompileCommands(*compDb, files);
+    }
+    const giga_drill::PchCache *pchPtr = pchCache.get();
+
     llvm::errs() << "mcp-serve: building call graph ("
                  << files.size() << " files, "
                  << McpThreads << " threads)...\n";
     auto graph = giga_drill::buildCallGraph(*compDb, files, collapsePaths,
-                                             McpThreads);
+                                             McpThreads, pchPtr);
     llvm::errs() << "mcp-serve: call graph built ("
                  << graph.nodeCount() << " nodes, "
                  << graph.edgeCount() << " edges)\n";
@@ -560,7 +606,7 @@ int main(int argc, const char **argv) {
     llvm::errs() << "mcp-serve: building control flow index...\n";
     auto cfIndex = giga_drill::buildControlFlowIndex(*compDb, files, graph,
                                                       collapsePaths,
-                                                      McpThreads);
+                                                      McpThreads, pchPtr);
     llvm::errs() << "mcp-serve: control flow index built ("
                  << cfIndex.size() << " call sites)\n";
 

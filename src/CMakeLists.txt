@@ -7,6 +7,7 @@ add_library(giga_drill_lib
   lagann/TemplateEngine.cpp
   lagann/RulesParser.cpp
   lagann/TransformPipeline.cpp
+  compat/PchCache.cpp
   callgraph/CallGraph.cpp
   callgraph/CallGraphBuilder.cpp
   callgraph/CollapseFilter.cpp

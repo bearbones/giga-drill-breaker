@@ -16,6 +16,8 @@
 #ifndef GIGA_DRILL_COMPAT_TOOL_ADJUSTERS_H
 #define GIGA_DRILL_COMPAT_TOOL_ADJUSTERS_H
 
+#include "giga_drill/compat/PchCache.h"
+
 #include "clang/Tooling/Tooling.h"
 #include "clang/Tooling/ArgumentsAdjusters.h"
 #include <algorithm>
@@ -28,9 +30,12 @@ namespace giga_drill {
 /// This lets us consume compilation databases produced by toolchains whose
 /// Clang version or configuration differs from ours (e.g. hermetic Xcode
 /// builds that use -gmodules).
-inline clang::tooling::ArgumentsAdjuster getStripIncompatibleFlagsAdjuster() {
-  return [](const clang::tooling::CommandLineArguments &args,
-            llvm::StringRef /*filename*/) {
+/// When stripPch is false, PCH-related flags are preserved (use when a
+/// PchCache adjuster will handle them instead).
+inline clang::tooling::ArgumentsAdjuster
+getStripIncompatibleFlagsAdjuster(bool stripPch = true) {
+  return [stripPch](const clang::tooling::CommandLineArguments &args,
+                    llvm::StringRef /*filename*/) {
     // Flags to remove outright.
     static const char *const StripFlags[] = {
         "-gmodules",
@@ -39,10 +44,10 @@ inline clang::tooling::ArgumentsAdjuster getStripIncompatibleFlagsAdjuster() {
         "-Werror",
     };
     // Flags whose *next* argument should also be removed.
+    // -include-pch is only stripped when stripPch is true.
     static const char *const StripWithNext[] = {
         "-fmodule-file",
         "-fmodules-cache-path",
-        "-include-pch",
     };
 
     clang::tooling::CommandLineArguments filtered;
@@ -69,23 +74,30 @@ inline clang::tooling::ArgumentsAdjuster getStripIncompatibleFlagsAdjuster() {
           }
         }
       }
+      // Strip -include-pch (compiled PCH from build system).
+      if (!skip && stripPch && args[i] == "-include-pch") {
+        skip = true;
+        ++i; // skip next arg too
+      }
       // Strip -include args that reference PCH files (CMake-style PCH).
       // These use "-include/path/to/pch" (joined) or "-include /path/to/pch".
-      if (!skip && (args[i] == "-Xarch_arm64" || args[i] == "-Xarch_x86_64")) {
-        // Check if next arg is a PCH include.
-        if (i + 1 < args.size() &&
-            args[i + 1].find("-include") == 0 &&
-            args[i + 1].find("pch") != std::string::npos) {
-          skip = true;
-          ++i; // skip the -include arg too
+      if (stripPch) {
+        if (!skip && (args[i] == "-Xarch_arm64" || args[i] == "-Xarch_x86_64")) {
+          // Check if next arg is a PCH include.
+          if (i + 1 < args.size() &&
+              args[i + 1].find("-include") == 0 &&
+              args[i + 1].find("pch") != std::string::npos) {
+            skip = true;
+            ++i; // skip the -include arg too
+          }
         }
-      }
-      if (!skip && args[i].find("-include") == 0 &&
-          args[i].find("pch") != std::string::npos) {
-        skip = true;
-        // If it's just "-include" (separate), skip next arg too.
-        if (args[i] == "-include")
-          ++i;
+        if (!skip && args[i].find("-include") == 0 &&
+            args[i].find("pch") != std::string::npos) {
+          skip = true;
+          // If it's just "-include" (separate), skip next arg too.
+          if (args[i] == "-include")
+            ++i;
+        }
       }
       if (!skip)
         filtered.push_back(args[i]);
@@ -118,12 +130,81 @@ inline clang::tooling::ArgumentsAdjuster getResourceDirAdjuster() {
   };
 }
 
+/// Argument adjuster that replaces PCH source includes with compiled PCH
+/// binaries from a PchCache. The PCH source `-include <pch_src>` is replaced
+/// with `-include-pch <compiled.pch>`.
+inline clang::tooling::ArgumentsAdjuster
+getPchCacheAdjuster(const PchCache &cache) {
+  return [&cache](const clang::tooling::CommandLineArguments &args,
+                  llvm::StringRef /*filename*/) {
+    clang::tooling::CommandLineArguments result;
+    result.reserve(args.size());
+    for (size_t i = 0; i < args.size(); ++i) {
+      llvm::StringRef arg(args[i]);
+
+      // Handle -Xarch_* -include<pch> pairs.
+      if (arg.starts_with("-Xarch_") && i + 1 < args.size()) {
+        llvm::StringRef next(args[i + 1]);
+        if (next.starts_with("-include") && !next.starts_with("-include-pch") &&
+            next.contains("pch")) {
+          std::string pchSrc;
+          if (next.size() > 8) {
+            pchSrc = next.substr(8).str();
+          } else if (i + 2 < args.size()) {
+            pchSrc = args[i + 2];
+          }
+          auto compiled = cache.getCompiledPch(pchSrc);
+          if (!compiled.empty()) {
+            // Replace the whole -Xarch -include<pch> with -include-pch
+            result.push_back("-include-pch");
+            result.push_back(compiled);
+            i += (next == "-include") ? 2 : 1;
+            continue;
+          }
+        }
+      }
+
+      // Handle standalone -include<pch> (joined or separate).
+      if (arg.starts_with("-include") && !arg.starts_with("-include-pch") &&
+          arg.contains("pch")) {
+        std::string pchSrc;
+        if (arg.size() > 8) {
+          pchSrc = arg.substr(8).str();
+        } else if (i + 1 < args.size()) {
+          pchSrc = args[i + 1];
+        }
+        auto compiled = cache.getCompiledPch(pchSrc);
+        if (!compiled.empty()) {
+          result.push_back("-include-pch");
+          result.push_back(compiled);
+          if (arg == "-include")
+            ++i; // skip separate path arg
+          continue;
+        }
+      }
+
+      result.push_back(args[i]);
+    }
+    return result;
+  };
+}
+
 /// Create a ClangTool with standard argument adjusters applied.
+/// When pchCache is provided, PCH source includes are replaced with compiled
+/// .pch binaries instead of being stripped.
 inline clang::tooling::ClangTool
 makeClangTool(const clang::tooling::CompilationDatabase &compDb,
-              const std::vector<std::string> &files) {
+              const std::vector<std::string> &files,
+              const PchCache *pchCache = nullptr) {
   clang::tooling::ClangTool tool(compDb, files);
-  tool.appendArgumentsAdjuster(getStripIncompatibleFlagsAdjuster());
+  if (pchCache && !pchCache->empty()) {
+    // Replace PCH source includes with compiled PCH, then strip other
+    // incompatible flags (but not PCH-related ones).
+    tool.appendArgumentsAdjuster(getPchCacheAdjuster(*pchCache));
+    tool.appendArgumentsAdjuster(getStripIncompatibleFlagsAdjuster(/*stripPch=*/false));
+  } else {
+    tool.appendArgumentsAdjuster(getStripIncompatibleFlagsAdjuster());
+  }
   tool.appendArgumentsAdjuster(
       clang::tooling::getClangStripDependencyFileAdjuster());
   tool.appendArgumentsAdjuster(getResourceDirAdjuster());

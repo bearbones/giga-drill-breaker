@@ -134,16 +134,20 @@ private:
   std::unordered_map<std::string, size_t> bySite_;
 };
 
+class PchCache;
+
 // Build a ControlFlowIndex from a compilation database (Phase 3, after call
 // graph construction). The CallGraph is used to resolve callee noexcept specs.
 // If collapsePaths is non-empty, call site contexts within collapsed paths are
 // skipped (same filtering as buildCallGraph).
 // threadCount=0 uses hardware_concurrency; threadCount=1 forces serial.
+// pchCache, if non-null, provides compiled PCH binaries for faster parsing.
 ControlFlowIndex
 buildControlFlowIndex(const clang::tooling::CompilationDatabase &compDb,
                       const std::vector<std::string> &files,
                       const CallGraph &graph,
                       const std::vector<std::string> &collapsePaths = {},
-                      unsigned threadCount = 0);
+                      unsigned threadCount = 0,
+                      const PchCache *pchCache = nullptr);
 
 } // namespace giga_drill

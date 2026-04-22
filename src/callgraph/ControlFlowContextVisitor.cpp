@@ -16,6 +16,7 @@
 #include "giga_drill/callgraph/CollapseFilter.h"
 #include "giga_drill/callgraph/ControlFlowIndex.h"
 #include "giga_drill/callgraph/CallGraph.h"
+#include "giga_drill/compat/PchCache.h"
 #include "giga_drill/compat/ToolAdjusters.h"
 
 #include "llvm/Support/ThreadPool.h"
@@ -453,7 +454,8 @@ buildControlFlowIndex(const clang::tooling::CompilationDatabase &compDb,
                       const std::vector<std::string> &files,
                       const CallGraph &graph,
                       const std::vector<std::string> &collapsePaths,
-                      unsigned threadCount) {
+                      unsigned threadCount,
+                      const PchCache *pchCache) {
   ControlFlowIndex index;
   CollapseFilter collapseFilter(collapsePaths);
   const CollapseFilter *collapsePtr =
@@ -465,15 +467,15 @@ buildControlFlowIndex(const clang::tooling::CompilationDatabase &compDb,
     llvm::DefaultThreadPool pool(
         llvm::hardware_concurrency(threadCount));
     for (const auto &file : files) {
-      pool.async([&compDb, &index, &graph, collapsePtr, file]() {
-        auto tool = giga_drill::makeClangTool(compDb, {file});
+      pool.async([&compDb, &index, &graph, collapsePtr, pchCache, file]() {
+        auto tool = giga_drill::makeClangTool(compDb, {file}, pchCache);
         ControlFlowContextFactory factory(index, graph, collapsePtr);
         tool.run(&factory);
       });
     }
     pool.wait();
   } else {
-    auto tool = giga_drill::makeClangTool(compDb, files);
+    auto tool = giga_drill::makeClangTool(compDb, files, pchCache);
     ControlFlowContextFactory factory(index, graph, collapsePtr);
     tool.run(&factory);
   }

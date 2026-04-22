@@ -159,13 +159,17 @@ private:
   CallGraph &graph_;
 };
 
+class PchCache;
+
 // Build a call graph from a compilation database (multi-TU, two-pass).
 // If collapsePaths is non-empty, internal edges within collapsed paths are
 // skipped (boundary edges from non-collapsed callers are preserved).
 // threadCount=0 uses hardware_concurrency; threadCount=1 forces serial.
+// pchCache, if non-null, provides compiled PCH binaries for faster parsing.
 CallGraph buildCallGraph(const clang::tooling::CompilationDatabase &compDb,
                          const std::vector<std::string> &files,
                          const std::vector<std::string> &collapsePaths = {},
-                         unsigned threadCount = 0);
+                         unsigned threadCount = 0,
+                         const PchCache *pchCache = nullptr);
 
 } // namespace giga_drill
