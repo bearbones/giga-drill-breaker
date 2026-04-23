@@ -20,10 +20,13 @@
 #include "giga_drill/callgraph/ControlFlowOracle.h"
 #include "giga_drill/lagann/RulesParser.h"
 #include "giga_drill/lagann/TransformPipeline.h"
+#include "giga_drill/callgraph/CollapseFilter.h"
 #include "giga_drill/compat/PchCache.h"
 #include "giga_drill/mcp/McpServer.h"
 
 #include "clang/Tooling/CompilationDatabase.h"
+
+#include <algorithm>
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -219,6 +222,12 @@ static llvm::cl::list<std::string>
         llvm::cl::value_desc("pattern"),
         llvm::cl::sub(CfqueryCmd));
 
+static llvm::cl::list<std::string>
+    CfquerySkipPaths("skip-paths",
+        llvm::cl::desc("Path patterns to skip entirely (TUs matching are not processed)"),
+        llvm::cl::value_desc("pattern"),
+        llvm::cl::sub(CfqueryCmd));
+
 static llvm::cl::opt<unsigned>
     CfqueryThreads("threads",
         llvm::cl::desc("Number of threads (0 = hardware_concurrency, 1 = serial)"),
@@ -264,6 +273,12 @@ static llvm::cl::list<std::string>
 static llvm::cl::list<std::string>
     McpCollapsePaths("collapse-paths",
         llvm::cl::desc("Path patterns to collapse (internal edges skipped)"),
+        llvm::cl::value_desc("pattern"),
+        llvm::cl::sub(McpServeCmd));
+
+static llvm::cl::list<std::string>
+    McpSkipPaths("skip-paths",
+        llvm::cl::desc("Path patterns to skip entirely (TUs matching are not processed)"),
         llvm::cl::value_desc("pattern"),
         llvm::cl::sub(McpServeCmd));
 
@@ -418,6 +433,20 @@ int main(int argc, const char **argv) {
                                    CfquerySourceFiles.end());
     std::vector<std::string> collapsePaths(CfqueryCollapsePaths.begin(),
                                            CfqueryCollapsePaths.end());
+
+    // Filter out TUs matching --skip-paths.
+    if (!CfquerySkipPaths.empty()) {
+      giga_drill::CollapseFilter skipFilter(
+          {CfquerySkipPaths.begin(), CfquerySkipPaths.end()});
+      size_t before = files.size();
+      files.erase(std::remove_if(files.begin(), files.end(),
+                                  [&](const std::string &f) {
+                                    return skipFilter.isCollapsed(f);
+                                  }),
+                  files.end());
+      llvm::errs() << "skip-paths: " << (before - files.size())
+                   << " of " << before << " TUs skipped\n";
+    }
 
     // Pre-compile PCH headers if --pch-dir is set.
     std::unique_ptr<giga_drill::PchCache> pchCache;
@@ -583,6 +612,20 @@ int main(int argc, const char **argv) {
                                    McpSourceFiles.end());
     std::vector<std::string> collapsePaths(McpCollapsePaths.begin(),
                                            McpCollapsePaths.end());
+
+    // Filter out TUs matching --skip-paths.
+    if (!McpSkipPaths.empty()) {
+      giga_drill::CollapseFilter skipFilter(
+          {McpSkipPaths.begin(), McpSkipPaths.end()});
+      size_t before = files.size();
+      files.erase(std::remove_if(files.begin(), files.end(),
+                                  [&](const std::string &f) {
+                                    return skipFilter.isCollapsed(f);
+                                  }),
+                  files.end());
+      llvm::errs() << "mcp-serve: skip-paths: " << (before - files.size())
+                   << " of " << before << " TUs skipped\n";
+    }
 
     // Pre-compile PCH headers if --pch-dir is set.
     std::unique_ptr<giga_drill::PchCache> pchCache;
