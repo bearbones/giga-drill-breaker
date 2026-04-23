@@ -22,11 +22,84 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
-#include <cstdlib>
 #include <functional>
 #include <set>
 
 namespace giga_drill {
+
+namespace {
+
+/// Apply the same flag adjustments to a compile command that ToolAdjusters
+/// would apply to a ClangTool invocation. This ensures the shell-invoked
+/// clang++ sees the same flags as ClangTool's cc1 pipeline.
+static std::vector<std::string>
+applyToolAdjusters(const std::vector<std::string> &args) {
+  // Simulate getStripIncompatibleFlagsAdjuster (stripPch=true for PCH
+  // source flags — we're compiling the PCH, not using it).
+  static const char *const stripFlags[] = {
+      "-gmodules", "-fmodules", "-fcxx-modules", "-Werror",
+  };
+  static const char *const stripWithNext[] = {
+      "-fmodule-file", "-fmodules-cache-path", "-include-pch",
+  };
+
+  std::vector<std::string> result;
+  for (size_t i = 0; i < args.size(); ++i) {
+    bool skip = false;
+    for (const auto *f : stripFlags) {
+      if (args[i] == f) {
+        skip = true;
+        break;
+      }
+    }
+    if (!skip) {
+      for (const auto *f : stripWithNext) {
+        if (args[i] == f) {
+          skip = true;
+          ++i;
+          break;
+        }
+      }
+    }
+    // Strip PCH source includes.
+    if (!skip && (args[i] == "-Xarch_arm64" || args[i] == "-Xarch_x86_64")) {
+      if (i + 1 < args.size() && args[i + 1].find("-include") == 0 &&
+          args[i + 1].find("pch") != std::string::npos) {
+        skip = true;
+        ++i;
+      }
+    }
+    if (!skip && args[i].find("-include") == 0 &&
+        args[i].find("pch") != std::string::npos) {
+      skip = true;
+      if (args[i] == "-include")
+        ++i;
+    }
+    if (!skip && args[i] == "-Winvalid-pch")
+      skip = true;
+    if (!skip)
+      result.push_back(args[i]);
+  }
+
+  // Simulate getResourceDirAdjuster — inject -resource-dir if not already set.
+  bool hasResourceDir = false;
+  for (const auto &a : result) {
+    if (a.find("-resource-dir") == 0) {
+      hasResourceDir = true;
+      break;
+    }
+  }
+#ifdef GIGA_DRILL_CLANG_RESOURCE_DIR
+  if (!hasResourceDir) {
+    result.push_back("-resource-dir");
+    result.push_back(GIGA_DRILL_CLANG_RESOURCE_DIR);
+  }
+#endif
+
+  return result;
+}
+
+} // anonymous namespace
 
 PchCache::PchCache(std::string cacheDir, std::string clangBin)
     : cacheDir_(std::move(cacheDir)), clangBin_(std::move(clangBin)) {}
@@ -76,7 +149,7 @@ static bool isPchSourceInclude(const std::vector<std::string> &args,
 void PchCache::buildFromCompileCommands(
     const clang::tooling::CompilationDatabase &compDb,
     const std::vector<std::string> &files) {
-  // Map: PCH source header → first TU's compile command that uses it.
+  // Map: PCH source header → first TU's args (for cache key computation).
   std::unordered_map<std::string, std::vector<std::string>> pchToFlags;
 
   for (const auto &file : files) {
@@ -112,9 +185,8 @@ void PchCache::buildFromCompileCommands(
   llvm::errs() << "pch-cache: found " << pchToFlags.size()
                << " unique PCH headers to compile\n";
 
-  for (auto &[pchSrc, tuArgs] : pchToFlags) {
-    auto flags = extractPchCompileFlags(tuArgs);
-    auto key = computeCacheKey(pchSrc, flags);
+  for (auto &[pchSrc, tuCmdArgs] : pchToFlags) {
+    auto key = computeCacheKey(pchSrc, tuCmdArgs);
     std::string outPath = cacheDir_ + "/" + key + ".pch";
 
     // Check if already compiled.
@@ -124,15 +196,17 @@ void PchCache::buildFromCompileCommands(
       continue;
     }
 
-    // Construct command: clang++ -x c++-header <flags> <pch_src> -emit-pch -o <out>
-    // Include our resource-dir so the PCH sees the same built-in headers
-    // as the TU parses (which also get resource-dir injected).
+    // Apply the same flag adjustments that ToolAdjusters apply to
+    // ClangTool invocations. This ensures the external clang++ sees
+    // the same resource-dir and stripped flags, producing a PCH
+    // compatible with the ClangTool's TU parsing path.
+    auto adjustedFlags = applyToolAdjusters(tuCmdArgs);
+    auto pchFlags = extractPchCompileFlags(adjustedFlags);
+
+    // Construct: clang++ -x c++-header <flags> <pch_src> -Xclang -emit-pch -o <out>
     std::string cmd = clangBin_;
-    cmd += " -x c++-header";
-#ifdef GIGA_DRILL_CLANG_RESOURCE_DIR
-    cmd += " -resource-dir '" GIGA_DRILL_CLANG_RESOURCE_DIR "'";
-#endif
-    for (const auto &f : flags) {
+    cmd += " -x c++-header -Wno-error";
+    for (const auto &f : pchFlags) {
       cmd += " '";
       cmd += f;
       cmd += "'";
@@ -141,22 +215,18 @@ void PchCache::buildFromCompileCommands(
     cmd += pchSrc;
     cmd += "' -Xclang -emit-pch -o '";
     cmd += outPath;
-    std::string logFile = outPath + ".log";
-    cmd += "' -Wno-error > '";
-    cmd += logFile;
     cmd += "' 2>&1";
 
     llvm::errs() << "pch-cache: compiling " << pchSrc << " ...\n";
     int rc = std::system(cmd.c_str());
+
     if (rc == 0 && llvm::sys::fs::exists(outPath)) {
       uint64_t size;
       llvm::sys::fs::file_size(outPath, size);
       llvm::errs() << "pch-cache: ok (" << size / 1024 / 1024 << " MB)\n";
       cache_[pchSrc] = outPath;
-      llvm::sys::fs::remove(logFile);
     } else {
-      llvm::errs() << "pch-cache: FAILED (exit " << rc
-                   << "), see " << logFile << "\n";
+      llvm::errs() << "pch-cache: FAILED (exit " << rc << ")\n";
       llvm::sys::fs::remove(outPath);
     }
   }

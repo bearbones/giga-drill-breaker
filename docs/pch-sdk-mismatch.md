@@ -212,6 +212,46 @@ graceful errors, not crashes.
 
 ### Conclusion
 
-Implement `GeneratePCHAction` through `ClangTool::run()`. This guarantees
-both PCH and TU go through identical cc1 argument processing with identical
-header search paths. No driver-injected `-internal-isystem` mismatch.
+The implemented fix applies ToolAdjusters logic (resource-dir injection,
+incompatible flag stripping) to the external `system()` clang++ invocation.
+This ensures the driver sees the same flags for PCH compilation as ClangTool
+would apply to TU parsing. Confirmed: BaseWrapProp.cpp (the crasher) now
+produces 13,704 call sites with PCH, zero crashes.
+
+## Alternative Approach: ToolInvocation (cc1 direct)
+
+`ClangTool` cannot compile PCH files because it always injects `-fsyntax-only`,
+which combined with `-x c++-header` causes the driver to generate multiple
+compiler jobs ("expected exactly one compiler job" error).
+
+`clang::tooling::ToolInvocation` is a lower-level API that runs cc1 directly
+without the driver. It could compile PCH files by:
+
+1. Constructing cc1 arguments from the compile command (the driver normally
+   does this translation, so we'd need to replicate it or capture it)
+2. Setting the frontend action to `GeneratePCHAction`
+3. Running the invocation
+
+**Pros**:
+- Guaranteed identical header resolution (same cc1 process as TU parsing)
+- No external process spawning (faster, no shell escaping issues)
+- No risk of driver/cc1 argument translation divergence
+
+**Cons**:
+- Need to construct cc1 arguments manually (the driver translates flags like
+  `-arch arm64` → `-triple arm64-apple-macosx10.13.0`, `-g` → `-debug-info-kind=constructor`,
+  etc.). This is complex and fragile.
+- Alternative: run the driver with `-###` to capture the cc1 line, then parse
+  it for ToolInvocation. This adds a subprocess call but avoids manual flag
+  translation.
+- ClangTool's `buildASTFromCodeWithArgs` shows the pattern but only for
+  in-memory code, not file-based PCH generation.
+
+**When to revisit**: If the current `system()` approach causes issues with:
+- Cross-platform portability (Windows cmd.exe quoting)
+- Toolchain configurations where the driver and cc1 diverge
+- Reproducibility requirements (system() is inherently non-deterministic)
+
+**Key reference**: `clang/lib/Tooling/Tooling.cpp`, `ToolInvocation::run()` —
+this is what `ClangTool::run()` calls internally after driver argument
+processing. The cc1 arguments are in `CompilerInvocation`.
