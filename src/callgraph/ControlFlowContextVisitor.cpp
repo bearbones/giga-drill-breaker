@@ -16,6 +16,7 @@
 #include "giga_drill/callgraph/CollapseFilter.h"
 #include "giga_drill/callgraph/ControlFlowIndex.h"
 #include "giga_drill/callgraph/CallGraph.h"
+#include "giga_drill/compat/ClangVersion.h"
 #include "giga_drill/compat/PchCache.h"
 #include "giga_drill/compat/ToolAdjusters.h"
 
@@ -464,8 +465,13 @@ buildControlFlowIndex(const clang::tooling::CompilationDatabase &compDb,
   bool parallel = threadCount != 1 && files.size() > 1;
 
   if (parallel) {
+#if GIGA_DRILL_LLVM_AT_LEAST(19)
     llvm::DefaultThreadPool pool(
         llvm::hardware_concurrency(threadCount));
+#else
+    llvm::ThreadPool pool(
+        llvm::hardware_concurrency(threadCount));
+#endif
     for (const auto &file : files) {
       pool.async([&compDb, &index, &graph, collapsePtr, pchCache, file]() {
         auto tool = giga_drill::makeClangTool(compDb, {file}, pchCache);

@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        llvm-version: [18, 20]
+        llvm-version: [18, 20, 21]
 
     name: LLVM ${{ matrix.llvm-version }}
 
