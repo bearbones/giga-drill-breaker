@@ -53,12 +53,29 @@ Rules are specified as JSON objects containing:
 
 Requires CMake 3.20+, a C++17 compiler, and Ninja (recommended).
 
+### Dependencies
+
+| Dependency | Required | How it's resolved |
+|---|---|---|
+| LLVM/Clang | 18, 20, or 21 | system package preferred; submodule fallback |
+| Catch2 | v3.10+ (tests only) | imported target -> `find_package` -> submodule fallback |
+
+Neither dependency is fetched at configure time. Hermetic-build
+environments and organizations using internal package managers can
+satisfy each dependency at any tier without modifying this build
+system — see "Hermetic and internal-package-manager builds" below.
+
+### Quick start
+
 ```bash
-# Clone with submodules
+# Clone with submodules (LLVM and Catch2)
 git clone --recurse-submodules https://github.com/bearbones/giga-drill-breaker.git
 cd giga-drill-breaker
 
-# The submodule uses sparse checkout; after cloning you may need:
+# If you only need Catch2 (recommended — system LLVM is much faster):
+# git submodule update --init extern/Catch2
+
+# The LLVM submodule uses sparse checkout; after cloning you may need:
 cd extern/llvm-project
 git sparse-checkout set llvm clang cmake third-party
 cd ../..
@@ -74,12 +91,51 @@ cmake --build build --target giga_drill_tests
 cd build && ctest --output-on-failure
 ```
 
-The build system first tries to find a system-installed LLVM/Clang 18
-(`llvm-18-dev`, `libclang-18-dev`). If not found, it falls back to the
-bundled submodule.
+### LLVM/Clang resolution
+
+The build tries each supported LLVM major version in turn (21, then 20,
+then 18) by probing well-known install paths, then falls back to the
+`extern/llvm-project` submodule. To pin a specific version, point
+`CMAKE_PREFIX_PATH` at it:
+
+```bash
+cmake -B build -G Ninja -DCMAKE_PREFIX_PATH=/usr/lib/llvm-20
+```
 
 On macOS with Apple Silicon, AArch64 support is included automatically.
 For Intel-only builds: `-DLLVM_TARGETS_TO_BUILD=X86`.
+
+### Catch2 resolution
+
+The test build tries Catch2 in this order:
+
+1. **Pre-existing `Catch2::Catch2WithMain` imported target** — if a parent
+   project, internal package manager, or CMake toolchain file has already
+   defined it, we use it as-is.
+2. **`find_package(Catch2 3.10 CONFIG)`** — covers system installs, vcpkg,
+   Conan, Spack, and any layout that ships Catch2's CMake config files.
+   Override the search with `CMAKE_PREFIX_PATH` or `Catch2_DIR`.
+3. **Submodule at `extern/Catch2`** — pinned to v3.10.0 upstream by default.
+
+Tests can be disabled entirely with `-DGIGA_DRILL_BUILD_TESTS=OFF`.
+
+### Hermetic and internal-package-manager builds
+
+The dependency resolution is structured so that organizations vendoring
+their own dependencies (internal forks, mirror-only network, package
+managers like Spack/Conan/vcpkg) do not need to modify any of this
+project's build files:
+
+- **Replace dependency sources** — point `.gitmodules` at internal
+  mirrors (`url = https://internal-mirror.example.com/Catch2.git`) and
+  reuse the submodule path. CMake never reads the URL.
+- **Provide via package manager** — set `CMAKE_PREFIX_PATH` for
+  `find_package` to find your toolchain's installs. Both LLVM and
+  Catch2 are looked up with `find_package` first.
+- **Provide via parent project** — if this repository is consumed as a
+  subdirectory of a larger build that already exposes
+  `Catch2::Catch2WithMain` (or LLVM via `LLVM_DIR`/`Clang_DIR`), no
+  configuration is needed; the existing targets/packages are honored.
 
 ---
 
