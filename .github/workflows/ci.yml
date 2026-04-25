@@ -21,6 +21,9 @@ jobs:
         with:
           submodules: false
 
+      - name: Initialize Catch2 submodule
+        run: git submodule update --init --depth 1 -- extern/Catch2
+
       - name: Install LLVM/Clang ${{ matrix.llvm-version }}
         env:
           LLVM_VERSION: ${{ matrix.llvm-version }}

@@ -173,7 +173,10 @@ boundary edges (non-collapsed caller → collapsed callee) are preserved.
   `clangRewrite`, `clangToolingCore`, `LLVMSupport`.
 
 `tests/CMakeLists.txt`:
-- Fetches Catch2 v3.7.1 via FetchContent.
+- Resolves Catch2 v3.10+ in three tiers (no network at configure time):
+  1. Pre-existing `Catch2::Catch2WithMain` imported target.
+  2. `find_package(Catch2 3.10 CONFIG)` — system / vcpkg / Conan / Spack.
+  3. `extern/Catch2` submodule (pinned to v3.10.0 upstream by default).
 - Defines `PROJECT_SOURCE_DIR` for example file paths.
 
 ---
@@ -329,6 +332,12 @@ only, not a namespace boundary.
 
 ## External Dependencies
 
-- **LLVM/Clang 18 or 20** — system package or git submodule at `extern/llvm-project`
-- **Catch2 v3.7.1** — fetched automatically by CMake during test configuration
-- No other runtime dependencies
+- **LLVM/Clang 18, 20, or 21** — system package preferred (`find_package`),
+  git submodule at `extern/llvm-project` as fallback. Selectable via
+  `CMAKE_PREFIX_PATH=/usr/lib/llvm-NN`.
+- **Catch2 v3.10+** (tests only) — resolved in three tiers: pre-existing
+  imported target -> `find_package` -> `extern/Catch2` submodule.
+  Network is not required at configure time. See README.md "Hermetic
+  and internal-package-manager builds" for organizations using
+  internal mirrors or alternate package managers.
+- No other runtime dependencies.
