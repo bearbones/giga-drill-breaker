@@ -158,12 +158,16 @@ boundary edges (non-collapsed caller → collapsed callee) are preserved.
 
 `CMakeLists.txt` (top-level):
 - Requires CMake 3.20+, C++17.
-- Iterates `GIGA_DRILL_SUPPORTED_LLVM_VERSIONS` (currently `20 18`, newest
-  first) via `find_package()`. To add a new version, append it to that list.
+- Iterates `GIGA_DRILL_SUPPORTED_LLVM_VERSIONS` (currently `21 20 18`,
+  newest first) via `find_package()`. The CI matrix in
+  `.github/workflows/ci.yml` mirrors this list.
 - Falls back to `extern/llvm-project` submodule if no system package matches.
 - Disables RTTI (`-fno-rtti`) to match LLVM's default.
 - A lightweight compatibility header (`include/giga_drill/compat/ClangVersion.h`)
   provides `GIGA_DRILL_LLVM_AT_LEAST(major)` for version-conditional code.
+- See `COMPATIBILITY.md` for the support matrix, known API differences
+  between supported LLVM majors, and the procedure for adding/removing a
+  supported version.
 
 `src/CMakeLists.txt`:
 - Builds `giga_drill_lib` from `mugann/*.cpp`, `lagann/*.cpp`, `callgraph/*.cpp`, and `mcp/*.cpp`.
@@ -291,11 +295,18 @@ class that bridges between `MatchFinder::MatchCallback` and the user-supplied
 
 ---
 
-## Development Branch
+## Development Workflow
 
-All changes go to: `claude/reorganize-features-document-aPqVo`
+Changes land on `main` via pull requests. Feature branches use a topical
+prefix (`fix/`, `feat/`, `docs/`, etc.) and a short description, e.g.
+`fix/llvm-18-threadpool-compat`.
 
 Commit convention: descriptive imperative messages, no ticket numbers required.
+
+When release branches exist (`release/llvm-18`, `release/llvm-20`,
+`release/llvm-21`), bug fixes are cherry-picked from `main` to each
+applicable release branch via the `backport/llvm-NN` PR label. See
+`COMPATIBILITY.md` for the full cherry-pick policy.
 
 ---
 
