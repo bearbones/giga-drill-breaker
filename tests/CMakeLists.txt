@@ -32,7 +32,10 @@ if(NOT TARGET Catch2::Catch2WithMain)
   if(EXISTS "${_catch2_submodule}/CMakeLists.txt")
     set(CATCH_INSTALL_DOCS OFF CACHE BOOL "" FORCE)
     set(CATCH_INSTALL_EXTRAS ON CACHE BOOL "" FORCE)
-    add_subdirectory("${_catch2_submodule}" EXCLUDE_FROM_ALL)
+    # Explicit binary dir required because the source lives outside this
+    # directory (extern/ is a sibling of tests/, not a child).
+    add_subdirectory("${_catch2_submodule}" "${CMAKE_BINARY_DIR}/extern/Catch2"
+                     EXCLUDE_FROM_ALL)
     list(APPEND CMAKE_MODULE_PATH "${_catch2_submodule}/extras")
     set(_catch2_origin "submodule (extern/Catch2)")
   endif()
