@@ -158,12 +158,16 @@ boundary edges (non-collapsed caller → collapsed callee) are preserved.
 
 `CMakeLists.txt` (top-level):
 - Requires CMake 3.20+, C++17.
-- Iterates `GIGA_DRILL_SUPPORTED_LLVM_VERSIONS` (currently `20 18`, newest
-  first) via `find_package()`. To add a new version, append it to that list.
+- Iterates `GIGA_DRILL_SUPPORTED_LLVM_VERSIONS` (currently `21 20 18`,
+  newest first) via `find_package()`. The CI matrix in
+  `.github/workflows/ci.yml` mirrors this list.
 - Falls back to `extern/llvm-project` submodule if no system package matches.
 - Disables RTTI (`-fno-rtti`) to match LLVM's default.
 - A lightweight compatibility header (`include/giga_drill/compat/ClangVersion.h`)
   provides `GIGA_DRILL_LLVM_AT_LEAST(major)` for version-conditional code.
+- See `COMPATIBILITY.md` for the support matrix, known API differences
+  between supported LLVM majors, and the procedure for adding/removing a
+  supported version.
 
 `src/CMakeLists.txt`:
 - Builds `giga_drill_lib` from `mugann/*.cpp`, `lagann/*.cpp`, `callgraph/*.cpp`, and `mcp/*.cpp`.
@@ -173,7 +177,10 @@ boundary edges (non-collapsed caller → collapsed callee) are preserved.
   `clangRewrite`, `clangToolingCore`, `LLVMSupport`.
 
 `tests/CMakeLists.txt`:
-- Fetches Catch2 v3.7.1 via FetchContent.
+- Resolves Catch2 v3.10+ in three tiers (no network at configure time):
+  1. Pre-existing `Catch2::Catch2WithMain` imported target.
+  2. `find_package(Catch2 3.10 CONFIG)` — system / vcpkg / Conan / Spack.
+  3. `extern/Catch2` submodule (pinned to v3.10.0 upstream by default).
 - Defines `PROJECT_SOURCE_DIR` for example file paths.
 
 ---
@@ -291,11 +298,18 @@ class that bridges between `MatchFinder::MatchCallback` and the user-supplied
 
 ---
 
-## Development Branch
+## Development Workflow
 
-All changes go to: `claude/reorganize-features-document-aPqVo`
+Changes land on `main` via pull requests. Feature branches use a topical
+prefix (`fix/`, `feat/`, `docs/`, etc.) and a short description, e.g.
+`fix/llvm-18-threadpool-compat`.
 
 Commit convention: descriptive imperative messages, no ticket numbers required.
+
+When release branches exist (`release/llvm-18`, `release/llvm-20`,
+`release/llvm-21`), bug fixes are cherry-picked from `main` to each
+applicable release branch via the `backport/llvm-NN` PR label. See
+`COMPATIBILITY.md` for the full cherry-pick policy.
 
 ---
 
@@ -329,6 +343,12 @@ only, not a namespace boundary.
 
 ## External Dependencies
 
-- **LLVM/Clang 18 or 20** — system package or git submodule at `extern/llvm-project`
-- **Catch2 v3.7.1** — fetched automatically by CMake during test configuration
-- No other runtime dependencies
+- **LLVM/Clang 18, 20, or 21** — system package preferred (`find_package`),
+  git submodule at `extern/llvm-project` as fallback. Selectable via
+  `CMAKE_PREFIX_PATH=/usr/lib/llvm-NN`.
+- **Catch2 v3.10+** (tests only) — resolved in three tiers: pre-existing
+  imported target -> `find_package` -> `extern/Catch2` submodule.
+  Network is not required at configure time. See README.md "Hermetic
+  and internal-package-manager builds" for organizations using
+  internal mirrors or alternate package managers.
+- No other runtime dependencies.

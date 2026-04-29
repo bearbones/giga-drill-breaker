@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        llvm-version: [18, 20]
+        llvm-version: [18, 20, 21]
 
     name: LLVM ${{ matrix.llvm-version }}
 
@@ -21,13 +21,23 @@ jobs:
         with:
           submodules: false
 
+      - name: Initialize Catch2 submodule
+        run: git submodule update --init --depth 1 -- extern/Catch2
+
       - name: Install LLVM/Clang ${{ matrix.llvm-version }}
+        env:
+          LLVM_VERSION: ${{ matrix.llvm-version }}
         run: |
-          sudo apt-get update
+          # Use apt.llvm.org for all matrix versions so CI is reproducible
+          # regardless of which LLVM versions Ubuntu's archive happens to ship.
+          # Downstream hermetic builds are unaffected — this script lives in
+          # the workflow only, not in CMake.
+          wget -qO llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh "$LLVM_VERSION"
           sudo apt-get install -y \
-            llvm-${{ matrix.llvm-version }}-dev \
-            libclang-${{ matrix.llvm-version }}-dev \
-            clang-${{ matrix.llvm-version }} \
+            "llvm-${LLVM_VERSION}-dev" \
+            "libclang-${LLVM_VERSION}-dev" \
             ninja-build
 
       - name: Configure

@@ -14,6 +14,7 @@
 // limitations under the License.
 
 #include "giga_drill/callgraph/CallGraphBuilder.h"
+#include "giga_drill/compat/ClangVersion.h"
 #include "giga_drill/compat/ToolAdjusters.h"
 
 #include "llvm/Support/ThreadPool.h"
@@ -1041,8 +1042,13 @@ CallGraph buildCallGraph(const clang::tooling::CompilationDatabase &compDb,
   bool parallel = threadCount != 1 && files.size() > 1;
 
   if (parallel) {
+#if GIGA_DRILL_LLVM_AT_LEAST(19)
     llvm::DefaultThreadPool pool(
         llvm::hardware_concurrency(threadCount));
+#else
+    llvm::ThreadPool pool(
+        llvm::hardware_concurrency(threadCount));
+#endif
 
     // Pass 1: Parallel index of all declarations and class hierarchy.
     for (const auto &file : files) {
