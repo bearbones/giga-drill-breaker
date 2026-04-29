@@ -15,6 +15,8 @@
 
 #pragma once
 
+#include "giga_drill/callgraph/StringInterner.h"
+
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -126,12 +128,17 @@ public:
   // All stored contexts (for dump mode).
   std::vector<const CallSiteContext *> allContexts() const;
 
+  const StringInterner &interner() const { return interner_; }
+
 private:
+  using SId = StringInterner::Id;
+
   mutable std::mutex mutex_;
+  StringInterner interner_;
   std::vector<CallSiteContext> contexts_;
-  std::unordered_map<std::string, std::vector<size_t>> byCallee_;
-  std::unordered_map<std::string, std::vector<size_t>> byCaller_;
-  std::unordered_map<std::string, size_t> bySite_;
+  std::unordered_map<SId, std::vector<size_t>> byCallee_;
+  std::unordered_map<SId, std::vector<size_t>> byCaller_;
+  std::unordered_map<SId, size_t> bySite_;
 };
 
 class PchCache;

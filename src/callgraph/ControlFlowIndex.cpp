@@ -18,12 +18,14 @@
 namespace giga_drill {
 
 ControlFlowIndex::ControlFlowIndex(ControlFlowIndex &&other) noexcept
-    : contexts_(std::move(other.contexts_)),
+    : interner_(std::move(other.interner_)),
+      contexts_(std::move(other.contexts_)),
       byCallee_(std::move(other.byCallee_)),
       byCaller_(std::move(other.byCaller_)),
       bySite_(std::move(other.bySite_)) {}
 
 ControlFlowIndex &ControlFlowIndex::operator=(ControlFlowIndex &&other) noexcept {
+  interner_ = std::move(other.interner_);
   contexts_ = std::move(other.contexts_);
   byCallee_ = std::move(other.byCallee_);
   byCaller_ = std::move(other.byCaller_);
@@ -33,16 +35,22 @@ ControlFlowIndex &ControlFlowIndex::operator=(ControlFlowIndex &&other) noexcept
 
 void ControlFlowIndex::addCallSiteContext(CallSiteContext ctx) {
   std::lock_guard<std::mutex> lock(mutex_);
+  SId calleeId = interner_.intern(ctx.calleeName);
+  SId callerId = interner_.intern(ctx.callerName);
+  SId siteId = interner_.intern(ctx.callSite);
   size_t idx = contexts_.size();
-  byCallee_[ctx.calleeName].push_back(idx);
-  byCaller_[ctx.callerName].push_back(idx);
-  bySite_[ctx.callSite] = idx;
+  byCallee_[calleeId].push_back(idx);
+  byCaller_[callerId].push_back(idx);
+  bySite_[siteId] = idx;
   contexts_.push_back(std::move(ctx));
 }
 
 const CallSiteContext *
 ControlFlowIndex::contextAtSite(const std::string &callSite) const {
-  auto it = bySite_.find(callSite);
+  auto id = interner_.find(callSite);
+  if (!id)
+    return nullptr;
+  auto it = bySite_.find(*id);
   if (it == bySite_.end())
     return nullptr;
   return &contexts_[it->second];
@@ -51,7 +59,10 @@ ControlFlowIndex::contextAtSite(const std::string &callSite) const {
 std::vector<const CallSiteContext *>
 ControlFlowIndex::contextsForCallee(const std::string &calleeName) const {
   std::vector<const CallSiteContext *> result;
-  auto it = byCallee_.find(calleeName);
+  auto id = interner_.find(calleeName);
+  if (!id)
+    return result;
+  auto it = byCallee_.find(*id);
   if (it == byCallee_.end())
     return result;
   for (size_t idx : it->second)
@@ -62,7 +73,10 @@ ControlFlowIndex::contextsForCallee(const std::string &calleeName) const {
 std::vector<const CallSiteContext *>
 ControlFlowIndex::contextsForCaller(const std::string &callerName) const {
   std::vector<const CallSiteContext *> result;
-  auto it = byCaller_.find(callerName);
+  auto id = interner_.find(callerName);
+  if (!id)
+    return result;
+  auto it = byCaller_.find(*id);
   if (it == byCaller_.end())
     return result;
   for (size_t idx : it->second)
@@ -73,7 +87,10 @@ ControlFlowIndex::contextsForCaller(const std::string &callerName) const {
 std::vector<const CallSiteContext *>
 ControlFlowIndex::protectedCallsTo(const std::string &calleeName) const {
   std::vector<const CallSiteContext *> result;
-  auto it = byCallee_.find(calleeName);
+  auto id = interner_.find(calleeName);
+  if (!id)
+    return result;
+  auto it = byCallee_.find(*id);
   if (it == byCallee_.end())
     return result;
   for (size_t idx : it->second) {
@@ -86,7 +103,10 @@ ControlFlowIndex::protectedCallsTo(const std::string &calleeName) const {
 std::vector<const CallSiteContext *>
 ControlFlowIndex::unprotectedCallsTo(const std::string &calleeName) const {
   std::vector<const CallSiteContext *> result;
-  auto it = byCallee_.find(calleeName);
+  auto id = interner_.find(calleeName);
+  if (!id)
+    return result;
+  auto it = byCallee_.find(*id);
   if (it == byCallee_.end())
     return result;
   for (size_t idx : it->second) {
