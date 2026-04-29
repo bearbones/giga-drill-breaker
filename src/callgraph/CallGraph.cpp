@@ -20,7 +20,8 @@
 namespace giga_drill {
 
 CallGraph::CallGraph(CallGraph &&other) noexcept
-    : nodes_(std::move(other.nodes_)),
+    : interner_(std::move(other.interner_)),
+      nodes_(std::move(other.nodes_)),
       edges_(std::move(other.edges_)),
       outEdges_(std::move(other.outEdges_)),
       inEdges_(std::move(other.inEdges_)),
@@ -30,6 +31,7 @@ CallGraph::CallGraph(CallGraph &&other) noexcept
       functionReturns_(std::move(other.functionReturns_)) {}
 
 CallGraph &CallGraph::operator=(CallGraph &&other) noexcept {
+  interner_ = std::move(other.interner_);
   nodes_ = std::move(other.nodes_);
   edges_ = std::move(other.edges_);
   outEdges_ = std::move(other.outEdges_);
@@ -43,12 +45,11 @@ CallGraph &CallGraph::operator=(CallGraph &&other) noexcept {
 
 void CallGraph::addNode(CallGraphNode node) {
   std::lock_guard<std::mutex> lock(mutex_);
-  auto name = node.qualifiedName;
-  auto it = nodes_.find(name);
+  SId nameId = interner_.intern(node.qualifiedName);
+  auto it = nodes_.find(nameId);
   if (it == nodes_.end()) {
-    nodes_.emplace(std::move(name), std::move(node));
+    nodes_.emplace(nameId, std::move(node));
   } else {
-    // Update with richer info if available.
     if (!node.file.empty())
       it->second.file = std::move(node.file);
     if (node.line != 0)
@@ -64,16 +65,21 @@ void CallGraph::addNode(CallGraphNode node) {
 
 void CallGraph::addEdge(CallGraphEdge edge) {
   std::lock_guard<std::mutex> lock(mutex_);
+  SId callerId = interner_.intern(edge.callerName);
+  SId calleeId = interner_.intern(edge.calleeName);
   size_t idx = edges_.size();
-  outEdges_[edge.callerName].push_back(idx);
-  inEdges_[edge.calleeName].push_back(idx);
+  outEdges_[callerId].push_back(idx);
+  inEdges_[calleeId].push_back(idx);
   edges_.push_back(std::move(edge));
 }
 
 std::vector<const CallGraphEdge *>
 CallGraph::calleesOf(const std::string &name) const {
   std::vector<const CallGraphEdge *> result;
-  auto it = outEdges_.find(name);
+  auto id = interner_.find(name);
+  if (!id)
+    return result;
+  auto it = outEdges_.find(*id);
   if (it != outEdges_.end()) {
     for (size_t idx : it->second)
       result.push_back(&edges_[idx]);
@@ -84,7 +90,10 @@ CallGraph::calleesOf(const std::string &name) const {
 std::vector<const CallGraphEdge *>
 CallGraph::callersOf(const std::string &name) const {
   std::vector<const CallGraphEdge *> result;
-  auto it = inEdges_.find(name);
+  auto id = interner_.find(name);
+  if (!id)
+    return result;
+  auto it = inEdges_.find(*id);
   if (it != inEdges_.end()) {
     for (size_t idx : it->second)
       result.push_back(&edges_[idx]);
@@ -106,7 +115,10 @@ std::vector<const CallGraphNode *> CallGraph::allNodes() const {
 
 const CallGraphNode *
 CallGraph::findNode(const std::string &qualifiedName) const {
-  auto it = nodes_.find(qualifiedName);
+  auto id = interner_.find(qualifiedName);
+  if (!id)
+    return nullptr;
+  auto it = nodes_.find(*id);
   if (it != nodes_.end())
     return &it->second;
   return nullptr;
@@ -117,33 +129,46 @@ CallGraph::findNode(const std::string &qualifiedName) const {
 void CallGraph::addDerivedClass(const std::string &baseClass,
                                 const std::string &derivedClass) {
   std::lock_guard<std::mutex> lock(mutex_);
-  auto &vec = derivedClasses_[baseClass];
-  if (std::find(vec.begin(), vec.end(), derivedClass) == vec.end())
-    vec.push_back(derivedClass);
+  SId baseId = interner_.intern(baseClass);
+  SId derivedId = interner_.intern(derivedClass);
+  auto &vec = derivedClasses_[baseId];
+  if (std::find(vec.begin(), vec.end(), derivedId) == vec.end())
+    vec.push_back(derivedId);
 }
 
 std::vector<std::string>
 CallGraph::getDerivedClasses(const std::string &baseClass) const {
-  auto it = derivedClasses_.find(baseClass);
-  if (it != derivedClasses_.end())
-    return it->second;
+  auto id = interner_.find(baseClass);
+  if (!id)
+    return {};
+  auto it = derivedClasses_.find(*id);
+  if (it != derivedClasses_.end()) {
+    std::vector<std::string> result;
+    result.reserve(it->second.size());
+    for (SId sid : it->second)
+      result.push_back(interner_.resolve(sid));
+    return result;
+  }
   return {};
 }
 
 std::vector<std::string>
 CallGraph::getAllDerivedClasses(const std::string &baseClass) const {
+  auto baseId = interner_.find(baseClass);
+  if (!baseId)
+    return {};
   std::vector<std::string> result;
-  std::vector<std::string> stack = {baseClass};
-  std::set<std::string> visited;
+  std::vector<SId> stack = {*baseId};
+  std::set<SId> visited;
   while (!stack.empty()) {
-    std::string cls = std::move(stack.back());
+    SId cls = stack.back();
     stack.pop_back();
     if (!visited.insert(cls).second)
       continue;
     auto it = derivedClasses_.find(cls);
     if (it != derivedClasses_.end()) {
-      for (const auto &derived : it->second) {
-        result.push_back(derived);
+      for (SId derived : it->second) {
+        result.push_back(interner_.resolve(derived));
         stack.push_back(derived);
       }
     }
@@ -156,16 +181,26 @@ CallGraph::getAllDerivedClasses(const std::string &baseClass) const {
 void CallGraph::addMethodOverride(const std::string &baseMethod,
                                   const std::string &overrideMethod) {
   std::lock_guard<std::mutex> lock(mutex_);
-  auto &vec = methodOverrides_[baseMethod];
-  if (std::find(vec.begin(), vec.end(), overrideMethod) == vec.end())
-    vec.push_back(overrideMethod);
+  SId baseId = interner_.intern(baseMethod);
+  SId overrideId = interner_.intern(overrideMethod);
+  auto &vec = methodOverrides_[baseId];
+  if (std::find(vec.begin(), vec.end(), overrideId) == vec.end())
+    vec.push_back(overrideId);
 }
 
 std::vector<std::string>
 CallGraph::getOverrides(const std::string &baseMethod) const {
-  auto it = methodOverrides_.find(baseMethod);
-  if (it != methodOverrides_.end())
-    return it->second;
+  auto id = interner_.find(baseMethod);
+  if (!id)
+    return {};
+  auto it = methodOverrides_.find(*id);
+  if (it != methodOverrides_.end()) {
+    std::vector<std::string> result;
+    result.reserve(it->second.size());
+    for (SId sid : it->second)
+      result.push_back(interner_.resolve(sid));
+    return result;
+  }
   return {};
 }
 
@@ -174,14 +209,24 @@ CallGraph::getOverrides(const std::string &baseMethod) const {
 void CallGraph::addEffectiveImpl(const std::string &concreteClass,
                                  const std::string &implMethod) {
   std::lock_guard<std::mutex> lock(mutex_);
-  effectiveImplClasses_[implMethod].insert(concreteClass);
+  SId implId = interner_.intern(implMethod);
+  SId classId = interner_.intern(concreteClass);
+  effectiveImplClasses_[implId].insert(classId);
 }
 
 std::vector<std::string>
 CallGraph::getClassesForImpl(const std::string &implMethod) const {
-  auto it = effectiveImplClasses_.find(implMethod);
-  if (it != effectiveImplClasses_.end())
-    return {it->second.begin(), it->second.end()};
+  auto id = interner_.find(implMethod);
+  if (!id)
+    return {};
+  auto it = effectiveImplClasses_.find(*id);
+  if (it != effectiveImplClasses_.end()) {
+    std::vector<std::string> result;
+    result.reserve(it->second.size());
+    for (SId sid : it->second)
+      result.push_back(interner_.resolve(sid));
+    return result;
+  }
   return {};
 }
 
@@ -190,14 +235,23 @@ CallGraph::getClassesForImpl(const std::string &implMethod) const {
 void CallGraph::addFunctionReturn(const std::string &funcName,
                                   const std::string &returnedFunc) {
   std::lock_guard<std::mutex> lock(mutex_);
-  functionReturns_[funcName].insert(returnedFunc);
+  SId funcId = interner_.intern(funcName);
+  SId retId = interner_.intern(returnedFunc);
+  functionReturns_[funcId].insert(retId);
 }
 
 std::set<std::string>
 CallGraph::getFunctionReturns(const std::string &funcName) const {
-  auto it = functionReturns_.find(funcName);
-  if (it != functionReturns_.end())
-    return it->second;
+  auto id = interner_.find(funcName);
+  if (!id)
+    return {};
+  auto it = functionReturns_.find(*id);
+  if (it != functionReturns_.end()) {
+    std::set<std::string> result;
+    for (SId sid : it->second)
+      result.insert(interner_.resolve(sid));
+    return result;
+  }
   return {};
 }
 

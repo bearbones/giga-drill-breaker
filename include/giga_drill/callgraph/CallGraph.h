@@ -15,6 +15,8 @@
 
 #pragma once
 
+#include "giga_drill/callgraph/StringInterner.h"
+
 #include <mutex>
 #include <set>
 #include <string>
@@ -125,17 +127,22 @@ public:
   std::set<std::string>
   getFunctionReturns(const std::string &funcName) const;
 
-private:
-  mutable std::mutex mutex_;
-  std::unordered_map<std::string, CallGraphNode> nodes_;
-  std::vector<CallGraphEdge> edges_;
-  std::unordered_map<std::string, std::vector<size_t>> outEdges_;
-  std::unordered_map<std::string, std::vector<size_t>> inEdges_;
+  const StringInterner &interner() const { return interner_; }
 
-  std::unordered_map<std::string, std::vector<std::string>> derivedClasses_;
-  std::unordered_map<std::string, std::vector<std::string>> methodOverrides_;
-  std::unordered_map<std::string, std::set<std::string>> effectiveImplClasses_;
-  std::unordered_map<std::string, std::set<std::string>> functionReturns_;
+private:
+  using SId = StringInterner::Id;
+
+  mutable std::mutex mutex_;
+  StringInterner interner_;
+  std::unordered_map<SId, CallGraphNode> nodes_;
+  std::vector<CallGraphEdge> edges_;
+  std::unordered_map<SId, std::vector<size_t>> outEdges_;
+  std::unordered_map<SId, std::vector<size_t>> inEdges_;
+
+  std::unordered_map<SId, std::vector<SId>> derivedClasses_;
+  std::unordered_map<SId, std::vector<SId>> methodOverrides_;
+  std::unordered_map<SId, std::set<SId>> effectiveImplClasses_;
+  std::unordered_map<SId, std::set<SId>> functionReturns_;
 };
 
 } // namespace giga_drill
