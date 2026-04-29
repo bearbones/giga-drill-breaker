@@ -68,17 +68,17 @@ void restoreCrashGuard(const SavedHandlers &saved) {
 bool runToolGuarded(const clang::tooling::CompilationDatabase &compDb,
                     const std::string &file,
                     clang::tooling::FrontendActionFactory &factory,
-                    const giga_drill::PchCache *pchCache) {
+                    const giga_drill::PchCache *pchCache,
+                    const std::string &sysroot = "") {
   tl_guardActive = 1;
   int sig = sigsetjmp(tl_jumpBuf, 1);
   if (sig != 0) {
-    // Returned from signal handler — TU crashed.
     llvm::errs() << "CRASH (signal " << sig << ") processing " << file
                  << " — skipping\n";
     return false;
   }
 
-  auto tool = giga_drill::makeClangTool(compDb, {file}, pchCache);
+  auto tool = giga_drill::makeClangTool(compDb, {file}, pchCache, sysroot);
   tool.run(&factory);
   tl_guardActive = 0;
   return true;
@@ -1030,7 +1030,8 @@ CallGraph buildCallGraph(const clang::tooling::CompilationDatabase &compDb,
                          const std::vector<std::string> &files,
                          const std::vector<std::string> &collapsePaths,
                          unsigned threadCount,
-                         const PchCache *pchCache) {
+                         const PchCache *pchCache,
+                         const std::string &sysroot) {
   CallGraph graph;
   CollapseFilter collapseFilter(collapsePaths);
   const CollapseFilter *collapsePtr =
@@ -1052,18 +1053,18 @@ CallGraph buildCallGraph(const clang::tooling::CompilationDatabase &compDb,
 
     // Pass 1: Parallel index of all declarations and class hierarchy.
     for (const auto &file : files) {
-      pool.async([&compDb, &graph, pchCache, file]() {
+      pool.async([&compDb, &graph, pchCache, &sysroot, file]() {
         IndexerOnlyFactory factory(graph);
-        runToolGuarded(compDb, file, factory, pchCache);
+        runToolGuarded(compDb, file, factory, pchCache, sysroot);
       });
     }
     pool.wait();
 
     // Pass 2: Parallel edge building with full hierarchy knowledge.
     for (const auto &file : files) {
-      pool.async([&compDb, &graph, collapsePtr, pchCache, file]() {
+      pool.async([&compDb, &graph, collapsePtr, pchCache, &sysroot, file]() {
         EdgeOnlyFactory factory(graph, collapsePtr);
-        runToolGuarded(compDb, file, factory, pchCache);
+        runToolGuarded(compDb, file, factory, pchCache, sysroot);
       });
     }
     pool.wait();
@@ -1071,11 +1072,11 @@ CallGraph buildCallGraph(const clang::tooling::CompilationDatabase &compDb,
     // Serial path — process per-file for crash isolation.
     for (const auto &file : files) {
       IndexerOnlyFactory factory(graph);
-      runToolGuarded(compDb, file, factory, pchCache);
+      runToolGuarded(compDb, file, factory, pchCache, sysroot);
     }
     for (const auto &file : files) {
       EdgeOnlyFactory factory(graph, collapsePtr);
-      runToolGuarded(compDb, file, factory, pchCache);
+      runToolGuarded(compDb, file, factory, pchCache, sysroot);
     }
   }
 

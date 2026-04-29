@@ -106,6 +106,34 @@ getStripIncompatibleFlagsAdjuster(bool stripPch = true) {
   };
 }
 
+/// Inject -isysroot and libc++ include paths on macOS when the compilation
+/// database doesn't already provide them. If sysrootOverride is non-empty it
+/// takes precedence; otherwise falls back to the build-time default detected
+/// by CMake via xcrun.
+inline clang::tooling::ArgumentsAdjuster
+getSysrootAdjuster(const std::string &sysrootOverride = "") {
+  return [sysrootOverride](const clang::tooling::CommandLineArguments &args,
+                           llvm::StringRef /*filename*/) {
+    for (const auto &a : args)
+      if (a == "-isysroot")
+        return args;
+
+    const std::string sysroot = !sysrootOverride.empty() ? sysrootOverride
+#ifdef GIGA_DRILL_DEFAULT_SYSROOT
+        : std::string(GIGA_DRILL_DEFAULT_SYSROOT);
+#else
+        : std::string();
+#endif
+    if (sysroot.empty())
+      return args;
+
+    auto result = args;
+    result.push_back("-isysroot");
+    result.push_back(sysroot);
+    return result;
+  };
+}
+
 /// Inject -resource-dir pointing to this tool's Clang resource directory.
 /// This ensures the tool's built-in headers (stdarg.h, etc.) are found even
 /// when consuming compilation databases from a different toolchain.
@@ -192,14 +220,15 @@ getPchCacheAdjuster(const PchCache &cache) {
 /// Create a ClangTool with standard argument adjusters applied.
 /// When pchCache is provided, PCH source includes are replaced with compiled
 /// .pch binaries instead of being stripped.
+/// When sysroot is non-empty, it overrides the default macOS SDK path; an
+/// empty string falls back to the build-time default from xcrun.
 inline clang::tooling::ClangTool
 makeClangTool(const clang::tooling::CompilationDatabase &compDb,
               const std::vector<std::string> &files,
-              const PchCache *pchCache = nullptr) {
+              const PchCache *pchCache = nullptr,
+              const std::string &sysroot = "") {
   clang::tooling::ClangTool tool(compDb, files);
   if (pchCache && !pchCache->empty()) {
-    // Replace PCH source includes with compiled PCH, then strip other
-    // incompatible flags (but not PCH-related ones).
     tool.appendArgumentsAdjuster(getPchCacheAdjuster(*pchCache));
     tool.appendArgumentsAdjuster(getStripIncompatibleFlagsAdjuster(/*stripPch=*/false));
   } else {
@@ -207,6 +236,7 @@ makeClangTool(const clang::tooling::CompilationDatabase &compDb,
   }
   tool.appendArgumentsAdjuster(
       clang::tooling::getClangStripDependencyFileAdjuster());
+  tool.appendArgumentsAdjuster(getSysrootAdjuster(sysroot));
   tool.appendArgumentsAdjuster(getResourceDirAdjuster());
   return tool;
 }

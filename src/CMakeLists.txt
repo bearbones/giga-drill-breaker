@@ -52,6 +52,23 @@ if(LLVM_FOUND)
   endif()
 endif()
 
+# On macOS, detect the default SDK sysroot and libc++ include path so that
+# ClangTool can find C++ stdlib headers even when the compilation database
+# doesn't provide -isysroot (e.g. FixedCompilationDatabase in tests, or
+# standalone invocations without a game-engine build path).
+if(APPLE)
+  execute_process(
+    COMMAND xcrun --show-sdk-path
+    OUTPUT_VARIABLE _GIGA_DRILL_DEFAULT_SYSROOT
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+  if(_GIGA_DRILL_DEFAULT_SYSROOT)
+    message(STATUS "Default macOS sysroot: ${_GIGA_DRILL_DEFAULT_SYSROOT}")
+    target_compile_definitions(giga_drill_lib PRIVATE
+      "GIGA_DRILL_DEFAULT_SYSROOT=\"${_GIGA_DRILL_DEFAULT_SYSROOT}\"")
+  endif()
+endif()
+
 add_executable(giga-drill-breaker main.cpp)
 target_link_libraries(giga-drill-breaker PRIVATE giga_drill_lib)
 

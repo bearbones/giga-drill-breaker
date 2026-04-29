@@ -148,6 +148,7 @@ buildControlFlowIndex(const clang::tooling::CompilationDatabase &compDb,
                       const CallGraph &graph,
                       const std::vector<std::string> &collapsePaths = {},
                       unsigned threadCount = 0,
-                      const PchCache *pchCache = nullptr);
+                      const PchCache *pchCache = nullptr,
+                      const std::string &sysroot = "");
 
 } // namespace giga_drill

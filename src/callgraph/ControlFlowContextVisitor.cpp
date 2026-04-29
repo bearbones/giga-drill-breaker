@@ -47,7 +47,8 @@ void cfCrashHandler(int sig) {
 bool runCfToolGuarded(const clang::tooling::CompilationDatabase &compDb,
                       const std::string &file,
                       clang::tooling::FrontendActionFactory &factory,
-                      const giga_drill::PchCache *pchCache) {
+                      const giga_drill::PchCache *pchCache,
+                      const std::string &sysroot = "") {
   tl_cfGuardActive = 1;
   int sig = sigsetjmp(tl_cfJumpBuf, 1);
   if (sig != 0) {
@@ -55,7 +56,7 @@ bool runCfToolGuarded(const clang::tooling::CompilationDatabase &compDb,
                  << " — skipping\n";
     return false;
   }
-  auto tool = giga_drill::makeClangTool(compDb, {file}, pchCache);
+  auto tool = giga_drill::makeClangTool(compDb, {file}, pchCache, sysroot);
   tool.run(&factory);
   tl_cfGuardActive = 0;
   return true;
@@ -496,7 +497,8 @@ buildControlFlowIndex(const clang::tooling::CompilationDatabase &compDb,
                       const CallGraph &graph,
                       const std::vector<std::string> &collapsePaths,
                       unsigned threadCount,
-                      const PchCache *pchCache) {
+                      const PchCache *pchCache,
+                      const std::string &sysroot) {
   ControlFlowIndex index;
   CollapseFilter collapseFilter(collapsePaths);
   const CollapseFilter *collapsePtr =
@@ -517,16 +519,17 @@ buildControlFlowIndex(const clang::tooling::CompilationDatabase &compDb,
         llvm::hardware_concurrency(threadCount));
 #endif
     for (const auto &file : files) {
-      pool.async([&compDb, &index, &graph, collapsePtr, pchCache, file]() {
+      pool.async([&compDb, &index, &graph, collapsePtr, pchCache, &sysroot,
+                  file]() {
         ControlFlowContextFactory factory(index, graph, collapsePtr);
-        runCfToolGuarded(compDb, file, factory, pchCache);
+        runCfToolGuarded(compDb, file, factory, pchCache, sysroot);
       });
     }
     pool.wait();
   } else {
     for (const auto &file : files) {
       ControlFlowContextFactory factory(index, graph, collapsePtr);
-      runCfToolGuarded(compDb, file, factory, pchCache);
+      runCfToolGuarded(compDb, file, factory, pchCache, sysroot);
     }
   }
 

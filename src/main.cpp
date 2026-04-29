@@ -247,6 +247,12 @@ static llvm::cl::opt<std::string>
         llvm::cl::init(GIGA_DRILL_DEFAULT_CLANG),
         llvm::cl::sub(CfqueryCmd));
 
+static llvm::cl::opt<std::string>
+    CfquerySysroot("sysroot",
+        llvm::cl::desc("macOS SDK sysroot path (default: auto-detect via xcrun)"),
+        llvm::cl::value_desc("dir"),
+        llvm::cl::sub(CfqueryCmd));
+
 // ---------------------------------------------------------------------------
 // mcp-serve options
 // ---------------------------------------------------------------------------
@@ -299,6 +305,12 @@ static llvm::cl::opt<std::string>
         llvm::cl::desc("Path to clang++ binary for PCH compilation"),
         llvm::cl::value_desc("path"),
         llvm::cl::init(GIGA_DRILL_DEFAULT_CLANG),
+        llvm::cl::sub(McpServeCmd));
+
+static llvm::cl::opt<std::string>
+    McpSysroot("sysroot",
+        llvm::cl::desc("macOS SDK sysroot path (default: auto-detect via xcrun)"),
+        llvm::cl::value_desc("dir"),
         llvm::cl::sub(McpServeCmd));
 
 // ---------------------------------------------------------------------------
@@ -457,14 +469,17 @@ int main(int argc, const char **argv) {
     }
     const giga_drill::PchCache *pchPtr = pchCache.get();
 
+    std::string sysroot = CfquerySysroot.getValue();
+
     // Phase 1+2: Build call graph.
     auto graph = giga_drill::buildCallGraph(*compDb, files, collapsePaths,
-                                              CfqueryThreads, pchPtr);
+                                              CfqueryThreads, pchPtr, sysroot);
 
     // Phase 3: Build control flow index.
     auto cfIndex = giga_drill::buildControlFlowIndex(*compDb, files, graph,
                                                       collapsePaths,
-                                                      CfqueryThreads, pchPtr);
+                                                      CfqueryThreads, pchPtr,
+                                                      sysroot);
 
     // Dump mode: serialize the full index as JSON.
     if (CfqueryModeOpt == CfqueryDump) {
@@ -637,11 +652,13 @@ int main(int argc, const char **argv) {
     }
     const giga_drill::PchCache *pchPtr = pchCache.get();
 
+    std::string sysroot = McpSysroot.getValue();
+
     llvm::errs() << "mcp-serve: building call graph ("
                  << files.size() << " files, "
                  << McpThreads << " threads)...\n";
     auto graph = giga_drill::buildCallGraph(*compDb, files, collapsePaths,
-                                             McpThreads, pchPtr);
+                                             McpThreads, pchPtr, sysroot);
     llvm::errs() << "mcp-serve: call graph built ("
                  << graph.nodeCount() << " nodes, "
                  << graph.edgeCount() << " edges)\n";
@@ -649,7 +666,8 @@ int main(int argc, const char **argv) {
     llvm::errs() << "mcp-serve: building control flow index...\n";
     auto cfIndex = giga_drill::buildControlFlowIndex(*compDb, files, graph,
                                                       collapsePaths,
-                                                      McpThreads, pchPtr);
+                                                      McpThreads, pchPtr,
+                                                      sysroot);
     llvm::errs() << "mcp-serve: control flow index built ("
                  << cfIndex.size() << " call sites)\n";
 
