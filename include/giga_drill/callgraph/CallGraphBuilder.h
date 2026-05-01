@@ -34,7 +34,8 @@ namespace giga_drill {
 class CallGraphIndexerVisitor
     : public clang::RecursiveASTVisitor<CallGraphIndexerVisitor> {
 public:
-  CallGraphIndexerVisitor(CallGraph &graph, clang::SourceManager &sm);
+  CallGraphIndexerVisitor(CallGraph &graph, clang::SourceManager &sm,
+                          const std::string &tuPath = "");
 
   void setASTContext(clang::ASTContext *ctx) { ctx_ = ctx; }
 
@@ -52,6 +53,7 @@ private:
   CallGraph &graph_;
   clang::SourceManager &sm_;
   clang::ASTContext *ctx_ = nullptr;
+  std::string tuPath_;
   std::vector<clang::FunctionDecl *> funcStack_;
 
   std::string getFilePath(clang::SourceLocation loc) const;
@@ -64,7 +66,8 @@ private:
 class CallGraphEdgeVisitor
     : public clang::RecursiveASTVisitor<CallGraphEdgeVisitor> {
 public:
-  CallGraphEdgeVisitor(CallGraph &graph, clang::SourceManager &sm);
+  CallGraphEdgeVisitor(CallGraph &graph, clang::SourceManager &sm,
+                       const std::string &tuPath = "");
 
   void setASTContext(clang::ASTContext *ctx) { ctx_ = ctx; }
   void setCollapseFilter(const CollapseFilter *filter) { collapse_ = filter; }
@@ -84,6 +87,7 @@ private:
   CallGraph &graph_;
   clang::SourceManager &sm_;
   clang::ASTContext *ctx_ = nullptr;
+  std::string tuPath_;
   const CollapseFilter *collapse_ = nullptr;
   std::vector<clang::FunctionDecl *> funcStack_;
 
@@ -172,5 +176,14 @@ CallGraph buildCallGraph(const clang::tooling::CompilationDatabase &compDb,
                          unsigned threadCount = 0,
                          const PchCache *pchCache = nullptr,
                          const std::string &sysroot = "");
+
+// Index a single TU into an existing graph (Phase 1 + Phase 2).
+// Call graph.removeTU(file) first when re-indexing a changed file.
+void indexTU(CallGraph &graph,
+             const clang::tooling::CompilationDatabase &compDb,
+             const std::string &file,
+             const std::vector<std::string> &collapsePaths = {},
+             const PchCache *pchCache = nullptr,
+             const std::string &sysroot = "");
 
 } // namespace giga_drill

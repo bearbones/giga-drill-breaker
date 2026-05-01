@@ -88,8 +88,8 @@ public:
   CallGraph(const CallGraph &) = delete;
   CallGraph &operator=(const CallGraph &) = delete;
 
-  void addNode(CallGraphNode node);
-  void addEdge(CallGraphEdge edge);
+  void addNode(CallGraphNode node, const std::string &tuPath = "");
+  void addEdge(CallGraphEdge edge, const std::string &tuPath = "");
 
   std::vector<const CallGraphEdge *> calleesOf(const std::string &name) const;
   std::vector<const CallGraphEdge *> callersOf(const std::string &name) const;
@@ -102,7 +102,8 @@ public:
 
   // Class hierarchy tracking.
   void addDerivedClass(const std::string &baseClass,
-                       const std::string &derivedClass);
+                       const std::string &derivedClass,
+                       const std::string &tuPath = "");
   std::vector<std::string>
   getDerivedClasses(const std::string &baseClass) const;
   std::vector<std::string>
@@ -110,22 +111,34 @@ public:
 
   // Virtual method override tracking.
   void addMethodOverride(const std::string &baseMethod,
-                         const std::string &overrideMethod);
+                         const std::string &overrideMethod,
+                         const std::string &tuPath = "");
   std::vector<std::string>
   getOverrides(const std::string &baseMethod) const;
 
   // Effective implementation mapping: which concrete classes use a given
   // method implementation for virtual dispatch.
   void addEffectiveImpl(const std::string &concreteClass,
-                        const std::string &implMethod);
+                        const std::string &implMethod,
+                        const std::string &tuPath = "");
   std::vector<std::string>
   getClassesForImpl(const std::string &implMethod) const;
 
   // Function pointer return value tracking.
   void addFunctionReturn(const std::string &funcName,
-                         const std::string &returnedFunc);
+                         const std::string &returnedFunc,
+                         const std::string &tuPath = "");
   std::set<std::string>
   getFunctionReturns(const std::string &funcName) const;
+
+  // Per-TU incremental re-indexing. removeTU tombstones all edges from the
+  // given TU and removes nodes that were only contributed by that TU.
+  // Returns the number of edges removed.
+  size_t removeTU(const std::string &tuPath);
+
+  // Compact the edge vector, eliminating tombstones. Invalidates all
+  // previously returned const CallGraphEdge * pointers.
+  void compact();
 
   const StringInterner &interner() const { return interner_; }
 
@@ -143,6 +156,11 @@ private:
   std::unordered_map<SId, std::vector<SId>> methodOverrides_;
   std::unordered_map<SId, std::set<SId>> effectiveImplClasses_;
   std::unordered_map<SId, std::set<SId>> functionReturns_;
+
+  // Per-TU provenance tracking for incremental re-indexing.
+  std::unordered_map<SId, std::vector<size_t>> tuEdges_;
+  std::unordered_map<SId, std::set<SId>> nodeContributors_;
+  size_t liveEdgeCount_ = 0;
 };
 
 } // namespace giga_drill

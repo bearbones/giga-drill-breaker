@@ -543,4 +543,26 @@ buildControlFlowIndex(const clang::tooling::CompilationDatabase &compDb,
   return index;
 }
 
+void indexTUControlFlow(ControlFlowIndex &index,
+                        const clang::tooling::CompilationDatabase &compDb,
+                        const std::string &file,
+                        const CallGraph &graph,
+                        const std::vector<std::string> &collapsePaths,
+                        const PchCache *pchCache,
+                        const std::string &sysroot) {
+  CollapseFilter collapseFilter(collapsePaths);
+  const CollapseFilter *collapsePtr =
+      collapseFilter.empty() ? nullptr : &collapseFilter;
+
+  auto prevSegv = std::signal(SIGSEGV, cfCrashHandler);
+  auto prevBus = std::signal(SIGBUS, cfCrashHandler);
+  g_cfCrashCount.store(0, std::memory_order_relaxed);
+
+  ControlFlowContextFactory factory(index, graph, collapsePtr);
+  runCfToolGuarded(compDb, file, factory, pchCache, sysroot);
+
+  std::signal(SIGSEGV, prevSegv);
+  std::signal(SIGBUS, prevBus);
+}
+
 } // namespace giga_drill

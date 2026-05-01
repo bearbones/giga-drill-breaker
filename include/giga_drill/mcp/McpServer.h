@@ -20,24 +20,48 @@
 #include "giga_drill/callgraph/ControlFlowOracle.h"
 #include "giga_drill/mcp/McpProtocol.h"
 
+#include "clang/Tooling/CompilationDatabase.h"
+
+#include <memory>
 #include <string>
 #include <vector>
 
 namespace giga_drill {
 
+class PchCache;
+
+struct McpBuildParams {
+  std::shared_ptr<clang::tooling::CompilationDatabase> compDb;
+  std::vector<std::string> collapsePaths;
+  const PchCache *pchCache = nullptr;
+  std::string sysroot;
+};
+
 class McpServer {
 public:
   McpServer(CallGraph &&graph, ControlFlowIndex &&cfIndex,
-            std::vector<std::string> entryPoints);
+            std::vector<std::string> entryPoints,
+            McpBuildParams buildParams = {});
 
   /// Run the MCP stdio loop. Returns 0 on clean shutdown.
   int run();
+
+  /// Re-index a single TU. Removes old edges/contexts, re-runs Phase 1+2+3.
+  /// Returns {edgesRemoved, edgesAfter, contextsRemoved, contextsAfter}.
+  struct ReindexResult {
+    size_t edgesRemoved;
+    size_t edgesAfter;
+    size_t contextsRemoved;
+    size_t contextsAfter;
+  };
+  ReindexResult reindexTU(const std::string &filePath);
 
 private:
   CallGraph graph_;
   ControlFlowIndex cfIndex_;
   ControlFlowOracle oracle_;
   std::vector<std::string> entryPoints_;
+  McpBuildParams buildParams_;
   bool initialized_ = false;
 
   void dispatch(const McpRequest &req);

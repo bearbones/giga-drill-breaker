@@ -277,9 +277,9 @@ TEST_CASE("readRequest parses Content-Length framed messages",
 // Tool registration tests
 // ============================================================================
 
-TEST_CASE("getRegisteredTools returns all 12 tools", "[mcp][tools]") {
+TEST_CASE("getRegisteredTools returns all 13 tools", "[mcp][tools]") {
   auto tools = getRegisteredTools();
-  CHECK(tools.size() == 12);
+  CHECK(tools.size() == 13);
 
   // Verify tool names.
   std::set<std::string> names;
@@ -298,6 +298,7 @@ TEST_CASE("getRegisteredTools returns all 12 tools", "[mcp][tools]") {
   CHECK(names.count("graph_summary") == 1);
   CHECK(names.count("list_callback_sites") == 1);
   CHECK(names.count("list_concurrency_entry_points") == 1);
+  CHECK(names.count("reindex_tu") == 1);
 }
 
 // ============================================================================

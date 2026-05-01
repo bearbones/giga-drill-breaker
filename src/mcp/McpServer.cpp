@@ -15,6 +15,8 @@
 
 #include "giga_drill/mcp/McpServer.h"
 #include "giga_drill/mcp/McpTools.h"
+#include "giga_drill/callgraph/CallGraphBuilder.h"
+#include "giga_drill/callgraph/ControlFlowIndex.h"
 
 #include "llvm/Support/raw_ostream.h"
 
@@ -23,9 +25,30 @@
 namespace giga_drill {
 
 McpServer::McpServer(CallGraph &&graph, ControlFlowIndex &&cfIndex,
-                     std::vector<std::string> entryPoints)
+                     std::vector<std::string> entryPoints,
+                     McpBuildParams buildParams)
     : graph_(std::move(graph)), cfIndex_(std::move(cfIndex)),
-      oracle_(graph_, cfIndex_), entryPoints_(std::move(entryPoints)) {}
+      oracle_(graph_, cfIndex_), entryPoints_(std::move(entryPoints)),
+      buildParams_(std::move(buildParams)) {}
+
+McpServer::ReindexResult McpServer::reindexTU(const std::string &filePath) {
+  ReindexResult r{};
+  r.edgesRemoved = graph_.removeTU(filePath);
+  r.contextsRemoved = cfIndex_.removeTU(filePath);
+
+  if (buildParams_.compDb) {
+    indexTU(graph_, *buildParams_.compDb, filePath,
+            buildParams_.collapsePaths, buildParams_.pchCache,
+            buildParams_.sysroot);
+    indexTUControlFlow(cfIndex_, *buildParams_.compDb, filePath,
+                       graph_, buildParams_.collapsePaths,
+                       buildParams_.pchCache, buildParams_.sysroot);
+  }
+
+  r.edgesAfter = graph_.edgeCount();
+  r.contextsAfter = cfIndex_.size();
+  return r;
+}
 
 int McpServer::run() {
   llvm::errs() << "mcp-serve: server started, waiting for requests...\n";
@@ -145,6 +168,46 @@ llvm::json::Value McpServer::handleToolsCall(
   if (auto *argsVal = params.get("arguments")) {
     if (auto *argsObj = argsVal->getAsObject())
       args = *argsObj;
+  }
+
+  if (*toolName == "reindex_tu") {
+    auto filePath = args.getString("file");
+    if (!filePath) {
+      llvm::json::Object content;
+      content["type"] = "text";
+      content["text"] = "Missing required 'file' argument";
+      llvm::json::Array contentArr;
+      contentArr.push_back(llvm::json::Value(std::move(content)));
+      llvm::json::Object result;
+      result["content"] = std::move(contentArr);
+      result["isError"] = true;
+      return llvm::json::Value(std::move(result));
+    }
+    if (!buildParams_.compDb) {
+      llvm::json::Object content;
+      content["type"] = "text";
+      content["text"] = "reindex_tu unavailable: no compilation database";
+      llvm::json::Array contentArr;
+      contentArr.push_back(llvm::json::Value(std::move(content)));
+      llvm::json::Object result;
+      result["content"] = std::move(contentArr);
+      result["isError"] = true;
+      return llvm::json::Value(std::move(result));
+    }
+    auto r = reindexTU(filePath->str());
+    std::string msg = "Reindexed " + filePath->str() + "\n" +
+                      "Edges removed: " + std::to_string(r.edgesRemoved) +
+                      ", total edges: " + std::to_string(r.edgesAfter) + "\n" +
+                      "Contexts removed: " + std::to_string(r.contextsRemoved) +
+                      ", total contexts: " + std::to_string(r.contextsAfter);
+    llvm::json::Object content;
+    content["type"] = "text";
+    content["text"] = std::move(msg);
+    llvm::json::Array contentArr;
+    contentArr.push_back(llvm::json::Value(std::move(content)));
+    llvm::json::Object result;
+    result["content"] = std::move(contentArr);
+    return llvm::json::Value(std::move(result));
   }
 
   McpToolContext ctx{graph_, oracle_, cfIndex_, entryPoints_};

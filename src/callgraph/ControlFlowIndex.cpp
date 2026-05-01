@@ -22,7 +22,8 @@ ControlFlowIndex::ControlFlowIndex(ControlFlowIndex &&other) noexcept
       contexts_(std::move(other.contexts_)),
       byCallee_(std::move(other.byCallee_)),
       byCaller_(std::move(other.byCaller_)),
-      bySite_(std::move(other.bySite_)) {}
+      bySite_(std::move(other.bySite_)),
+      liveCount_(other.liveCount_) {}
 
 ControlFlowIndex &ControlFlowIndex::operator=(ControlFlowIndex &&other) noexcept {
   interner_ = std::move(other.interner_);
@@ -30,6 +31,7 @@ ControlFlowIndex &ControlFlowIndex::operator=(ControlFlowIndex &&other) noexcept
   byCallee_ = std::move(other.byCallee_);
   byCaller_ = std::move(other.byCaller_);
   bySite_ = std::move(other.bySite_);
+  liveCount_ = other.liveCount_;
   return *this;
 }
 
@@ -43,6 +45,7 @@ void ControlFlowIndex::addCallSiteContext(CallSiteContext ctx) {
   byCaller_[callerId].push_back(idx);
   bySite_[siteId] = idx;
   contexts_.push_back(std::move(ctx));
+  ++liveCount_;
 }
 
 const CallSiteContext *
@@ -65,8 +68,10 @@ ControlFlowIndex::contextsForCallee(const std::string &calleeName) const {
   auto it = byCallee_.find(*id);
   if (it == byCallee_.end())
     return result;
-  for (size_t idx : it->second)
-    result.push_back(&contexts_[idx]);
+  for (size_t idx : it->second) {
+    if (!contexts_[idx].callerName.empty())
+      result.push_back(&contexts_[idx]);
+  }
   return result;
 }
 
@@ -79,8 +84,10 @@ ControlFlowIndex::contextsForCaller(const std::string &callerName) const {
   auto it = byCaller_.find(*id);
   if (it == byCaller_.end())
     return result;
-  for (size_t idx : it->second)
-    result.push_back(&contexts_[idx]);
+  for (size_t idx : it->second) {
+    if (!contexts_[idx].callerName.empty())
+      result.push_back(&contexts_[idx]);
+  }
   return result;
 }
 
@@ -94,6 +101,8 @@ ControlFlowIndex::protectedCallsTo(const std::string &calleeName) const {
   if (it == byCallee_.end())
     return result;
   for (size_t idx : it->second) {
+    if (contexts_[idx].callerName.empty())
+      continue;
     if (!contexts_[idx].enclosingTryCatches.empty())
       result.push_back(&contexts_[idx]);
   }
@@ -110,6 +119,8 @@ ControlFlowIndex::unprotectedCallsTo(const std::string &calleeName) const {
   if (it == byCallee_.end())
     return result;
   for (size_t idx : it->second) {
+    if (contexts_[idx].callerName.empty())
+      continue;
     if (contexts_[idx].enclosingTryCatches.empty())
       result.push_back(&contexts_[idx]);
   }
@@ -118,10 +129,74 @@ ControlFlowIndex::unprotectedCallsTo(const std::string &calleeName) const {
 
 std::vector<const CallSiteContext *> ControlFlowIndex::allContexts() const {
   std::vector<const CallSiteContext *> result;
-  result.reserve(contexts_.size());
-  for (const auto &ctx : contexts_)
-    result.push_back(&ctx);
+  result.reserve(liveCount_);
+  for (const auto &ctx : contexts_) {
+    if (!ctx.callerName.empty())
+      result.push_back(&ctx);
+  }
   return result;
+}
+
+size_t ControlFlowIndex::removeTU(const std::string &tuPath) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  std::string prefix = tuPath + ":";
+  size_t removed = 0;
+
+  for (size_t i = 0; i < contexts_.size(); ++i) {
+    auto &ctx = contexts_[i];
+    if (ctx.callerName.empty())
+      continue;
+    if (ctx.callSite.compare(0, prefix.size(), prefix) != 0)
+      continue;
+
+    auto calleeId = interner_.find(ctx.calleeName);
+    if (calleeId) {
+      auto &cv = byCallee_[*calleeId];
+      cv.erase(std::remove(cv.begin(), cv.end(), i), cv.end());
+    }
+    auto callerId = interner_.find(ctx.callerName);
+    if (callerId) {
+      auto &cv = byCaller_[*callerId];
+      cv.erase(std::remove(cv.begin(), cv.end(), i), cv.end());
+    }
+    auto siteId = interner_.find(ctx.callSite);
+    if (siteId)
+      bySite_.erase(*siteId);
+
+    ctx.callerName.clear();
+    ctx.calleeName.clear();
+    --liveCount_;
+    ++removed;
+  }
+  return removed;
+}
+
+void ControlFlowIndex::compact() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  std::vector<CallSiteContext> newCtx;
+  newCtx.reserve(liveCount_);
+
+  std::unordered_map<SId, std::vector<size_t>> newByCallee;
+  std::unordered_map<SId, std::vector<size_t>> newByCaller;
+  std::unordered_map<SId, size_t> newBySite;
+
+  for (auto &ctx : contexts_) {
+    if (ctx.callerName.empty())
+      continue;
+    size_t idx = newCtx.size();
+    SId calleeId = interner_.intern(ctx.calleeName);
+    SId callerId = interner_.intern(ctx.callerName);
+    SId siteId = interner_.intern(ctx.callSite);
+    newByCallee[calleeId].push_back(idx);
+    newByCaller[callerId].push_back(idx);
+    newBySite[siteId] = idx;
+    newCtx.push_back(std::move(ctx));
+  }
+
+  contexts_ = std::move(newCtx);
+  byCallee_ = std::move(newByCallee);
+  byCaller_ = std::move(newByCaller);
+  bySite_ = std::move(newBySite);
 }
 
 } // namespace giga_drill

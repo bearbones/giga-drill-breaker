@@ -1305,6 +1305,26 @@ std::vector<McpToolEntry> getRegisteredTools() {
                      handleListConcurrencyEntryPoints});
   }
 
+  // reindex_tu — handled specially by McpServer (needs mutable access).
+  {
+    llvm::json::Object schema;
+    schema["type"] = "object";
+    schema["required"] = llvm::json::Array{"file"};
+    llvm::json::Object props;
+    props["file"] = llvm::json::Object{
+        {"type", "string"},
+        {"description", "Absolute path of the TU to re-index"}};
+    schema["properties"] = std::move(props);
+
+    tools.push_back({"reindex_tu",
+                     "Re-index a single translation unit after source changes. "
+                     "Removes stale edges/contexts and re-runs all three "
+                     "analysis phases for the given file. Returns counts of "
+                     "edges and contexts removed and current totals.",
+                     llvm::json::Value(std::move(schema)),
+                     nullptr});
+  }
+
   return tools;
 }
 

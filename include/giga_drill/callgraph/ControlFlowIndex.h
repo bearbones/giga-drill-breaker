@@ -123,10 +123,18 @@ public:
   std::vector<const CallSiteContext *>
   unprotectedCallsTo(const std::string &calleeName) const;
 
-  size_t size() const { return contexts_.size(); }
+  size_t size() const { return liveCount_; }
 
   // All stored contexts (for dump mode).
   std::vector<const CallSiteContext *> allContexts() const;
+
+  // Remove all contexts whose callSite belongs to the given TU file path.
+  // Returns the number of contexts removed.
+  size_t removeTU(const std::string &tuPath);
+
+  // Compact the contexts vector, eliminating tombstones. Invalidates all
+  // previously returned const CallSiteContext * pointers.
+  void compact();
 
   const StringInterner &interner() const { return interner_; }
 
@@ -139,6 +147,7 @@ private:
   std::unordered_map<SId, std::vector<size_t>> byCallee_;
   std::unordered_map<SId, std::vector<size_t>> byCaller_;
   std::unordered_map<SId, size_t> bySite_;
+  size_t liveCount_ = 0;
 };
 
 class PchCache;
@@ -157,5 +166,15 @@ buildControlFlowIndex(const clang::tooling::CompilationDatabase &compDb,
                       unsigned threadCount = 0,
                       const PchCache *pchCache = nullptr,
                       const std::string &sysroot = "");
+
+// Index a single TU into an existing ControlFlowIndex (Phase 3).
+// Call cfIndex.removeTU(file) first when re-indexing a changed file.
+void indexTUControlFlow(ControlFlowIndex &index,
+                        const clang::tooling::CompilationDatabase &compDb,
+                        const std::string &file,
+                        const CallGraph &graph,
+                        const std::vector<std::string> &collapsePaths = {},
+                        const PchCache *pchCache = nullptr,
+                        const std::string &sysroot = "");
 
 } // namespace giga_drill

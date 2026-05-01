@@ -189,8 +189,9 @@ static ExecutionContext spawnerContextFor(llvm::StringRef qualifiedName) {
 // ============================================================================
 
 CallGraphIndexerVisitor::CallGraphIndexerVisitor(CallGraph &graph,
-                                                 clang::SourceManager &sm)
-    : graph_(graph), sm_(sm) {}
+                                                 clang::SourceManager &sm,
+                                                 const std::string &tuPath)
+    : graph_(graph), sm_(sm), tuPath_(tuPath) {}
 
 std::string CallGraphIndexerVisitor::getFilePath(
     clang::SourceLocation loc) const {
@@ -282,7 +283,7 @@ bool CallGraphIndexerVisitor::VisitFunctionDecl(clang::FunctionDecl *decl) {
       node.enclosingClass = parent->getQualifiedNameAsString();
   }
 
-  graph_.addNode(std::move(node));
+  graph_.addNode(std::move(node), tuPath_);
   return true;
 }
 
@@ -297,7 +298,7 @@ bool CallGraphIndexerVisitor::VisitCXXRecordDecl(
   for (const auto &base : decl->bases()) {
     auto *baseType = base.getType()->getAsCXXRecordDecl();
     if (baseType)
-      graph_.addDerivedClass(baseType->getQualifiedNameAsString(), className);
+      graph_.addDerivedClass(baseType->getQualifiedNameAsString(), className, tuPath_);
   }
 
   // Record virtual method overrides.
@@ -307,7 +308,7 @@ bool CallGraphIndexerVisitor::VisitCXXRecordDecl(
 
     for (auto *overridden : method->overridden_methods()) {
       graph_.addMethodOverride(overridden->getQualifiedNameAsString(),
-                               method->getQualifiedNameAsString());
+                               method->getQualifiedNameAsString(), tuPath_);
     }
   }
 
@@ -342,7 +343,7 @@ void CallGraphIndexerVisitor::computeEffectiveImpls(
       if (!method->isPureVirtual()) {
         handledMethodNames.insert(methodName);
         graph_.addEffectiveImpl(className,
-                                method->getQualifiedNameAsString());
+                                method->getQualifiedNameAsString(), tuPath_);
       }
     }
 
@@ -394,7 +395,7 @@ bool CallGraphIndexerVisitor::VisitLambdaExpr(clang::LambdaExpr *expr) {
   node.file = getFilePath(expr->getBeginLoc());
   node.line = sm_.getSpellingLineNumber(expr->getBeginLoc());
   node.enclosingClass = enclosing;
-  graph_.addNode(std::move(node));
+  graph_.addNode(std::move(node), tuPath_);
   return true;
 }
 
@@ -410,7 +411,7 @@ bool CallGraphIndexerVisitor::VisitReturnStmt(clang::ReturnStmt *stmt) {
       std::string enclosing = getCurrentFunction();
       if (!enclosing.empty()) {
         graph_.addFunctionReturn(enclosing,
-                                 funcDecl->getQualifiedNameAsString());
+                                 funcDecl->getQualifiedNameAsString(), tuPath_);
       }
     }
   }
@@ -423,8 +424,9 @@ bool CallGraphIndexerVisitor::VisitReturnStmt(clang::ReturnStmt *stmt) {
 // ============================================================================
 
 CallGraphEdgeVisitor::CallGraphEdgeVisitor(CallGraph &graph,
-                                           clang::SourceManager &sm)
-    : graph_(graph), sm_(sm) {}
+                                           clang::SourceManager &sm,
+                                           const std::string &tuPath)
+    : graph_(graph), sm_(sm), tuPath_(tuPath) {}
 
 std::string CallGraphEdgeVisitor::getFilePath(
     clang::SourceLocation loc) const {
@@ -550,7 +552,7 @@ void CallGraphEdgeVisitor::processCallableArgs(
       std::string lambdaName = lambdaQualifiedName(
           sm_, le->getBeginLoc(), enclosingNonLambdaName());
       graph_.addEdge({caller, lambdaName, lambdaEdgeKind, Confidence::Proven,
-                      siteStr, 1, spawnerCtx});
+                      siteStr, 1, spawnerCtx}, tuPath_);
       continue;
     }
 
@@ -565,7 +567,7 @@ void CallGraphEdgeVisitor::processCallableArgs(
               llvm::dyn_cast<clang::FunctionDecl>(dre->getDecl())) {
         graph_.addEdge({caller, funcDecl->getQualifiedNameAsString(),
                         ptrEdgeKind, Confidence::Proven, siteStr, 1,
-                        spawnerCtx});
+                        spawnerCtx}, tuPath_);
         handledRefs_.insert(dre);
       } else if (auto *varDecl =
                      llvm::dyn_cast<clang::VarDecl>(dre->getDecl())) {
@@ -573,14 +575,14 @@ void CallGraphEdgeVisitor::processCallableArgs(
         if (fnIt != varFuncSources_.end()) {
           for (const auto &funcName : fnIt->second) {
             graph_.addEdge({caller, funcName, ptrEdgeKind,
-                            Confidence::Proven, siteStr, 2, spawnerCtx});
+                            Confidence::Proven, siteStr, 2, spawnerCtx}, tuPath_);
           }
           handledRefs_.insert(dre);
         }
         auto lamIt = varLambdaSources_.find(varDecl);
         if (lamIt != varLambdaSources_.end()) {
           graph_.addEdge({caller, lamIt->second, lambdaEdgeKind,
-                          Confidence::Proven, siteStr, 1, spawnerCtx});
+                          Confidence::Proven, siteStr, 1, spawnerCtx}, tuPath_);
           handledRefs_.insert(dre);
         }
       }
@@ -644,7 +646,7 @@ bool CallGraphEdgeVisitor::VisitCallExpr(clang::CallExpr *expr) {
   if (llvm::isa<clang::CXXOperatorCallExpr>(expr)) {
     graph_.addEdge({caller, callee->getQualifiedNameAsString(),
                     EdgeKind::OperatorCall, Confidence::Proven,
-                    formatLocation(expr->getBeginLoc()), 0});
+                    formatLocation(expr->getBeginLoc()), 0}, tuPath_);
     return true;
   }
 
@@ -670,17 +672,17 @@ bool CallGraphEdgeVisitor::VisitCallExpr(clang::CallExpr *expr) {
                    typeName});
               graph_.addEdge({caller, ctor->getQualifiedNameAsString(),
                               EdgeKind::ConstructorCall, Confidence::Proven,
-                              formatLocation(expr->getBeginLoc()), 0});
+                              formatLocation(expr->getBeginLoc()), 0}, tuPath_);
             }
             // Also just add a generic constructor node for the type.
             std::string ctorName = typeName + "::" +
                                    recordDecl->getNameAsString();
             graph_.addNode({ctorName, getFilePath(recordDecl->getLocation()),
                             sm_.getSpellingLineNumber(recordDecl->getLocation()),
-                            false, false, typeName});
+                            false, false, typeName}, tuPath_);
             graph_.addEdge({caller, ctorName, EdgeKind::ConstructorCall,
                             Confidence::Proven,
-                            formatLocation(expr->getBeginLoc()), 0});
+                            formatLocation(expr->getBeginLoc()), 0}, tuPath_);
           }
         }
       }
@@ -690,7 +692,7 @@ bool CallGraphEdgeVisitor::VisitCallExpr(clang::CallExpr *expr) {
   // Regular direct call.
   graph_.addEdge({caller, callee->getQualifiedNameAsString(),
                   EdgeKind::DirectCall, Confidence::Proven,
-                  formatLocation(expr->getBeginLoc()), 0});
+                  formatLocation(expr->getBeginLoc()), 0}, tuPath_);
 
   return true;
 }
@@ -704,14 +706,14 @@ void CallGraphEdgeVisitor::handleVirtualDispatch(
   // Add Plausible edge to the base method itself (if not pure virtual).
   if (!method->isPureVirtual()) {
     graph_.addEdge({caller, baseMethodName, EdgeKind::VirtualDispatch,
-                    Confidence::Plausible, site, 0});
+                    Confidence::Plausible, site, 0}, tuPath_);
   }
 
   // Add Plausible edges to all known overrides.
   auto overrides = graph_.getOverrides(baseMethodName);
   for (const auto &overrideName : overrides) {
     graph_.addEdge({caller, overrideName, EdgeKind::VirtualDispatch,
-                    Confidence::Plausible, site, 0});
+                    Confidence::Plausible, site, 0}, tuPath_);
   }
 
   // Also check overrides of methods that this method itself overrides
@@ -722,7 +724,7 @@ void CallGraphEdgeVisitor::handleVirtualDispatch(
     for (const auto &overrideName : moreOverrides) {
       if (overrideName != baseMethodName) {
         graph_.addEdge({caller, overrideName, EdgeKind::VirtualDispatch,
-                        Confidence::Plausible, site, 0});
+                        Confidence::Plausible, site, 0}, tuPath_);
       }
     }
   }
@@ -762,9 +764,9 @@ bool CallGraphEdgeVisitor::VisitCXXConstructExpr(
   // Add constructor edge.
   graph_.addNode({ctorName, getFilePath(ctor->getLocation()),
                   sm_.getSpellingLineNumber(ctor->getLocation()), false, false,
-                  ctor->getParent()->getQualifiedNameAsString()});
+                  ctor->getParent()->getQualifiedNameAsString()}, tuPath_);
   graph_.addEdge({caller, ctorName, EdgeKind::ConstructorCall,
-                  Confidence::Proven, formatLocation(expr->getBeginLoc()), 0});
+                  Confidence::Proven, formatLocation(expr->getBeginLoc()), 0}, tuPath_);
 
   return true;
 }
@@ -846,7 +848,7 @@ void CallGraphEdgeVisitor::addConcreteTypeEdges(
         handledMethodNames.insert(methodName);
         graph_.addEdge({caller, method->getQualifiedNameAsString(),
                         EdgeKind::VirtualDispatch, Confidence::Proven, site,
-                        0});
+                        0}, tuPath_);
       }
     }
 
@@ -857,9 +859,9 @@ void CallGraphEdgeVisitor::addConcreteTypeEdges(
         graph_.addNode({dtorName, getFilePath(dtor->getLocation()),
                         sm_.getSpellingLineNumber(dtor->getLocation()), false,
                         dtor->isVirtual(),
-                        current->getQualifiedNameAsString()});
+                        current->getQualifiedNameAsString()}, tuPath_);
         graph_.addEdge({caller, dtorName, EdgeKind::DestructorCall,
-                        Confidence::Proven, site, 0});
+                        Confidence::Proven, site, 0}, tuPath_);
       }
     }
 
@@ -896,7 +898,7 @@ bool CallGraphEdgeVisitor::VisitDeclRefExpr(clang::DeclRefExpr *expr) {
   // Treat as address-taken: Plausible edge.
   graph_.addEdge({caller, funcDecl->getQualifiedNameAsString(),
                   EdgeKind::FunctionPointer, Confidence::Plausible,
-                  formatLocation(expr->getBeginLoc()), 0});
+                  formatLocation(expr->getBeginLoc()), 0}, tuPath_);
 
   return true;
 }
@@ -945,8 +947,9 @@ namespace {
 
 class IndexerOnlyConsumer : public clang::ASTConsumer {
 public:
-  IndexerOnlyConsumer(CallGraph &graph, clang::SourceManager &sm)
-      : visitor_(graph, sm) {}
+  IndexerOnlyConsumer(CallGraph &graph, clang::SourceManager &sm,
+                      const std::string &tuPath)
+      : visitor_(graph, sm, tuPath) {}
   void HandleTranslationUnit(clang::ASTContext &ctx) override {
     visitor_.setASTContext(&ctx);
     visitor_.TraverseDecl(ctx.getTranslationUnitDecl());
@@ -958,33 +961,38 @@ private:
 
 class IndexerOnlyAction : public clang::ASTFrontendAction {
 public:
-  explicit IndexerOnlyAction(CallGraph &g) : graph_(g) {}
+  IndexerOnlyAction(CallGraph &g, const std::string &tuPath)
+      : graph_(g), tuPath_(tuPath) {}
   std::unique_ptr<clang::ASTConsumer>
   CreateASTConsumer(clang::CompilerInstance &ci, llvm::StringRef) override {
     return std::make_unique<IndexerOnlyConsumer>(graph_,
-                                                 ci.getSourceManager());
+                                                 ci.getSourceManager(),
+                                                 tuPath_);
   }
 
 private:
   CallGraph &graph_;
+  std::string tuPath_;
 };
 
 class IndexerOnlyFactory : public clang::tooling::FrontendActionFactory {
 public:
-  explicit IndexerOnlyFactory(CallGraph &g) : graph_(g) {}
+  IndexerOnlyFactory(CallGraph &g, const std::string &tuPath)
+      : graph_(g), tuPath_(tuPath) {}
   std::unique_ptr<clang::FrontendAction> create() override {
-    return std::make_unique<IndexerOnlyAction>(graph_);
+    return std::make_unique<IndexerOnlyAction>(graph_, tuPath_);
   }
 
 private:
   CallGraph &graph_;
+  std::string tuPath_;
 };
 
 class EdgeOnlyConsumer : public clang::ASTConsumer {
 public:
   EdgeOnlyConsumer(CallGraph &graph, clang::SourceManager &sm,
-                   const CollapseFilter *collapse)
-      : visitor_(graph, sm) {
+                   const CollapseFilter *collapse, const std::string &tuPath)
+      : visitor_(graph, sm, tuPath) {
     visitor_.setCollapseFilter(collapse);
   }
   void HandleTranslationUnit(clang::ASTContext &ctx) override {
@@ -998,30 +1006,34 @@ private:
 
 class EdgeOnlyAction : public clang::ASTFrontendAction {
 public:
-  EdgeOnlyAction(CallGraph &g, const CollapseFilter *collapse)
-      : graph_(g), collapse_(collapse) {}
+  EdgeOnlyAction(CallGraph &g, const CollapseFilter *collapse,
+                 const std::string &tuPath)
+      : graph_(g), collapse_(collapse), tuPath_(tuPath) {}
   std::unique_ptr<clang::ASTConsumer>
   CreateASTConsumer(clang::CompilerInstance &ci, llvm::StringRef) override {
     return std::make_unique<EdgeOnlyConsumer>(graph_, ci.getSourceManager(),
-                                              collapse_);
+                                              collapse_, tuPath_);
   }
 
 private:
   CallGraph &graph_;
   const CollapseFilter *collapse_;
+  std::string tuPath_;
 };
 
 class EdgeOnlyFactory : public clang::tooling::FrontendActionFactory {
 public:
-  EdgeOnlyFactory(CallGraph &g, const CollapseFilter *collapse)
-      : graph_(g), collapse_(collapse) {}
+  EdgeOnlyFactory(CallGraph &g, const CollapseFilter *collapse,
+                  const std::string &tuPath)
+      : graph_(g), collapse_(collapse), tuPath_(tuPath) {}
   std::unique_ptr<clang::FrontendAction> create() override {
-    return std::make_unique<EdgeOnlyAction>(graph_, collapse_);
+    return std::make_unique<EdgeOnlyAction>(graph_, collapse_, tuPath_);
   }
 
 private:
   CallGraph &graph_;
   const CollapseFilter *collapse_;
+  std::string tuPath_;
 };
 
 } // anonymous namespace
@@ -1054,7 +1066,7 @@ CallGraph buildCallGraph(const clang::tooling::CompilationDatabase &compDb,
     // Pass 1: Parallel index of all declarations and class hierarchy.
     for (const auto &file : files) {
       pool.async([&compDb, &graph, pchCache, &sysroot, file]() {
-        IndexerOnlyFactory factory(graph);
+        IndexerOnlyFactory factory(graph, file);
         runToolGuarded(compDb, file, factory, pchCache, sysroot);
       });
     }
@@ -1063,7 +1075,7 @@ CallGraph buildCallGraph(const clang::tooling::CompilationDatabase &compDb,
     // Pass 2: Parallel edge building with full hierarchy knowledge.
     for (const auto &file : files) {
       pool.async([&compDb, &graph, collapsePtr, pchCache, &sysroot, file]() {
-        EdgeOnlyFactory factory(graph, collapsePtr);
+        EdgeOnlyFactory factory(graph, collapsePtr, file);
         runToolGuarded(compDb, file, factory, pchCache, sysroot);
       });
     }
@@ -1071,11 +1083,11 @@ CallGraph buildCallGraph(const clang::tooling::CompilationDatabase &compDb,
   } else {
     // Serial path — process per-file for crash isolation.
     for (const auto &file : files) {
-      IndexerOnlyFactory factory(graph);
+      IndexerOnlyFactory factory(graph, file);
       runToolGuarded(compDb, file, factory, pchCache, sysroot);
     }
     for (const auto &file : files) {
-      EdgeOnlyFactory factory(graph, collapsePtr);
+      EdgeOnlyFactory factory(graph, collapsePtr, file);
       runToolGuarded(compDb, file, factory, pchCache, sysroot);
     }
   }
@@ -1088,6 +1100,28 @@ CallGraph buildCallGraph(const clang::tooling::CompilationDatabase &compDb,
 
   restoreCrashGuard(saved);
   return graph;
+}
+
+void indexTU(CallGraph &graph,
+             const clang::tooling::CompilationDatabase &compDb,
+             const std::string &file,
+             const std::vector<std::string> &collapsePaths,
+             const PchCache *pchCache,
+             const std::string &sysroot) {
+  CollapseFilter collapseFilter(collapsePaths);
+  const CollapseFilter *collapsePtr =
+      collapseFilter.empty() ? nullptr : &collapseFilter;
+
+  auto saved = installCrashGuard();
+  g_crashCount.store(0, std::memory_order_relaxed);
+
+  IndexerOnlyFactory indexerFactory(graph, file);
+  runToolGuarded(compDb, file, indexerFactory, pchCache, sysroot);
+
+  EdgeOnlyFactory edgeFactory(graph, collapsePtr, file);
+  runToolGuarded(compDb, file, edgeFactory, pchCache, sysroot);
+
+  restoreCrashGuard(saved);
 }
 
 } // namespace giga_drill

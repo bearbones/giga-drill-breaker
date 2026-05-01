@@ -676,8 +676,16 @@ int main(int argc, const char **argv) {
     if (entryPoints.empty())
       entryPoints.push_back("main");
 
+    giga_drill::McpBuildParams buildParams;
+    buildParams.compDb = std::shared_ptr<clang::tooling::CompilationDatabase>(
+        std::move(compDb));
+    buildParams.collapsePaths = collapsePaths;
+    buildParams.pchCache = pchPtr;
+    buildParams.sysroot = sysroot;
+
     giga_drill::McpServer server(std::move(graph), std::move(cfIndex),
-                                 std::move(entryPoints));
+                                 std::move(entryPoints),
+                                 std::move(buildParams));
     return server.run();
   }
 
