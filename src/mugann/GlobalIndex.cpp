@@ -73,41 +73,54 @@ std::string stripPointer(const std::string &s) {
 
 } // namespace
 
-void TypeRelationIndex::addBase(std::string derived, std::string base) {
-  auto &v = bases[std::move(derived)];
-  if (std::find(v.begin(), v.end(), base) == v.end())
-    v.push_back(std::move(base));
+void TypeRelationIndex::addBase(const std::string &derived,
+                                const std::string &base) {
+  SId derivedId = interner_.intern(derived);
+  SId baseId = interner_.intern(base);
+  auto &v = bases_[derivedId];
+  if (std::find(v.begin(), v.end(), baseId) == v.end())
+    v.push_back(baseId);
 }
 
-void TypeRelationIndex::addCtorEdge(std::string toType, std::string fromType) {
-  auto &v = ctorEdges[std::move(toType)];
-  if (std::find(v.begin(), v.end(), fromType) == v.end())
-    v.push_back(std::move(fromType));
+void TypeRelationIndex::addCtorEdge(const std::string &toType,
+                                    const std::string &fromType) {
+  SId toId = interner_.intern(toType);
+  SId fromId = interner_.intern(fromType);
+  auto &v = ctorEdges_[toId];
+  if (std::find(v.begin(), v.end(), fromId) == v.end())
+    v.push_back(fromId);
 }
 
-void TypeRelationIndex::addConvOpEdge(std::string fromType,
-                                      std::string toType) {
-  auto &v = convOpEdges[std::move(fromType)];
-  if (std::find(v.begin(), v.end(), toType) == v.end())
-    v.push_back(std::move(toType));
+void TypeRelationIndex::addConvOpEdge(const std::string &fromType,
+                                      const std::string &toType) {
+  SId fromId = interner_.intern(fromType);
+  SId toId = interner_.intern(toType);
+  auto &v = convOpEdges_[fromId];
+  if (std::find(v.begin(), v.end(), toId) == v.end())
+    v.push_back(toId);
 }
 
 bool TypeRelationIndex::isBaseOrSelf(const std::string &derived,
                                      const std::string &maybeBase) const {
   if (derived == maybeBase)
     return true;
-  std::unordered_set<std::string> seen;
-  std::vector<std::string> stack{derived};
+  auto derivedOpt = interner_.find(derived);
+  auto baseOpt = interner_.find(maybeBase);
+  if (!derivedOpt || !baseOpt)
+    return false;
+  SId baseId = *baseOpt;
+  std::unordered_set<SId> seen;
+  std::vector<SId> stack{*derivedOpt};
   while (!stack.empty()) {
-    std::string cur = std::move(stack.back());
+    SId cur = stack.back();
     stack.pop_back();
     if (!seen.insert(cur).second)
       continue;
-    auto it = bases.find(cur);
-    if (it == bases.end())
+    auto it = bases_.find(cur);
+    if (it == bases_.end())
       continue;
-    for (const auto &b : it->second) {
-      if (b == maybeBase)
+    for (SId b : it->second) {
+      if (b == baseId)
         return true;
       stack.push_back(b);
     }
@@ -117,48 +130,51 @@ bool TypeRelationIndex::isBaseOrSelf(const std::string &derived,
 
 bool TypeRelationIndex::isConvertible(const std::string &from,
                                       const std::string &to) const {
-  // Identity after normalization.
   if (from == to)
     return true;
 
-  // Builtin arithmetic conversions.
   if (isArithmeticTypeName(from) && isArithmeticTypeName(to))
     return true;
 
-  // Derived-to-base via references or pointers. normalizeTypeForMatching
-  // already removed '&'; we still need to strip a trailing '*' symmetrically
-  // so that `Derived*` satisfies a `Base*` parameter.
   {
     std::string fromClass = stripPointer(from);
     std::string toClass = stripPointer(to);
     if (fromClass != from || toClass != to) {
-      // Both sides had a pointer; must strip in lockstep.
       if (fromClass != from && toClass != to &&
           isBaseOrSelf(fromClass, toClass))
         return true;
     } else if (isBaseOrSelf(fromClass, toClass) && fromClass != toClass) {
-      // Reference/value case: derived value can bind to base reference.
       return true;
     }
   }
 
-  // Single-hop non-explicit converting constructor on the target type.
   {
-    auto it = ctorEdges.find(to);
-    if (it != ctorEdges.end()) {
-      for (const auto &src : it->second)
-        if (src == from)
-          return true;
+    auto toOpt = interner_.find(to);
+    if (toOpt) {
+      auto it = ctorEdges_.find(*toOpt);
+      if (it != ctorEdges_.end()) {
+        auto fromOpt = interner_.find(from);
+        if (fromOpt) {
+          for (SId src : it->second)
+            if (src == *fromOpt)
+              return true;
+        }
+      }
     }
   }
 
-  // Single-hop non-explicit conversion operator on the source type.
   {
-    auto it = convOpEdges.find(from);
-    if (it != convOpEdges.end()) {
-      for (const auto &tgt : it->second)
-        if (tgt == to)
-          return true;
+    auto fromOpt = interner_.find(from);
+    if (fromOpt) {
+      auto it = convOpEdges_.find(*fromOpt);
+      if (it != convOpEdges_.end()) {
+        auto toOpt = interner_.find(to);
+        if (toOpt) {
+          for (SId tgt : it->second)
+            if (tgt == *toOpt)
+              return true;
+        }
+      }
     }
   }
 
@@ -166,17 +182,22 @@ bool TypeRelationIndex::isConvertible(const std::string &from,
 }
 
 void GlobalIndex::addFunctionOverload(FunctionOverloadEntry entry) {
-  overloads_[entry.qualifiedName].push_back(std::move(entry));
+  SId key = interner_.intern(entry.qualifiedName);
+  overloads_[key].push_back(std::move(entry));
 }
 
 void GlobalIndex::addDeductionGuide(DeductionGuideEntry entry) {
-  guides_[entry.templateName].push_back(std::move(entry));
+  SId key = interner_.intern(entry.templateName);
+  guides_[key].push_back(std::move(entry));
 }
 
 std::vector<const FunctionOverloadEntry *>
 GlobalIndex::findOverloads(const std::string &qualifiedName) const {
   std::vector<const FunctionOverloadEntry *> result;
-  auto it = overloads_.find(qualifiedName);
+  auto id = interner_.find(qualifiedName);
+  if (!id)
+    return result;
+  auto it = overloads_.find(*id);
   if (it != overloads_.end()) {
     for (const auto &entry : it->second)
       result.push_back(&entry);
@@ -187,7 +208,10 @@ GlobalIndex::findOverloads(const std::string &qualifiedName) const {
 std::vector<const DeductionGuideEntry *>
 GlobalIndex::findDeductionGuides(const std::string &templateName) const {
   std::vector<const DeductionGuideEntry *> result;
-  auto it = guides_.find(templateName);
+  auto id = interner_.find(templateName);
+  if (!id)
+    return result;
+  auto it = guides_.find(*id);
   if (it != guides_.end()) {
     for (const auto &entry : it->second)
       result.push_back(&entry);
@@ -210,13 +234,17 @@ size_t GlobalIndex::guideCount() const {
 }
 
 void GlobalIndex::addCoverageProperty(CoveragePropertyEntry entry) {
-  coverageProps_[entry.enclosingClass].push_back(std::move(entry));
+  SId key = interner_.intern(entry.enclosingClass);
+  coverageProps_[key].push_back(std::move(entry));
 }
 
 std::vector<const CoveragePropertyEntry *>
 GlobalIndex::findClassMethods(const std::string &enclosingClass) const {
   std::vector<const CoveragePropertyEntry *> result;
-  auto it = coverageProps_.find(enclosingClass);
+  auto id = interner_.find(enclosingClass);
+  if (!id)
+    return result;
+  auto it = coverageProps_.find(*id);
   if (it != coverageProps_.end()) {
     for (const auto &entry : it->second)
       result.push_back(&entry);
@@ -228,7 +256,7 @@ std::vector<std::string> GlobalIndex::allIndexedClasses() const {
   std::vector<std::string> result;
   result.reserve(coverageProps_.size());
   for (const auto &kv : coverageProps_)
-    result.push_back(kv.first);
+    result.push_back(interner_.resolve(kv.first));
   return result;
 }
 

@@ -15,6 +15,8 @@
 
 #pragma once
 
+#include "giga_drill/callgraph/StringInterner.h"
+
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -86,20 +88,9 @@ struct CoveragePropertyEntry {
 // are viable via a standard conversion path the analyzer would otherwise
 // miss — nothing more.
 struct TypeRelationIndex {
-  // Normalized derived className -> list of direct base class names.
-  std::unordered_map<std::string, std::vector<std::string>> bases;
-
-  // Normalized target type -> list of source types accepted by a non-explicit
-  // single-argument converting constructor of that target.
-  std::unordered_map<std::string, std::vector<std::string>> ctorEdges;
-
-  // Normalized source type -> list of target types reachable via a non-explicit
-  // conversion operator on the source.
-  std::unordered_map<std::string, std::vector<std::string>> convOpEdges;
-
-  void addBase(std::string derived, std::string base);
-  void addCtorEdge(std::string toType, std::string fromType);
-  void addConvOpEdge(std::string fromType, std::string toType);
+  void addBase(const std::string &derived, const std::string &base);
+  void addCtorEdge(const std::string &toType, const std::string &fromType);
+  void addConvOpEdge(const std::string &fromType, const std::string &toType);
 
   // Transitive base-class check (cycle-safe). Returns true when
   // `derived == maybeBase` or when `maybeBase` appears anywhere on the
@@ -112,6 +103,21 @@ struct TypeRelationIndex {
   // pointer/reference-stripped derived-to-base, a converting constructor
   // edge, a conversion-operator edge. Returns false otherwise.
   bool isConvertible(const std::string &from, const std::string &to) const;
+
+private:
+  using SId = StringInterner::Id;
+  StringInterner interner_;
+
+  // Normalized derived className -> list of direct base class names.
+  std::unordered_map<SId, std::vector<SId>> bases_;
+
+  // Normalized target type -> list of source types accepted by a non-explicit
+  // single-argument converting constructor of that target.
+  std::unordered_map<SId, std::vector<SId>> ctorEdges_;
+
+  // Normalized source type -> list of target types reachable via a non-explicit
+  // conversion operator on the source.
+  std::unordered_map<SId, std::vector<SId>> convOpEdges_;
 };
 
 // A diagnostic emitted when analysis finds an issue.
@@ -171,10 +177,11 @@ public:
   size_t coverageEntryCount() const;
 
 private:
-  std::unordered_map<std::string, std::vector<FunctionOverloadEntry>> overloads_;
-  std::unordered_map<std::string, std::vector<DeductionGuideEntry>> guides_;
-  std::unordered_map<std::string, std::vector<CoveragePropertyEntry>>
-      coverageProps_;
+  using SId = StringInterner::Id;
+  StringInterner interner_;
+  std::unordered_map<SId, std::vector<FunctionOverloadEntry>> overloads_;
+  std::unordered_map<SId, std::vector<DeductionGuideEntry>> guides_;
+  std::unordered_map<SId, std::vector<CoveragePropertyEntry>> coverageProps_;
   TypeRelationIndex types_;
 };
 
