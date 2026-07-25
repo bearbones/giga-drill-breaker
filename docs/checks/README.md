@@ -57,6 +57,7 @@ initial seeding and may evolve. Organizations can define their own groups
 | [specialization-visibility](specialization-visibility.md) | on | — | TU instantiates a primary template whose explicit specialization exists elsewhere (IFNDR) |
 | [default-arg-divergence](default-arg-divergence.md) | on | — | Declaration sites that disagree on a parameter's default argument |
 | [static-init-order](static-init-order.md) | on | — | Dynamic initializers reading another TU's dynamically-initialized global (SIOF) |
+| [header-static-duplication](header-static-duplication.md) | on | — | Mutable header-defined statics materialized by multiple TUs (forked per-TU state) |
 | [static-init-hazards](static-init-hazards.md) | off | compute-heavy | Static initializers reaching dlopen/dlsym or thread create/join (loader-lock deadlock risk) |
 | [exception-escape](exception-escape.md) | off | noisy | noexcept functions that can transitively reach an uncaught throw across TUs |
 | [odr-violations](odr-violations.md) | off | compute-heavy | Vague-linkage definitions that differ across sites or TUs |

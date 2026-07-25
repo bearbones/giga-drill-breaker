@@ -74,6 +74,12 @@ struct AnalysisOptions {
   // actual cross-site conflict, which is near-certainly a bug.
   bool enableDefaultArgDiag = true;
 
+  // header-static-duplication: a MUTABLE internal-linkage static defined
+  // in a header and materialized by two or more TUs — per-TU forked
+  // state. On by default: duplication is proven (TUs counted), and const
+  // copies — the common benign case — are silent.
+  bool enableHeaderStaticDiag = true;
+
   // exception-escape: noexcept functions that can transitively reach an
   // uncaught throw across TUs (std::terminate). Off by default: the
   // name-level call summaries it walks conflate overload sets and skip
@@ -255,6 +261,12 @@ void analyzeStaticInitOrder(const GlobalIndex &index,
 // goes blind one call deep at the TU boundary; the summaries cross it.
 void analyzeExceptionEscape(const GlobalIndex &index,
                             std::vector<Diagnostic> &diagnostics);
+
+// header-static-duplication (index-only, phase 1.5): mutable
+// header-defined statics whose recorded tuPaths prove >= 2 TUs own a
+// private copy. Const/constexpr copies stay silent.
+void analyzeHeaderStaticDuplication(const GlobalIndex &index,
+                                    std::vector<Diagnostic> &diagnostics);
 
 // static-init-hazards: walk the call graph from every static-init root
 // (dynamic initializers via their directly-called functions; ELF

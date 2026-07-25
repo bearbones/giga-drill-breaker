@@ -57,6 +57,11 @@ const std::vector<CheckInfo> &builtinAnnealChecks() {
        "(loader-lock deadlock risk)",
        /*defaultOn=*/false,
        {"compute-heavy"}},
+      {"header-static-duplication",
+       "Mutable header-defined statics materialized by multiple TUs "
+       "(forked per-TU state)",
+       /*defaultOn=*/true,
+       {}},
       {"exception-escape",
        "noexcept functions that can transitively reach an uncaught throw "
        "across TUs",

@@ -309,7 +309,48 @@ void IndexerVisitor::maybeRecordFunctionSummary(clang::FunctionDecl *decl) {
   index_.addFunctionSummary(entry);
 }
 
+// Internal-linkage static defined in a HEADER: every including TU gets a
+// private copy. Recorded with the materializing TU so the analysis can
+// prove duplication actually happened (>= 2 distinct TUs) instead of
+// pattern-matching. Main-file statics are the normal, intended usage and
+// are never recorded. Cheap and rare: always collected.
+void IndexerVisitor::maybeRecordHeaderStatic(clang::VarDecl *decl) {
+  if (llvm::isa<clang::ParmVarDecl>(decl) || !decl->hasGlobalStorage() ||
+      decl->isStaticLocal())
+    return;
+  if (decl->isThisDeclarationADefinition() != clang::VarDecl::Definition)
+    return;
+  if (decl->getType()->isDependentType() || decl->getDescribedVarTemplate())
+    return;
+  if (decl->getTemplateSpecializationKind() ==
+      clang::TSK_ImplicitInstantiation)
+    return;
+  if (decl->isExternallyVisible())
+    return; // external linkage: one program-wide copy, linker-managed
+  auto loc = sm_.getSpellingLoc(decl->getLocation());
+  if (sm_.isInMainFile(loc) || sm_.isInSystemHeader(loc))
+    return;
+
+  HeaderStaticEntry entry;
+  entry.name = decl->getQualifiedNameAsString();
+  entry.filePath = getFilePath(decl->getLocation());
+  entry.line = sm_.getSpellingLineNumber(decl->getLocation());
+  // "Effectively const" is treated as benign: const/constexpr, and the
+  // ubiquitous `static const char *kName = "..."` idiom — the pointer is
+  // technically mutable, but flagging pointer-to-const would drown the
+  // check in idiomatic constants (documented recall tradeoff).
+  clang::QualType type = decl->getType();
+  entry.isConst = type.isConstQualified() || decl->isConstexpr() ||
+                  (type->isPointerType() &&
+                   type->getPointeeType().isConstQualified());
+  if (auto mainFile = sm_.getFileEntryRefForID(sm_.getMainFileID()))
+    entry.tuPaths.push_back(std::string(mainFile->getName()));
+  index_.addHeaderStatic(entry);
+}
+
 bool IndexerVisitor::VisitVarDecl(clang::VarDecl *decl) {
+  maybeRecordHeaderStatic(decl);
+
   // Static-storage-duration variable DEFINITIONS at namespace/class scope.
   // Function-local statics initialize lazily on first pass — safe, and
   // deliberately excluded. Parameters and locals have no global storage.
