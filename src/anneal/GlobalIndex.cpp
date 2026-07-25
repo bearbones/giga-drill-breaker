@@ -226,7 +226,29 @@ void GlobalIndex::absorb(const GlobalIndex &shard) {
       [this](const StaticInitEntry &e) { addStaticInit(e); });
   shard.forEachFunctionSummary(
       [this](const FunctionSummaryEntry &e) { addFunctionSummary(e); });
+  shard.forEachHeaderStatic(
+      [this](const HeaderStaticEntry &e) { addHeaderStatic(e); });
   types_.absorb(shard.types_);
+}
+
+void GlobalIndex::addHeaderStatic(const HeaderStaticEntry &entry) {
+  std::string key = entry.filePath + "|" + std::to_string(entry.line);
+  std::lock_guard<std::mutex> lock(writeMutex_);
+  auto it = headerStaticBySite_.find(key);
+  if (it == headerStaticBySite_.end()) {
+    headerStatics_.push_back(entry);
+    headerStaticBySite_.emplace(std::move(key), headerStatics_.size() - 1);
+    return;
+  }
+  auto &existing = headerStatics_[it->second];
+  for (const auto &tu : entry.tuPaths)
+    if (std::find(existing.tuPaths.begin(), existing.tuPaths.end(), tu) ==
+        existing.tuPaths.end())
+      existing.tuPaths.push_back(tu);
+}
+
+size_t GlobalIndex::headerStaticCount() const {
+  return headerStatics_.size();
 }
 
 void GlobalIndex::addFunctionSummary(const FunctionSummaryEntry &entry) {

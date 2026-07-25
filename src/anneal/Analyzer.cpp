@@ -891,6 +891,49 @@ void analyzeDefaultArgDivergence(const GlobalIndex &index,
   }
 }
 
+// --- header-static duplication ---
+
+void analyzeHeaderStaticDuplication(const GlobalIndex &index,
+                                    std::vector<Diagnostic> &diagnostics) {
+  std::vector<const HeaderStaticEntry *> entries;
+  index.forEachHeaderStatic([&](const HeaderStaticEntry &e) {
+    if (!e.isConst && e.tuPaths.size() >= 2)
+      entries.push_back(&e);
+  });
+  std::sort(entries.begin(), entries.end(),
+            [](const HeaderStaticEntry *a, const HeaderStaticEntry *b) {
+              return std::tie(a->filePath, a->line, a->name) <
+                     std::tie(b->filePath, b->line, b->name);
+            });
+
+  for (const auto *entry : entries) {
+    std::vector<std::string> tus = entry->tuPaths;
+    std::sort(tus.begin(), tus.end());
+    std::string tuList;
+    for (size_t i = 0; i < tus.size() && i < 3; ++i) {
+      if (i)
+        tuList += ", ";
+      tuList += tus[i];
+    }
+    if (tus.size() > 3)
+      tuList += ", ...";
+
+    Diagnostic diag;
+    diag.kind = Diagnostic::HeaderStatic_Duplicated;
+    diag.callLocation = entry->filePath + ":" + std::to_string(entry->line);
+    diag.message =
+        "Header-static duplication: '" + entry->name +
+        "' is defined static in " + entry->filePath + ":" +
+        std::to_string(entry->line) + ", and " +
+        std::to_string(tus.size()) + " TUs (" + tuList +
+        ") each materialized their OWN copy — writes in one TU are "
+        "invisible in the others, and its address differs per TU. Use "
+        "'inline' (C++17) for one shared object, extern with a single "
+        "definition, or constexpr if it is meant to be a constant.";
+    diagnostics.push_back(std::move(diag));
+  }
+}
+
 // --- static initialization checks ---
 
 void analyzeStaticInitOrder(const GlobalIndex &index,
@@ -1319,6 +1362,8 @@ runAnalysis(const clang::tooling::CompilationDatabase &compDb,
     analyzeStaticInitOrder(index, diagnostics);
   if (opts.enableExceptionEscapeDiag)
     analyzeExceptionEscape(index, diagnostics);
+  if (opts.enableHeaderStaticDiag)
+    analyzeHeaderStaticDuplication(index, diagnostics);
 
   // Phase 1.5c: organization IndexChecks (ext/) — cross-TU invariants over
   // the merged index. Recomputed every run, so they never touch journal

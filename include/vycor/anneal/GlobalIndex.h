@@ -250,6 +250,21 @@ struct FunctionSummaryEntry {
   std::vector<std::string> referencedGlobals;
 };
 
+// One internal-linkage static-storage variable DEFINED IN A HEADER, with
+// the set of TUs that materialized it. `static int x;` in a header gives
+// every including TU its own private copy: writes in one TU are invisible
+// in the others, and the address differs per TU. A single-TU tool can
+// only see the pattern; counting tuPaths proves the duplication actually
+// happened. Const copies are recorded but treated as benign (identical
+// immutable values per TU are the common, harmless case).
+struct HeaderStaticEntry {
+  std::string name; // qualified spelling (anonymous namespaces included)
+  std::string filePath; // the defining header
+  unsigned line = 0;
+  bool isConst = false;
+  std::vector<std::string> tuPaths; // distinct TUs with their own copy
+};
+
 // A diagnostic emitted when analysis finds an issue.
 struct Diagnostic {
   enum Kind {
@@ -286,6 +301,9 @@ struct Diagnostic {
                                   // — deadlock risk under the loader lock
     Exception_Escape,             // a noexcept function can transitively
                                   // reach an uncaught throw (std::terminate)
+    HeaderStatic_Duplicated,      // a mutable static defined in a header is
+                                  // materialized by multiple TUs — forked
+                                  // per-TU state
     Custom,                       // organization ext/ check (see checkName)
   };
   Kind kind;
@@ -339,6 +357,10 @@ public:
   // (same name + site) dedup at insert.
   void addStaticInit(const StaticInitEntry &entry);
 
+  // Header-defined internal-linkage statics (see HeaderStaticEntry).
+  // Entries with the same definition site MERGE: tuPaths union.
+  void addHeaderStatic(const HeaderStaticEntry &entry);
+
   // Function call summaries (see FunctionSummaryEntry). Entries with the
   // same qualified name MERGE: lists union, flags OR, first site wins.
   void addFunctionSummary(const FunctionSummaryEntry &entry);
@@ -359,6 +381,7 @@ public:
   size_t defaultArgCount() const;
   size_t staticInitCount() const;
   size_t functionSummaryCount() const;
+  size_t headerStaticCount() const;
 
   // Merge a per-TU shard into this index (parallel phase-1 merge and
   // checkpoint replay). Entries are appended exactly as if the shard's
@@ -405,6 +428,10 @@ public:
     for (const auto &entry : functionSummaries_)
       fn(entry);
   }
+  template <typename Fn> void forEachHeaderStatic(Fn fn) const {
+    for (const auto &entry : headerStatics_)
+      fn(entry);
+  }
 
 private:
   using SId = StringInterner::Id;
@@ -434,6 +461,8 @@ private:
   std::unordered_set<std::string> staticInitKeys_;
   std::vector<FunctionSummaryEntry> functionSummaries_;
   std::unordered_map<std::string, size_t> functionSummaryByName_;
+  std::vector<HeaderStaticEntry> headerStatics_;
+  std::unordered_map<std::string, size_t> headerStaticBySite_; // file|line
   TypeRelationIndex types_;
 };
 
