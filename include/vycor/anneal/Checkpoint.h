@@ -85,6 +85,7 @@ struct AnnealIndexPayload {
   std::vector<StaticInitEntry> staticInits;
   std::vector<FunctionSummaryEntry> functionSummaries;
   std::vector<HeaderStaticEntry> headerStatics;
+  std::vector<ExceptionSpecEntry> exceptionSpecs;
   // (derived,base), (toType,fromType), (fromType,toType) — the argument
   // order of the corresponding TypeRelationIndex::add* methods.
   std::vector<std::pair<std::string, std::string>> baseEdges;

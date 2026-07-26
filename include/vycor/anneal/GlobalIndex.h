@@ -265,6 +265,24 @@ struct HeaderStaticEntry {
   std::vector<std::string> tuPaths; // distinct TUs with their own copy
 };
 
+// One declaration site's RESOLVED exception specification for one
+// function. Stored as the evaluated tri-state outcome (cannot-throw vs
+// potentially-throwing; dependent/unevaluated specs are skipped at record
+// time), NOT the source spelling — so `noexcept(SOME_MACRO)` evaluating
+// differently under different compile flags produces two entries at the
+// SAME site, which is exactly the divergence the analysis wants to see.
+// noexcept doesn't mangle, so contradictory declarations across TUs
+// compile and link clean (IFNDR); the signature field is spec-STRIPPED
+// (params + method qualifiers) precisely so the with-noexcept and
+// without-noexcept declarations of one function land in the same group.
+struct ExceptionSpecEntry {
+  std::string qualifiedName;
+  std::string signature; // spec-stripped: "(params) quals"
+  bool isNoexcept = false;
+  std::string filePath;
+  unsigned line = 0;
+};
+
 // A diagnostic emitted when analysis finds an issue.
 struct Diagnostic {
   enum Kind {
@@ -304,6 +322,9 @@ struct Diagnostic {
     HeaderStatic_Duplicated,      // a mutable static defined in a header is
                                   // materialized by multiple TUs — forked
                                   // per-TU state
+    ExceptionSpec_Divergent,      // declaration sites disagree on whether a
+                                  // function can throw — callers compile
+                                  // contradictory unwind assumptions
     Custom,                       // organization ext/ check (see checkName)
   };
   Kind kind;
@@ -361,6 +382,10 @@ public:
   // Entries with the same definition site MERGE: tuPaths union.
   void addHeaderStatic(const HeaderStaticEntry &entry);
 
+  // Resolved exception specs per declaration site (see
+  // ExceptionSpecEntry). Identical entries dedup at insert.
+  void addExceptionSpec(const ExceptionSpecEntry &entry);
+
   // Function call summaries (see FunctionSummaryEntry). Entries with the
   // same qualified name MERGE: lists union, flags OR, first site wins.
   void addFunctionSummary(const FunctionSummaryEntry &entry);
@@ -382,6 +407,7 @@ public:
   size_t staticInitCount() const;
   size_t functionSummaryCount() const;
   size_t headerStaticCount() const;
+  size_t exceptionSpecCount() const;
 
   // Merge a per-TU shard into this index (parallel phase-1 merge and
   // checkpoint replay). Entries are appended exactly as if the shard's
@@ -432,6 +458,10 @@ public:
     for (const auto &entry : headerStatics_)
       fn(entry);
   }
+  template <typename Fn> void forEachExceptionSpec(Fn fn) const {
+    for (const auto &entry : exceptionSpecs_)
+      fn(entry);
+  }
 
 private:
   using SId = StringInterner::Id;
@@ -463,6 +493,8 @@ private:
   std::unordered_map<std::string, size_t> functionSummaryByName_;
   std::vector<HeaderStaticEntry> headerStatics_;
   std::unordered_map<std::string, size_t> headerStaticBySite_; // file|line
+  std::vector<ExceptionSpecEntry> exceptionSpecs_;
+  std::unordered_set<std::string> exceptionSpecKeys_;
   TypeRelationIndex types_;
 };
 

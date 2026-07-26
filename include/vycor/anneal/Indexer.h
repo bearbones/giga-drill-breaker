@@ -69,6 +69,7 @@ private:
   void maybeRecordConstructorFn(clang::FunctionDecl *decl);
   void maybeRecordFunctionSummary(clang::FunctionDecl *decl);
   void maybeRecordHeaderStatic(clang::VarDecl *decl);
+  void maybeRecordExceptionSpec(clang::FunctionDecl *decl);
 };
 
 // ASTConsumer that drives the IndexerVisitor.

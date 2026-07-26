@@ -228,7 +228,23 @@ void GlobalIndex::absorb(const GlobalIndex &shard) {
       [this](const FunctionSummaryEntry &e) { addFunctionSummary(e); });
   shard.forEachHeaderStatic(
       [this](const HeaderStaticEntry &e) { addHeaderStatic(e); });
+  shard.forEachExceptionSpec(
+      [this](const ExceptionSpecEntry &e) { addExceptionSpec(e); });
   types_.absorb(shard.types_);
+}
+
+void GlobalIndex::addExceptionSpec(const ExceptionSpecEntry &entry) {
+  std::string key = entry.qualifiedName + "|" + entry.signature + "|" +
+                    (entry.isNoexcept ? "1|" : "0|") + entry.filePath + "|" +
+                    std::to_string(entry.line);
+  std::lock_guard<std::mutex> lock(writeMutex_);
+  if (!exceptionSpecKeys_.insert(std::move(key)).second)
+    return;
+  exceptionSpecs_.push_back(entry);
+}
+
+size_t GlobalIndex::exceptionSpecCount() const {
+  return exceptionSpecs_.size();
 }
 
 void GlobalIndex::addHeaderStatic(const HeaderStaticEntry &entry) {

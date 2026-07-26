@@ -823,6 +823,8 @@ int main(int argc, const char **argv) {
         enabledChecks.count("exception-escape") > 0;
     opts.enableHeaderStaticDiag =
         enabledChecks.count("header-static-duplication") > 0;
+    opts.enableExceptionSpecDiag =
+        enabledChecks.count("exception-spec-divergence") > 0;
     opts.enableCoverageDiag = enabledChecks.count("coverage-properties") > 0;
     opts.enableOdrDiag = enabledChecks.count("odr-violations") > 0;
     opts.warnSameScore = AnnealWarnSameScore;
