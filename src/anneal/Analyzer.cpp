@@ -891,6 +891,85 @@ void analyzeDefaultArgDivergence(const GlobalIndex &index,
   }
 }
 
+// --- exception-spec divergence ---
+
+void analyzeExceptionSpecDivergence(const GlobalIndex &index,
+                                    std::vector<Diagnostic> &diagnostics) {
+  using Site = std::pair<std::string, unsigned>;
+  struct Group {
+    std::string displayName;
+    // Site -> specs observed there (both = preprocessor-dependent).
+    std::vector<std::pair<Site, std::set<bool>>> sites;
+  };
+  std::map<std::string, Group> groups; // deterministic output order
+  index.forEachExceptionSpec([&](const ExceptionSpecEntry &e) {
+    auto &group = groups[e.qualifiedName + "|" + e.signature];
+    group.displayName = e.qualifiedName;
+    Site site{e.filePath, e.line};
+    for (auto &entry : group.sites)
+      if (entry.first == site) {
+        entry.second.insert(e.isNoexcept);
+        return;
+      }
+    group.sites.push_back({site, {e.isNoexcept}});
+  });
+
+  auto formatSite = [](const Site &s) {
+    return s.first + ":" + std::to_string(s.second);
+  };
+
+  for (const auto &[key, group] : groups) {
+    std::set<bool> allSpecs;
+    for (const auto &[site, specs] : group.sites)
+      allSpecs.insert(specs.begin(), specs.end());
+    if (allSpecs.size() < 2)
+      continue;
+
+    Diagnostic diag;
+    diag.kind = Diagnostic::ExceptionSpec_Divergent;
+    diag.callLocation = formatSite(group.sites.front().first);
+
+    // Root-cause first: a single site resolving both ways means the spec
+    // depends on preprocessor state (noexcept(MACRO) under differing
+    // compile flags).
+    const Site *bothWays = nullptr;
+    for (const auto &[site, specs] : group.sites)
+      if (specs.size() > 1) {
+        bothWays = &site;
+        break;
+      }
+    if (bothWays) {
+      diag.callLocation = formatSite(*bothWays);
+      diag.message =
+          "Exception-spec divergence: '" + group.displayName + "' at " +
+          formatSite(*bothWays) + " resolves to noexcept in some TUs and "
+          "potentially-throwing in others — its specification depends on "
+          "preprocessor state that differs between compile commands. All "
+          "declarations of a function must agree (IFNDR); callers compile "
+          "contradictory unwind assumptions.";
+      diagnostics.push_back(std::move(diag));
+      continue;
+    }
+
+    std::string noexceptSites, throwingSites;
+    for (const auto &[site, specs] : group.sites) {
+      std::string &into = *specs.begin() ? noexceptSites : throwingSites;
+      if (!into.empty())
+        into += ", ";
+      into += formatSite(site);
+    }
+    diag.message =
+        "Exception-spec divergence: '" + group.displayName +
+        "' is declared noexcept at " + noexceptSites +
+        " but potentially-throwing at " + throwingSites +
+        ". No TU sees both declarations (the in-TU case is a compile "
+        "error), so this contradiction is IFNDR: callers that saw "
+        "noexcept elide unwind paths, and noexcept-dependent decisions "
+        "(move_if_noexcept) fork per TU. Unify the declarations.";
+    diagnostics.push_back(std::move(diag));
+  }
+}
+
 // --- header-static duplication ---
 
 void analyzeHeaderStaticDuplication(const GlobalIndex &index,
@@ -1364,6 +1443,8 @@ runAnalysis(const clang::tooling::CompilationDatabase &compDb,
     analyzeExceptionEscape(index, diagnostics);
   if (opts.enableHeaderStaticDiag)
     analyzeHeaderStaticDuplication(index, diagnostics);
+  if (opts.enableExceptionSpecDiag)
+    analyzeExceptionSpecDivergence(index, diagnostics);
 
   // Phase 1.5c: organization IndexChecks (ext/) — cross-TU invariants over
   // the merged index. Recomputed every run, so they never touch journal

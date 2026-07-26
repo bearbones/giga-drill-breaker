@@ -62,6 +62,10 @@ const std::vector<CheckInfo> &builtinAnnealChecks() {
        "(forked per-TU state)",
        /*defaultOn=*/true,
        {}},
+      {"exception-spec-divergence",
+       "Declaration sites that disagree on whether a function can throw",
+       /*defaultOn=*/true,
+       {}},
       {"exception-escape",
        "noexcept functions that can transitively reach an uncaught throw "
        "across TUs",

@@ -74,6 +74,12 @@ struct AnalysisOptions {
   // actual cross-site conflict, which is near-certainly a bug.
   bool enableDefaultArgDiag = true;
 
+  // exception-spec-divergence: declaration sites that disagree on whether
+  // a function can throw. On by default: an in-TU contradiction is a
+  // compile error, so every finding is a real cross-TU (or cross-flag)
+  // disagreement — IFNDR, with unwind assumptions forked per TU.
+  bool enableExceptionSpecDiag = true;
+
   // header-static-duplication: a MUTABLE internal-linkage static defined
   // in a header and materialized by two or more TUs — per-TU forked
   // state. On by default: duplication is proven (TUs counted), and const
@@ -261,6 +267,14 @@ void analyzeStaticInitOrder(const GlobalIndex &index,
 // goes blind one call deep at the TU boundary; the summaries cross it.
 void analyzeExceptionEscape(const GlobalIndex &index,
                             std::vector<Diagnostic> &diagnostics);
+
+// exception-spec-divergence (index-only, phase 1.5): groups declaration
+// sites by (function, spec-stripped signature) and flags groups whose
+// RESOLVED specs disagree — either different sites (a shim header adding
+// noexcept the real header doesn't have) or one site resolving both ways
+// across TUs (noexcept(MACRO) under differing compile flags).
+void analyzeExceptionSpecDivergence(const GlobalIndex &index,
+                                    std::vector<Diagnostic> &diagnostics);
 
 // header-static-duplication (index-only, phase 1.5): mutable
 // header-defined statics whose recorded tuPaths prove >= 2 TUs own a

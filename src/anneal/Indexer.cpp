@@ -270,6 +270,63 @@ void IndexerVisitor::maybeRecordConstructorFn(clang::FunctionDecl *decl) {
   index_.addStaticInit(entry);
 }
 
+// Resolved exception spec per declaration site. Every redeclaration is a
+// site (like default arguments) — within one TU the compiler rejects
+// incompatible redeclarations, so a contradiction can only exist across
+// TUs, through headers no single TU includes together. The spec is stored
+// RESOLVED (FunctionProtoType::canThrow), so `noexcept(MACRO)` differing
+// per compile command shows up as two entries at one site. The signature
+// is spec-stripped: in C++17 noexcept is part of the function type, and a
+// type-derived signature would send the two sides of a divergence into
+// different groups, hiding exactly what we're looking for.
+void IndexerVisitor::maybeRecordExceptionSpec(clang::FunctionDecl *decl) {
+  if (!decl->isExternallyVisible())
+    return; // internal linkage: per-TU entities, no cross-TU contradiction
+  if (decl->isDependentContext() || decl->getDescribedFunctionTemplate())
+    return;
+  if (decl->getTemplateSpecializationKind() ==
+      clang::TSK_ImplicitInstantiation)
+    return;
+  auto loc = sm_.getSpellingLoc(decl->getLocation());
+  if (sm_.isInSystemHeader(loc))
+    return;
+  const auto *proto = decl->getType()->getAs<clang::FunctionProtoType>();
+  if (!proto)
+    return;
+  auto est = proto->getExceptionSpecType();
+  if (est == clang::EST_Unevaluated || est == clang::EST_Uninstantiated ||
+      est == clang::EST_Unparsed)
+    return; // implicit specs not yet computed: nothing reliable to compare
+  auto canThrow = proto->canThrow();
+  if (canThrow == clang::CT_Dependent)
+    return;
+
+  ExceptionSpecEntry entry;
+  entry.qualifiedName = decl->getQualifiedNameAsString();
+  std::string sig = "(";
+  for (unsigned i = 0; i < decl->getNumParams(); ++i) {
+    if (i)
+      sig += ", ";
+    sig += decl->getParamDecl(i)->getType().getAsString();
+  }
+  sig += ")";
+  if (const auto *method = llvm::dyn_cast<clang::CXXMethodDecl>(decl)) {
+    if (method->isConst())
+      sig += " const";
+    if (method->isVolatile())
+      sig += " volatile";
+    if (method->getRefQualifier() == clang::RQ_LValue)
+      sig += " &";
+    else if (method->getRefQualifier() == clang::RQ_RValue)
+      sig += " &&";
+  }
+  entry.signature = std::move(sig);
+  entry.isNoexcept = canThrow == clang::CT_Cannot;
+  entry.filePath = getFilePath(decl->getLocation());
+  entry.line = sm_.getSpellingLineNumber(decl->getLocation());
+  index_.addExceptionSpec(entry);
+}
+
 // Per-function call summary (transitive static-init-order and
 // exception-escape). Rides the same parse; gated because the payload cost
 // is real on large trees.
@@ -410,6 +467,7 @@ bool IndexerVisitor::VisitFunctionDecl(clang::FunctionDecl *decl) {
   maybeRecordDefaultArgs(decl);
   maybeRecordConstructorFn(decl);
   maybeRecordFunctionSummary(decl);
+  maybeRecordExceptionSpec(decl);
 
   // Only index definitions or the first declaration to avoid duplicates
   // from multiple includes. We prefer to index every unique declaration

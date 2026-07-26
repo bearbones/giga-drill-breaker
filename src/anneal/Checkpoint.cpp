@@ -34,8 +34,8 @@ namespace {
 constexpr char kMagic[4] = {'V', 'Y', 'C', 'J'};
 // v2: AnnealIndexPayload gained odrEntries. v3: specializations.
 // v4: defaultArgs. v5: staticInits. v6: functionSummaries.
-// v7: headerStatics.
-constexpr uint32_t kVersion = 7;
+// v7: headerStatics. v8: exceptionSpecs.
+constexpr uint32_t kVersion = 8;
 constexpr size_t kHeaderSize = 4 + 4 + 8;
 
 constexpr uint8_t kKindAttempt = 1;
@@ -196,6 +196,8 @@ uint64_t annealOptionsFingerprint(const AnalysisOptions &opts) {
   canon += opts.enableExceptionEscapeDiag ? '1' : '0';
   canon += "|hsd=";
   canon += opts.enableHeaderStaticDiag ? '1' : '0';
+  canon += "|xsd=";
+  canon += opts.enableExceptionSpecDiag ? '1' : '0';
   // Organization checks change phase-2 record content; the enabled set
   // (registered minus disabled) is part of the identity.
   std::vector<std::string> names;
@@ -235,6 +237,8 @@ AnnealIndexPayload AnnealIndexPayload::capture(const GlobalIndex &shard) {
   });
   shard.forEachHeaderStatic(
       [&](const HeaderStaticEntry &e) { p.headerStatics.push_back(e); });
+  shard.forEachExceptionSpec(
+      [&](const ExceptionSpecEntry &e) { p.exceptionSpecs.push_back(e); });
   const auto &types = shard.typeRelations();
   types.forEachBase([&](const std::string &d, const std::string &b) {
     p.baseEdges.emplace_back(d, b);
@@ -267,6 +271,8 @@ void AnnealIndexPayload::applyTo(GlobalIndex &into) const {
     into.addFunctionSummary(e);
   for (const auto &e : headerStatics)
     into.addHeaderStatic(e);
+  for (const auto &e : exceptionSpecs)
+    into.addExceptionSpec(e);
   auto &types = into.mutableTypeRelations();
   for (const auto &p : baseEdges)
     types.addBase(p.first, p.second);
@@ -414,6 +420,14 @@ void encodeIndexPayload(std::string &out, const AnnealIndexPayload &p) {
     for (const auto &tu : e.tuPaths)
       putStr(out, tu);
   }
+  putU32(out, static_cast<uint32_t>(p.exceptionSpecs.size()));
+  for (const auto &e : p.exceptionSpecs) {
+    putStr(out, e.qualifiedName);
+    putStr(out, e.signature);
+    putU8(out, e.isNoexcept ? 1 : 0);
+    putStr(out, e.filePath);
+    putU32(out, e.line);
+  }
 }
 
 bool decodeIndexPayload(Reader &r, AnnealIndexPayload &p) {
@@ -547,6 +561,16 @@ bool decodeIndexPayload(Reader &r, AnnealIndexPayload &p) {
     for (uint32_t j = 0; j < nTu && r.ok; ++j)
       e.tuPaths.push_back(r.str());
     p.headerStatics.push_back(std::move(e));
+  }
+  uint32_t nXs = r.u32();
+  for (uint32_t i = 0; i < nXs && r.ok; ++i) {
+    ExceptionSpecEntry e;
+    e.qualifiedName = r.str();
+    e.signature = r.str();
+    e.isNoexcept = r.u8() != 0;
+    e.filePath = r.str();
+    e.line = r.u32();
+    p.exceptionSpecs.push_back(std::move(e));
   }
   return r.ok;
 }
@@ -832,8 +856,8 @@ namespace {
 // on read (workers write complete files then exit 0).
 // v2: index payloads gained odrEntries. v3: specializations.
 // v4: defaultArgs. v5: staticInits. v6: functionSummaries.
-// v7: headerStatics.
-constexpr uint32_t kShardVersion = 7;
+// v7: headerStatics. v8: exceptionSpecs.
+constexpr uint32_t kShardVersion = 8;
 
 bool writeShardFile(const std::string &path, const char magic[4],
                     const std::vector<std::pair<std::string, std::string>>
