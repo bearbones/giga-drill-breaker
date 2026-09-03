@@ -135,8 +135,9 @@ Spelling: expose tool names with hyphens on the command line
 - **Stream, do not materialize.** NDJSON output should be written record
   by record to `raw_ostream`. `ControlFlowOracle::dumpIndexToJson` builds
   the entire index as one `std::ostringstream` string — at 6.37M call
-  sites that is gigabytes of transient heap for a dump nobody can read in
-  one piece anyway.
+  sites, a few hundred bytes per record puts that on the order of
+  gigabytes of transient heap for a dump nobody can read in one piece
+  anyway.
 - **Exit codes:** 0 = answered with results; 1 = answered, empty (not
   found, no paths, no dead code) — the `grep` convention; 2 = usage or
   argument error; 3 = index missing, stale (config mismatch, format
@@ -208,17 +209,21 @@ to build:
 in the header: byte offset and length for meta, graph interner, nodes,
 edges, hierarchy/returns, CF interner, CF contexts, channels. Then:
 
-- Load the CF index only for tools that read it (`query_exception_safety`,
-  `query_call_site_context`, `query_raii_scopes_at_callsite`, the lock
-  tools, `list_callback_sites`/`list_concurrency_entry_points` if they
-  read contexts, channel tools). `get_callers`, `get_callees`,
-  `search_functions`, `lookup_function`, `find_call_chain`,
-  `analyze_dead_code`, `get_class_hierarchy`, `graph_summary`,
-  `list_entry_points` need only the graph. Contexts were the 6.1 s of an
-  11.1 s load before v5 and are still the bulk; expect graph-only
-  queries to load in well under a second at this scale. Record the
-  per-section split with `--stats-json` first so the estimate is
-  replaced by a number.
+- Load the CF index only for tools that read it. From the handler
+  bodies: `query_exception_safety` (via the oracle),
+  `query_call_site_context`, `query_raii_scopes_at_callsite`,
+  `query_locks_held`, `query_same_lock`, and the four channel tools
+  (`list_channels`, `query_channel`, `query_channels_for_function`,
+  `explain_ordering`, which read the channel section) need it.
+  `get_callers`, `get_callees`, `search_functions`, `lookup_function`,
+  `find_call_chain`, `analyze_dead_code`, `get_class_hierarchy`,
+  `list_entry_points`, `list_callback_sites`,
+  `list_concurrency_entry_points` touch only the graph; `graph_summary`
+  reads only the CF index's size, which the section table can carry.
+  Contexts were the 6.1 s of an 11.1 s load before v5 and are still the
+  bulk; expect graph-only queries to load in well under a second at this
+  scale. Record the per-section split with `--stats-json` first so the
+  estimate is replaced by a number.
 - Declare per-tool needs in `McpToolEntry` (a small `Needs` bitmask) so
   the CLI dispatcher knows what to load, and `batch`/`serve` load
   everything.
@@ -298,10 +303,12 @@ deliberately not built) are documented. Two gaps:
 ### 4.1 Fold `prism --mode query` into megascope; keep `dump`
 
 `prism`'s five query types overlap the tool set: `exception-protection`
-and `throw-propagation` are `query_exception_safety`, `call-site-context`
-is `query_call_site_context` (but prism's version emits only counts, not
-the scopes and guards), `nearest-catches` and `all-path-contexts` have no
-MCP twin and belong in the tool table. Prism's query output is hand-built
+is `query_exception_safety` (both call `queryExceptionProtection`),
+`call-site-context` is `query_call_site_context` (but prism's version
+emits only counts, not the scopes and guards), and `throw-propagation`,
+`nearest-catches`, and `all-path-contexts` have no MCP twin — the oracle
+methods behind them are reachable only through prism today and belong in
+the tool table. Prism's query output is hand-built
 JSON in `main.cpp` (`nearest-catches`, `call-site-context`) with no string
 escaping — a function or location containing `"` or `\` (user-defined
 literal operators, some lambda spellings) produces invalid JSON. Under
