@@ -404,6 +404,8 @@ mapping and NDJSON/TSV emitters.
 | 10 | Frozen layout or auto-daemon (3.1.5 / 3.1.6) | 6 measured and still slow | large; only if needed |
 | — | D1, D2, D7, D8 | — | trivial, any time |
 
+Status: item 1 and defects D1, D2, D7, D8 landed in #56 (2026-09-03).
+
 Items 1–5 make the CLI real and can land in one or two PRs. Item 6 is the
 one performance change the CLI model actually needs, and it is gated on a
 measurement the tooling already produces. Item 10 exists so the decision

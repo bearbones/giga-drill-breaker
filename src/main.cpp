@@ -1343,7 +1343,9 @@ int main(int argc, const char **argv) {
       auto baked = vycor::bakeIndexes(
           *compDb, files, collapsePaths, McpThreads, pchPtr, sysroot, lockCfg,
           /*stats=*/nullptr,
-          [](const std::string &f) { llvm::errs() << "WORKER-TU " << f << "\n"; },
+          [](const std::string &f) {
+            llvm::errs() << "WORKER-TU " << f << "\n";
+          },
           channelCfg);
       vycor::SnapshotMeta meta;
       meta.collapsePaths = collapsePaths;

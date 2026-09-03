@@ -166,7 +166,8 @@ llvm::json::Value McpServer::handleToolsCall(
     const llvm::json::Object &params) {
   auto toolName = params.getString("name");
   if (!toolName) {
-    return mcpTextResult("Missing 'name' field in tools/call request", /*isError=*/true);
+    return mcpTextResult("Missing 'name' field in tools/call request",
+                         /*isError=*/true);
   }
 
   // Look up tool by name.
@@ -177,7 +178,8 @@ llvm::json::Value McpServer::handleToolsCall(
 
   auto it = handlers_.find(toolName->str());
   if (it == handlers_.end()) {
-    return mcpTextResult("Unknown tool: " + toolName->str(), /*isError=*/true);
+    return mcpTextResult("Unknown tool: " + toolName->str(),
+                         /*isError=*/true);
   }
 
   // Extract arguments.
@@ -190,10 +192,12 @@ llvm::json::Value McpServer::handleToolsCall(
   if (*toolName == "reindex_tu") {
     auto filePath = args.getString("file");
     if (!filePath) {
-      return mcpTextResult("Missing required 'file' argument", /*isError=*/true);
+      return mcpTextResult("Missing required 'file' argument",
+                           /*isError=*/true);
     }
     if (!buildParams_.compDb) {
-      return mcpTextResult("reindex_tu unavailable: no compilation database", /*isError=*/true);
+      return mcpTextResult("reindex_tu unavailable: no compilation database",
+                           /*isError=*/true);
     }
     auto r = reindexTU(filePath->str());
     std::string msg = "Reindexed " + filePath->str() + "\n" +
@@ -201,7 +205,7 @@ llvm::json::Value McpServer::handleToolsCall(
                       ", total edges: " + std::to_string(r.edgesAfter) + "\n" +
                       "Contexts removed: " + std::to_string(r.contextsRemoved) +
                       ", total contexts: " + std::to_string(r.contextsAfter);
-    return mcpTextResult(std::move(msg));
+    return mcpTextResult(msg);
   }
 
   ToolContext ctx{graph_,       oracle_,    cfIndex_,

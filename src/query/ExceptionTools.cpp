@@ -23,6 +23,7 @@
 #include "llvm/ADT/StringRef.h"
 
 #include <algorithm>
+#include <cctype>
 #include <map>
 #include <optional>
 #include <set>

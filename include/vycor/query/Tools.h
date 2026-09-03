@@ -89,7 +89,8 @@ struct ToolEntry {
   std::string name;
   std::string description;
   llvm::json::Value inputSchema; // JSON Schema object
-  ToolHandler handler;           // null for adapter-implemented tools (reindex_tu)
+  // Null for adapter-implemented tools (reindex_tu mutates the indexes).
+  ToolHandler handler;
 };
 
 /// Returns the list of all registered tools, in tools/list order.

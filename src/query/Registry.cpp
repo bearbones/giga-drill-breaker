@@ -16,7 +16,6 @@
 
 #include "vycor/query/Tools.h"
 #include "Registry.h"
-#include "Schema.h"
 
 namespace vycor {
 
