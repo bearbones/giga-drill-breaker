@@ -309,12 +309,14 @@ over stdio.
   --snapshot /tmp/proj.snap
 ```
 
-**17 MCP tools**: `search_functions`, `lookup_function`, `get_callees`,
+**21 MCP tools**: `search_functions`, `lookup_function`, `get_callees`,
 `get_callers`, `find_call_chain`, `query_exception_safety`,
 `query_call_site_context`, `query_raii_scopes_at_callsite`,
 `query_locks_held`, `query_same_lock`, `analyze_dead_code`,
 `get_class_hierarchy`, `list_entry_points`, `graph_summary`,
-`list_callback_sites`, `list_concurrency_entry_points`, `reindex_tu`.
+`list_callback_sites`, `list_concurrency_entry_points`, `list_channels`,
+`query_channel`, `query_channels_for_function`, `explain_ordering`,
+`reindex_tu`.
 See `docs/mcp-usage.md`.
 
 Scaling flags: `--snapshot` (warm starts — only changed TUs are
@@ -368,14 +370,17 @@ include/vycor/
                                 CallGraphBuilder, ControlFlowIndex,
                                 ControlFlowOracle, ChannelIndex, Snapshot,
                                 CollapseFilter, WorkerPool)
-  mcp/                          MCP server (McpServer, McpTools, McpProtocol)
+  query/                        Transport-neutral megascope tools (Tools.h:
+                                ToolEntry/ToolContext/result contract,
+                                Identity, Serialize)
+  mcp/                          MCP adapter (McpServer, McpProtocol)
   ext/                          Organization extension API (Extensions.h,
                                 OrgConfig.h)
   compat/                       LLVM-version compat, PCH cache, tool adjusters
 
 src/
   main.cpp                      CLI entry point (anneal/morph/prism/megascope)
-  anneal/ morph/ callgraph/ mcp/ ext/ compat/   Implementations
+  anneal/ morph/ callgraph/ query/ mcp/ ext/ compat/   Implementations
 
 ext/                            Organization slot-in (fork-owned; globbed
                                 into the build — see ext/README.md)

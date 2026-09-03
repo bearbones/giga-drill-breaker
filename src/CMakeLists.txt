@@ -21,7 +21,14 @@ add_library(vycor_lib
   callgraph/WorkerPool.cpp
   mcp/McpProtocol.cpp
   mcp/McpServer.cpp
-  mcp/McpTools.cpp
+  query/Serialize.cpp
+  query/Identity.cpp
+  query/GraphTools.cpp
+  query/ExceptionTools.cpp
+  query/LockTools.cpp
+  query/DeadCodeTools.cpp
+  query/ChannelTools.cpp
+  query/Registry.cpp
   ext/Extensions.cpp
   ext/OrgConfig.cpp
 )

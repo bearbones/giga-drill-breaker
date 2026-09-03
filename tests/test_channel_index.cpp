@@ -23,7 +23,7 @@
 #include "vycor/callgraph/ChannelIndex.h"
 #include "vycor/callgraph/ControlFlowIndex.h"
 #include "vycor/callgraph/ControlFlowOracle.h"
-#include "vycor/mcp/McpTools.h"
+#include "vycor/query/Tools.h"
 
 #include <algorithm>
 #include <catch2/catch_test_macros.hpp>
@@ -329,10 +329,10 @@ TEST_CASE("explain_ordering MCP tool proves same-vs-different channel "
 
   ControlFlowOracle oracle(built.graph, built.cfIndex);
   std::vector<std::string> eps = {"main"};
-  McpToolContext ctx{built.graph, oracle, built.cfIndex, eps, &built.channels};
+  ToolContext ctx{built.graph, oracle, built.cfIndex, eps, &built.channels};
 
   auto tools = getRegisteredTools();
-  auto findTool = [&](const std::string &name) -> const McpToolEntry & {
+  auto findTool = [&](const std::string &name) -> const ToolEntry & {
     for (auto &t : tools)
       if (t.name == name)
         return t;
@@ -342,13 +342,8 @@ TEST_CASE("explain_ordering MCP tool proves same-vs-different channel "
 
   // list_channels sees both distinct channels.
   auto listResult = findTool("list_channels").handler({}, ctx);
-  auto *listContent = listResult.getAsObject()
-                          ->getArray("content")
-                          ->front()
-                          .getAsObject();
-  auto listPayload = llvm::json::parse(*listContent->getString("text"));
-  REQUIRE(bool(listPayload));
-  CHECK(listPayload->getAsObject()->getInteger("count") == 2);
+  REQUIRE(listResult.getAsObject() != nullptr);
+  CHECK(listResult.getAsObject()->getInteger("count") == 2);
 
   // explain_ordering on the two producer sites proves they're different
   // channels — the core fact the motivating flaky-test investigation
@@ -357,13 +352,8 @@ TEST_CASE("explain_ordering MCP tool proves same-vs-different channel "
   args["call_site_a"] = siteA;
   args["call_site_b"] = siteB;
   auto explainResult = findTool("explain_ordering").handler(args, ctx);
-  auto *explainContent = explainResult.getAsObject()
-                             ->getArray("content")
-                             ->front()
-                             .getAsObject();
-  auto explainPayload = llvm::json::parse(*explainContent->getString("text"));
-  REQUIRE(bool(explainPayload));
-  CHECK(explainPayload->getAsObject()->getBoolean("sameChannel") == false);
+  REQUIRE(explainResult.getAsObject() != nullptr);
+  CHECK(explainResult.getAsObject()->getBoolean("sameChannel") == false);
 
   llvm::sys::fs::remove(built.path);
 }

@@ -271,9 +271,10 @@ Start from a known function deep in the call tree and walk upward:
 ```python
 # Find what calls handleServerSecurityMessageV2
 r = call(proc, 1, "get_callers",
-         {"name": "RBX::Network::ClientReplicator::handleServerSecurityMessageV2",
-          "max_depth": 3})
-# Each unique callerName with zero callers of its own is a real entry point
+         {"name": "RBX::Network::ClientReplicator::handleServerSecurityMessageV2"})
+# get_callers is one level deep (there is no max_depth); repeat on each
+# unique callerName to walk upward. A caller with zero callers of its own
+# is a real entry point.
 ```
 
 Identical edges from multiple TUs are deduplicated server-side; distinct
@@ -309,8 +310,7 @@ try/catch blocks:
 ```python
 # Get callers of the target
 callers = call(proc, 3, "get_callers",
-               {"name": "RBX::Network::SecurityChannel::sendCounter",
-                "max_depth": 1})
+               {"name": "RBX::Network::SecurityChannel::sendCounter"})
 
 # Check each unique call site
 seen = set()

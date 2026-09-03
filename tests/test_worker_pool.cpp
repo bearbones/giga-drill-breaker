@@ -171,6 +171,7 @@ void writeShard(const std::string &shardPath,
                 const std::vector<std::string> &batch) {
   CallGraph g;
   ControlFlowIndex cf;
+  ChannelIndex channels;
   for (const auto &tu : batch) {
     std::string fn = "fn@" + tu;
     g.addNode({fn, tu, 1, false, false, ""}, tu);
@@ -179,9 +180,19 @@ void writeShard(const std::string &shardPath,
                tu + ":2:3", 0, ExecutionContext::Synchronous},
               tu);
     cf.addCallSiteContext(makeContext(fn, "common", tu + ":2:3", tu));
+    ChannelSite site;
+    site.channelId = "chan@" + tu;
+    site.channelTypeName = "Queue";
+    site.category = "queue";
+    site.op = ChannelOperation::Produce;
+    site.siteFunctionUsr = fn;
+    site.siteFunctionDisplay = fn;
+    site.callSite = tu + ":3:1";
+    site.tuPath = tu;
+    channels.addSite(std::move(site));
   }
   SnapshotMeta meta;
-  REQUIRE(SnapshotIO::save(shardPath, g, cf, meta));
+  REQUIRE(SnapshotIO::save(shardPath, g, cf, meta, channels));
 }
 
 void writeMarkers(const std::string &stderrPath,
@@ -452,6 +463,11 @@ TEST_CASE("dispatcher absorbs clean batches", "[worker_pool][dispatcher]") {
   CHECK(out.graph.nodeCount() == files.size() + 1); // + shared "common"
   CHECK(out.graph.edgeCount() == files.size());     // distinct call sites
   CHECK(out.cfIndex.size() == files.size());
+  // Channel sites ride the shard too (D7: --channel-types-json under
+  // --isolate-workers used to leave the merged index empty).
+  CHECK(out.channels.size() == files.size());
+  for (const auto &tu : files)
+    CHECK(out.channels.producersOf("chan@" + tu).size() == 1);
   CHECK(stats.tuStats.size() == files.size());
   CHECK(stats.crashCount() == 0);
   for (const auto &t : stats.tuStats)

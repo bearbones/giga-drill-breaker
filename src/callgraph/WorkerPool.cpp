@@ -266,6 +266,7 @@ BakedIndexes bakeIsolatedWithRunner(const WorkerRunner &runner,
                        << " records a different build configuration\n";
         out.graph.absorb(snap->graph);
         out.cfIndex.absorb(snap->cfIndex);
+        out.channels.absorb(snap->channels);
         if (stats) {
           // Honest per-TU accounting isn't available across a batch; record
           // the batch wall divided evenly rather than faking parse times.
@@ -299,7 +300,7 @@ WorkerRunner makeSubprocessRunner(const std::string &selfExe,
                         const std::string &shardPath,
                         const std::string &stderrPath) -> int {
     std::vector<std::string> argv;
-    argv.reserve(12 + 2 * batch.size());
+    argv.reserve(16 + 2 * batch.size());
     argv.push_back(selfExe);
     argv.push_back("megascope");
     argv.push_back("--bake-worker");
@@ -324,6 +325,14 @@ WorkerRunner makeSubprocessRunner(const std::string &selfExe,
     for (const auto &t : cfg.lockTypes) {
       argv.push_back("--lock-types");
       argv.push_back(t);
+    }
+    if (!cfg.channelTypesJson.empty()) {
+      argv.push_back("--channel-types-json");
+      argv.push_back(cfg.channelTypesJson);
+    }
+    if (!cfg.orgConfig.empty()) {
+      argv.push_back("--org-config");
+      argv.push_back(cfg.orgConfig);
     }
     for (const auto &f : batch) {
       argv.push_back("--source");

@@ -46,6 +46,11 @@ struct McpBakeConfig {
   std::vector<std::string> extraArgs;
   std::string sysroot;
   std::vector<std::string> lockTypes; // LockTypeConfig::userAllowlist
+  /// Forwarded verbatim as --channel-types-json / --org-config so the
+  /// worker rebuilds the same ChannelTypeConfig the parent merged (CLI
+  /// JSON first, then org-config/registry types, deduped). Empty = off.
+  std::string channelTypesJson;
+  std::string orgConfig;
 };
 
 /// Test seam: run one worker over `batch`, writing its snapshot shard to

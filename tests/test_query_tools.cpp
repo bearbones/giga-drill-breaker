@@ -19,7 +19,7 @@
 #include "vycor/callgraph/ControlFlowIndex.h"
 #include "vycor/callgraph/ControlFlowOracle.h"
 #include "vycor/mcp/McpProtocol.h"
-#include "vycor/mcp/McpTools.h"
+#include "vycor/query/Tools.h"
 
 #include "llvm/Support/JSON.h"
 
@@ -169,33 +169,14 @@ static ControlFlowIndex buildTestCfIndex() {
   return idx;
 }
 
-// Helper: extract the text from an MCP tool result.
+// Helper: the payload object of a successful tool result.
 static llvm::json::Object parseToolResult(const llvm::json::Value &result) {
   auto *obj = result.getAsObject();
   REQUIRE(obj != nullptr);
-  auto *content = obj->getArray("content");
-  REQUIRE(content != nullptr);
-  REQUIRE(content->size() >= 1);
-  auto *first = (*content)[0].getAsObject();
-  REQUIRE(first != nullptr);
-  auto text = first->getString("text");
-  REQUIRE(text.has_value());
-
-  auto parsed = llvm::json::parse(*text);
-  REQUIRE(static_cast<bool>(parsed));
-  auto *parsedObj = parsed->getAsObject();
-  REQUIRE(parsedObj != nullptr);
-  return std::move(*parsedObj);
+  REQUIRE_FALSE(isErrorResult(result));
+  return *obj;
 }
 
-static bool isErrorResult(const llvm::json::Value &result) {
-  auto *obj = result.getAsObject();
-  if (!obj)
-    return false;
-  if (auto b = obj->getBoolean("isError"))
-    return *b;
-  return false;
-}
 
 // ============================================================================
 // Protocol tests
@@ -458,10 +439,10 @@ TEST_CASE("search_functions tool", "[mcp][tools]") {
   ControlFlowIndex cfIndex;
   ControlFlowOracle oracle(graph, cfIndex);
   std::vector<std::string> eps = {"main"};
-  McpToolContext ctx{graph, oracle, cfIndex, eps};
+  ToolContext ctx{graph, oracle, cfIndex, eps};
 
   auto tools = getRegisteredTools();
-  McpToolHandler handler;
+  ToolHandler handler;
   for (auto &t : tools) {
     if (t.name == "search_functions") {
       handler = t.handler;
@@ -516,10 +497,10 @@ TEST_CASE("lookup_function tool", "[mcp][tools]") {
   ControlFlowIndex cfIndex;
   ControlFlowOracle oracle(graph, cfIndex);
   std::vector<std::string> eps = {"main"};
-  McpToolContext ctx{graph, oracle, cfIndex, eps};
+  ToolContext ctx{graph, oracle, cfIndex, eps};
 
   auto tools = getRegisteredTools();
-  McpToolHandler handler;
+  ToolHandler handler;
   for (auto &t : tools) {
     if (t.name == "lookup_function") {
       handler = t.handler;
@@ -559,10 +540,10 @@ TEST_CASE("get_callees tool", "[mcp][tools]") {
   ControlFlowIndex cfIndex;
   ControlFlowOracle oracle(graph, cfIndex);
   std::vector<std::string> eps = {"main"};
-  McpToolContext ctx{graph, oracle, cfIndex, eps};
+  ToolContext ctx{graph, oracle, cfIndex, eps};
 
   auto tools = getRegisteredTools();
-  McpToolHandler handler;
+  ToolHandler handler;
   for (auto &t : tools) {
     if (t.name == "get_callees") {
       handler = t.handler;
@@ -607,10 +588,10 @@ TEST_CASE("get_callers tool", "[mcp][tools]") {
   ControlFlowIndex cfIndex;
   ControlFlowOracle oracle(graph, cfIndex);
   std::vector<std::string> eps = {"main"};
-  McpToolContext ctx{graph, oracle, cfIndex, eps};
+  ToolContext ctx{graph, oracle, cfIndex, eps};
 
   auto tools = getRegisteredTools();
-  McpToolHandler handler;
+  ToolHandler handler;
   for (auto &t : tools) {
     if (t.name == "get_callers") {
       handler = t.handler;
@@ -641,10 +622,10 @@ TEST_CASE("find_call_chain tool", "[mcp][tools]") {
   ControlFlowIndex cfIndex;
   ControlFlowOracle oracle(graph, cfIndex);
   std::vector<std::string> eps = {"main"};
-  McpToolContext ctx{graph, oracle, cfIndex, eps};
+  ToolContext ctx{graph, oracle, cfIndex, eps};
 
   auto tools = getRegisteredTools();
-  McpToolHandler handler;
+  ToolHandler handler;
   for (auto &t : tools) {
     if (t.name == "find_call_chain") {
       handler = t.handler;
@@ -717,10 +698,10 @@ TEST_CASE("query_call_site_context tool", "[mcp][tools]") {
   auto cfIndex = buildTestCfIndex();
   ControlFlowOracle oracle(graph, cfIndex);
   std::vector<std::string> eps = {"main"};
-  McpToolContext ctx{graph, oracle, cfIndex, eps};
+  ToolContext ctx{graph, oracle, cfIndex, eps};
 
   auto tools = getRegisteredTools();
-  McpToolHandler handler;
+  ToolHandler handler;
   for (auto &t : tools) {
     if (t.name == "query_call_site_context") {
       handler = t.handler;
@@ -753,10 +734,10 @@ TEST_CASE("analyze_dead_code tool", "[mcp][tools]") {
   ControlFlowIndex cfIndex;
   ControlFlowOracle oracle(graph, cfIndex);
   std::vector<std::string> eps = {"main"};
-  McpToolContext ctx{graph, oracle, cfIndex, eps};
+  ToolContext ctx{graph, oracle, cfIndex, eps};
 
   auto tools = getRegisteredTools();
-  McpToolHandler handler;
+  ToolHandler handler;
   for (auto &t : tools) {
     if (t.name == "analyze_dead_code") {
       handler = t.handler;
@@ -795,10 +776,10 @@ TEST_CASE("get_class_hierarchy tool", "[mcp][tools]") {
   ControlFlowIndex cfIndex;
   ControlFlowOracle oracle(graph, cfIndex);
   std::vector<std::string> eps = {"main"};
-  McpToolContext ctx{graph, oracle, cfIndex, eps};
+  ToolContext ctx{graph, oracle, cfIndex, eps};
 
   auto tools = getRegisteredTools();
-  McpToolHandler handler;
+  ToolHandler handler;
   for (auto &t : tools) {
     if (t.name == "get_class_hierarchy") {
       handler = t.handler;
@@ -846,10 +827,10 @@ TEST_CASE("get_callees with include_confidences selects exact tiers",
   ControlFlowIndex cfIndex;
   ControlFlowOracle oracle(graph, cfIndex);
   std::vector<std::string> eps = {"main"};
-  McpToolContext ctx{graph, oracle, cfIndex, eps};
+  ToolContext ctx{graph, oracle, cfIndex, eps};
 
   auto tools = getRegisteredTools();
-  McpToolHandler handler;
+  ToolHandler handler;
   for (auto &t : tools) {
     if (t.name == "get_callees") {
       handler = t.handler;
@@ -905,10 +886,10 @@ TEST_CASE("analyze_dead_code filters system headers and paginates",
   ControlFlowIndex cfIndex;
   ControlFlowOracle oracle(graph, cfIndex);
   std::vector<std::string> eps = {"main"};
-  McpToolContext ctx{graph, oracle, cfIndex, eps};
+  ToolContext ctx{graph, oracle, cfIndex, eps};
 
   auto tools = getRegisteredTools();
-  McpToolHandler handler;
+  ToolHandler handler;
   for (auto &t : tools) {
     if (t.name == "analyze_dead_code") {
       handler = t.handler;
@@ -986,10 +967,10 @@ TEST_CASE("query_call_site_context surfaces malformed and unindexed input",
   auto cfIndex = buildTestCfIndex();
   ControlFlowOracle oracle(graph, cfIndex);
   std::vector<std::string> eps = {"main"};
-  McpToolContext ctx{graph, oracle, cfIndex, eps};
+  ToolContext ctx{graph, oracle, cfIndex, eps};
 
   auto tools = getRegisteredTools();
-  McpToolHandler handler;
+  ToolHandler handler;
   for (auto &t : tools) {
     if (t.name == "query_call_site_context") {
       handler = t.handler;
@@ -1029,10 +1010,10 @@ TEST_CASE("list_entry_points returns configured entries", "[mcp][tools]") {
   ControlFlowIndex cfIndex;
   ControlFlowOracle oracle(graph, cfIndex);
   std::vector<std::string> eps = {"main"};
-  McpToolContext ctx{graph, oracle, cfIndex, eps};
+  ToolContext ctx{graph, oracle, cfIndex, eps};
 
   auto tools = getRegisteredTools();
-  McpToolHandler handler;
+  ToolHandler handler;
   for (auto &t : tools) {
     if (t.name == "list_entry_points") {
       handler = t.handler;
@@ -1060,10 +1041,10 @@ TEST_CASE("graph_summary produces histograms and top-N fanout",
   ControlFlowIndex cfIndex;
   ControlFlowOracle oracle(graph, cfIndex);
   std::vector<std::string> eps = {"main"};
-  McpToolContext ctx{graph, oracle, cfIndex, eps};
+  ToolContext ctx{graph, oracle, cfIndex, eps};
 
   auto tools = getRegisteredTools();
-  McpToolHandler handler;
+  ToolHandler handler;
   for (auto &t : tools) {
     if (t.name == "graph_summary") {
       handler = t.handler;
@@ -1112,7 +1093,7 @@ TEST_CASE("graph_summary produces histograms and top-N fanout",
 // ============================================================================
 
 namespace {
-McpToolHandler findHandler(const std::vector<McpToolEntry> &tools,
+ToolHandler findHandler(const std::vector<ToolEntry> &tools,
                            llvm::StringRef name) {
   for (auto &t : tools)
     if (t.name == name)
@@ -1127,7 +1108,7 @@ TEST_CASE("get_callees surfaces ThreadEntry edges with execution context",
   ControlFlowIndex cfIndex;
   ControlFlowOracle oracle(graph, cfIndex);
   std::vector<std::string> eps = {"main"};
-  McpToolContext ctx{graph, oracle, cfIndex, eps};
+  ToolContext ctx{graph, oracle, cfIndex, eps};
 
   auto tools = getRegisteredTools();
   auto handler = findHandler(tools, "get_callees");
@@ -1225,7 +1206,7 @@ TEST_CASE("list_callback_sites groups callback edges by target",
   ControlFlowIndex cfIndex;
   ControlFlowOracle oracle(graph, cfIndex);
   std::vector<std::string> eps = {"main"};
-  McpToolContext ctx{graph, oracle, cfIndex, eps};
+  ToolContext ctx{graph, oracle, cfIndex, eps};
 
   auto tools = getRegisteredTools();
   auto handler = findHandler(tools, "list_callback_sites");
@@ -1294,7 +1275,7 @@ TEST_CASE("list_concurrency_entry_points enumerates ThreadEntry edges",
   ControlFlowIndex cfIndex;
   ControlFlowOracle oracle(graph, cfIndex);
   std::vector<std::string> eps = {"main"};
-  McpToolContext ctx{graph, oracle, cfIndex, eps};
+  ToolContext ctx{graph, oracle, cfIndex, eps};
 
   auto tools = getRegisteredTools();
   auto handler = findHandler(tools, "list_concurrency_entry_points");
@@ -1363,7 +1344,7 @@ TEST_CASE("find_call_chain propagates executionContext per hop",
   ControlFlowIndex cfIndex;
   ControlFlowOracle oracle(graph, cfIndex);
   std::vector<std::string> eps = {"main"};
-  McpToolContext ctx{graph, oracle, cfIndex, eps};
+  ToolContext ctx{graph, oracle, cfIndex, eps};
 
   auto tools = getRegisteredTools();
   auto handler = findHandler(tools, "find_call_chain");
@@ -1408,7 +1389,7 @@ TEST_CASE("find_call_chain propagates executionContext per hop",
 // ============================================================================
 
 // Helper: pluck a named tool's handler from getRegisteredTools().
-static McpToolHandler findHandler(const std::string &name) {
+static ToolHandler findHandler(const std::string &name) {
   auto tools = getRegisteredTools();
   for (auto &t : tools) {
     if (t.name == name)
@@ -1491,7 +1472,7 @@ TEST_CASE("query_raii_scopes_at_callsite returns locals and respects kinds",
 
   ControlFlowOracle oracle(graph, cf);
   std::vector<std::string> eps = {"caller"};
-  McpToolContext ctx{graph, oracle, cf, eps};
+  ToolContext ctx{graph, oracle, cf, eps};
   auto handler = findHandler("query_raii_scopes_at_callsite");
   REQUIRE(handler);
 
@@ -1550,7 +1531,7 @@ TEST_CASE("query_locks_held finds lock two frames up",
 
   ControlFlowOracle oracle(graph, cf);
   std::vector<std::string> eps = {"entry"};
-  McpToolContext ctx{graph, oracle, cf, eps};
+  ToolContext ctx{graph, oracle, cf, eps};
   auto handler = findHandler("query_locks_held");
   REQUIRE(handler);
 
@@ -1596,7 +1577,7 @@ TEST_CASE("query_locks_held respects max_depth",
 
   ControlFlowOracle oracle(graph, cf);
   std::vector<std::string> eps = {"entry"};
-  McpToolContext ctx{graph, oracle, cf, eps};
+  ToolContext ctx{graph, oracle, cf, eps};
   auto handler = findHandler("query_locks_held");
   REQUIRE(handler);
 
@@ -1646,7 +1627,7 @@ TEST_CASE("query_same_lock intersects locks across two targets",
 
   ControlFlowOracle oracle(graph, cf);
   std::vector<std::string> eps = {"entry"};
-  McpToolContext mctx{graph, oracle, cf, eps};
+  ToolContext mctx{graph, oracle, cf, eps};
   auto handler = findHandler("query_same_lock");
   REQUIRE(handler);
 
@@ -1708,7 +1689,7 @@ TEST_CASE("query_same_lock returns empty intersection when locks differ",
 
   ControlFlowOracle oracle(graph, cf);
   std::vector<std::string> eps = {"entry"};
-  McpToolContext mctx{graph, oracle, cf, eps};
+  ToolContext mctx{graph, oracle, cf, eps};
   auto handler = findHandler("query_same_lock");
   REQUIRE(handler);
 
