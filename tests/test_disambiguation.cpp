@@ -29,7 +29,7 @@
 #include "vycor/callgraph/CallGraphBuilder.h"
 #include "vycor/callgraph/ControlFlowIndex.h"
 #include "vycor/callgraph/ControlFlowOracle.h"
-#include "vycor/mcp/McpTools.h"
+#include "vycor/query/Tools.h"
 
 #include "llvm/Support/JSON.h"
 
@@ -58,7 +58,7 @@ CallGraph buildPrecisionGraph(const std::vector<std::string> &files) {
   return buildCallGraph(compDb, paths);
 }
 
-McpToolHandler findHandler(llvm::StringRef name) {
+ToolHandler findHandler(llvm::StringRef name) {
   for (auto &t : getRegisteredTools()) {
     if (t.name == name)
       return t.handler;
@@ -66,34 +66,15 @@ McpToolHandler findHandler(llvm::StringRef name) {
   return {};
 }
 
-// Extract the JSON payload from an MCP tool result (same shape helper as
-// test_mcp.cpp).
+// The payload object of a successful tool result (same helper as
+// test_query_tools.cpp).
 llvm::json::Object parseToolResult(const llvm::json::Value &result) {
   auto *obj = result.getAsObject();
   REQUIRE(obj != nullptr);
-  auto *content = obj->getArray("content");
-  REQUIRE(content != nullptr);
-  REQUIRE(content->size() >= 1);
-  auto *first = (*content)[0].getAsObject();
-  REQUIRE(first != nullptr);
-  auto text = first->getString("text");
-  REQUIRE(text.has_value());
-
-  auto parsed = llvm::json::parse(*text);
-  REQUIRE(static_cast<bool>(parsed));
-  auto *parsedObj = parsed->getAsObject();
-  REQUIRE(parsedObj != nullptr);
-  return std::move(*parsedObj);
+  REQUIRE_FALSE(isErrorResult(result));
+  return *obj;
 }
 
-bool isErrorResult(const llvm::json::Value &result) {
-  auto *obj = result.getAsObject();
-  if (!obj)
-    return false;
-  if (auto b = obj->getBoolean("isError"))
-    return *b;
-  return false;
-}
 
 // Pull the sorted candidate usr list out of an ambiguous response, asserting
 // the full response shape along the way.
@@ -130,7 +111,7 @@ TEST_CASE("get_callers disambiguates overloads by name and answers "
   ControlFlowOracle oracle(graph, cfIndex);
   std::vector<std::string> eps = {"precision::fromCString",
                                   "precision::fromDouble"};
-  McpToolContext ctx{graph, oracle, cfIndex, eps};
+  ToolContext ctx{graph, oracle, cfIndex, eps};
 
   auto handler = findHandler("get_callers");
   REQUIRE(handler);
@@ -181,7 +162,7 @@ TEST_CASE("lookup_function disambiguates and resolves by usr",
   ControlFlowIndex cfIndex;
   ControlFlowOracle oracle(graph, cfIndex);
   std::vector<std::string> eps = {"precision::fromCString"};
-  McpToolContext ctx{graph, oracle, cfIndex, eps};
+  ToolContext ctx{graph, oracle, cfIndex, eps};
 
   auto handler = findHandler("lookup_function");
   REQUIRE(handler);
@@ -235,7 +216,7 @@ TEST_CASE("get_callers with a unique name is unchanged",
   ControlFlowIndex cfIndex;
   ControlFlowOracle oracle(graph, cfIndex);
   std::vector<std::string> eps = {"precision::fromCString"};
-  McpToolContext ctx{graph, oracle, cfIndex, eps};
+  ToolContext ctx{graph, oracle, cfIndex, eps};
 
   auto handler = findHandler("get_callers");
   REQUIRE(handler);
@@ -263,7 +244,7 @@ TEST_CASE("call-site tools disambiguate a macro-shared spelling by caller",
   auto cfIndex = buildControlFlowIndex(compDb, paths, graph);
   ControlFlowOracle oracle(graph, cfIndex);
   std::vector<std::string> eps = {"precision::userOne", "precision::userTwo"};
-  McpToolContext ctx{graph, oracle, cfIndex, eps};
+  ToolContext ctx{graph, oracle, cfIndex, eps};
 
   auto contexts = cfIndex.contextsForCallee("precision::guarded");
   REQUIRE(contexts.size() == 2);
@@ -401,7 +382,7 @@ TEST_CASE("ambiguous candidate list is capped with a by-file summary",
   BigOverloadFixture fx(30);
   ControlFlowOracle oracle(fx.graph, fx.cfIndex);
   std::vector<std::string> eps = {"main"};
-  McpToolContext ctx{fx.graph, oracle, fx.cfIndex, eps};
+  ToolContext ctx{fx.graph, oracle, fx.cfIndex, eps};
   auto handler = findHandler("lookup_function");
   REQUIRE(handler);
 
@@ -437,7 +418,7 @@ TEST_CASE("small ambiguous sets are not truncated",
   BigOverloadFixture fx(3);
   ControlFlowOracle oracle(fx.graph, fx.cfIndex);
   std::vector<std::string> eps = {"main"};
-  McpToolContext ctx{fx.graph, oracle, fx.cfIndex, eps};
+  ToolContext ctx{fx.graph, oracle, fx.cfIndex, eps};
   auto handler = findHandler("lookup_function");
   REQUIRE(handler);
 
@@ -455,7 +436,7 @@ TEST_CASE("filter narrows an ambiguous name", "[mcp][disambiguation][filter]") {
   BigOverloadFixture fx(30);
   ControlFlowOracle oracle(fx.graph, fx.cfIndex);
   std::vector<std::string> eps = {"main"};
-  McpToolContext ctx{fx.graph, oracle, fx.cfIndex, eps};
+  ToolContext ctx{fx.graph, oracle, fx.cfIndex, eps};
   auto handler = findHandler("lookup_function");
   REQUIRE(handler);
 
@@ -498,7 +479,7 @@ TEST_CASE("site resolves an ambiguous name to the instantiation called there",
   BigOverloadFixture fx(30);
   ControlFlowOracle oracle(fx.graph, fx.cfIndex);
   std::vector<std::string> eps = {"main"};
-  McpToolContext ctx{fx.graph, oracle, fx.cfIndex, eps};
+  ToolContext ctx{fx.graph, oracle, fx.cfIndex, eps};
   auto handler = findHandler("lookup_function");
   REQUIRE(handler);
 
@@ -563,7 +544,7 @@ TEST_CASE("macro-shared site with distinct callees lists the small set",
 
   ControlFlowOracle oracle(fx.graph, fx.cfIndex);
   std::vector<std::string> eps = {"main"};
-  McpToolContext ctx{fx.graph, oracle, fx.cfIndex, eps};
+  ToolContext ctx{fx.graph, oracle, fx.cfIndex, eps};
   auto handler = findHandler("lookup_function");
   REQUIRE(handler);
 

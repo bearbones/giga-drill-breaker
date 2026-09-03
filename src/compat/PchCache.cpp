@@ -221,7 +221,7 @@ void PchCache::buildFromCompileCommands(
     int rc = std::system(cmd.c_str());
 
     if (rc == 0 && llvm::sys::fs::exists(outPath)) {
-      uint64_t size;
+      uint64_t size = 0;
       llvm::sys::fs::file_size(outPath, size);
       llvm::errs() << "pch-cache: ok (" << size / 1024 / 1024 << " MB)\n";
       cache_[pchSrc] = outPath;

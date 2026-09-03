@@ -144,23 +144,47 @@ Proven `VirtualDispatch` edges (concrete type known) are never expanded.
 are in collapsed paths are skipped. Boundary edges (non-collapsed caller → collapsed callee)
 are preserved. This reduces noise from utility/math headers while keeping entry points visible.
 
-### `mcp` — MCP Server
+### `query` — Transport-Neutral Query Tools
+
+**Headers:** `include/vycor/query/`
+**Sources:** `src/query/`
+
+Every megascope tool is a pure function `(json::Object args, ToolContext)
+-> json::Value` over the in-memory indexes. Transports (the MCP server
+today, the CLI next) are thin adapters over this table; tests call the
+handlers directly.
+
+| File | Purpose |
+|---|---|
+| `Tools.h` | `ToolContext`, `ToolEntry` (name, description, JSON Schema, handler), `QueryCache`, `getRegisteredTools()`, and the result contract: success = payload object; error = `{"error": msg}` (`errorResult`/`isErrorResult`); ambiguity = `{"ambiguous": true, candidates...}` (`isAmbiguousResult`) |
+| `Identity.h/.cpp` | F8 identity resolution: `resolveIdentity` (name/usr/site/filter → USR), the disambiguation payload, `attachUsr` |
+| `Serialize.h/.cpp` | Enum spellings (`EdgeKind`, `Confidence`, `ExecutionContext`, `ChannelOperation`) and JSON serializers for edges, guards, channel sites — part of the output contract |
+| `GraphTools.cpp` | lookup, search, callers, callees, call chain, class hierarchy, entry points, graph summary, callback/concurrency sites |
+| `ExceptionTools.cpp` | exception safety, call-site context, RAII scopes |
+| `LockTools.cpp` | locks held, same-lock path search |
+| `DeadCodeTools.cpp` | dead-code analysis (cached liveness) |
+| `ChannelTools.cpp` | channel listing/query, channels-for-function, explain-ordering |
+| `Registry.cpp` / `Registry.h` | Composes the per-family `register*Tools` lists into `getRegisteredTools()` (tools/list order); result-contract helpers |
+| `Schema.h` | JSON Schema property builders shared by the registrations |
+
+### `mcp` — MCP Server (adapter)
 
 **Headers:** `include/vycor/mcp/`
 **Sources:** `src/mcp/`
 
 | File | Purpose |
 |---|---|
-| `McpServer.h/.cpp` | JSON-RPC dispatch loop, holds call graph + CF index in memory |
+| `McpServer.h/.cpp` | JSON-RPC dispatch loop; owns the indexes and `QueryCache`; `wrapToolResult` turns a query payload into a `content[0].text` block (error payload → `isError`); implements `reindex_tu` (needs mutable indexes) |
 | `McpProtocol.h/.cpp` | MCP stdio framing: newline-delimited JSON, with Content-Length autodetect for legacy clients |
-| `McpTools.h/.cpp` | Tool implementations: lookup, callers, callees, call chains, exception safety, dead code, class hierarchy |
 
-**17 MCP tools**: `search_functions`, `lookup_function`, `get_callees`,
+**21 MCP tools**: `search_functions`, `lookup_function`, `get_callees`,
 `get_callers`, `find_call_chain`, `query_exception_safety`,
 `query_call_site_context`, `query_raii_scopes_at_callsite`,
 `query_locks_held`, `query_same_lock`, `analyze_dead_code`,
 `get_class_hierarchy`, `list_entry_points`, `graph_summary`,
-`list_callback_sites`, `list_concurrency_entry_points`, `reindex_tu`.
+`list_callback_sites`, `list_concurrency_entry_points`, `list_channels`,
+`query_channel`, `query_channels_for_function`, `explain_ordering`,
+`reindex_tu`.
 
 Identical edges registered by multiple TUs (header-inlined code) are
 **deduplicated at insert** with per-TU refcounting, so `removeTU` only drops

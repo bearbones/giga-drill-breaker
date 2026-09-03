@@ -101,8 +101,7 @@ public:
 
   /// Serialize graph + cfIndex + channels + meta to `path` (atomically, via
   /// a temp file and rename). `channels` defaults to empty so callers that
-  /// don't use --channel-types-json (or the --isolate-workers worker-shard
-  /// path, which doesn't support channel tracking yet) are unaffected.
+  /// don't use --channel-types-json are unaffected.
   /// Returns false on I/O failure.
   static bool save(const std::string &path, const CallGraph &graph,
                    const ControlFlowIndex &cfIndex, const SnapshotMeta &meta,

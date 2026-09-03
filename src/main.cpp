@@ -1329,13 +1329,6 @@ int main(int argc, const char **argv) {
     if (!loadOrgConfigIfSet(McpOrgConfig, orgCfg))
       return 1;
     mergeExtensionConfig(orgCfg, lockCfg, channelCfg, collapsePaths);
-    if (!channelCfg.registeredTypes.empty() && McpIsolateWorkers) {
-      llvm::errs()
-          << "megascope: WARNING: --channel-types-json is not yet supported "
-             "with --isolate-workers — channel tracking will be empty "
-             "unless this run does a fresh non-isolated full build\n";
-    }
-
     // ---- worker mode (spawned by an --isolate-workers parent) ------------
     // Bake the batch with the existing in-process pipeline (crash guard
     // still enabled — first line of defense stays in-process), write the v5
@@ -1349,17 +1342,20 @@ int main(int argc, const char **argv) {
       }
       auto baked = vycor::bakeIndexes(
           *compDb, files, collapsePaths, McpThreads, pchPtr, sysroot, lockCfg,
-          /*stats=*/nullptr, [](const std::string &f) {
+          /*stats=*/nullptr,
+          [](const std::string &f) {
             llvm::errs() << "WORKER-TU " << f << "\n";
-          });
+          },
+          channelCfg);
       vycor::SnapshotMeta meta;
       meta.collapsePaths = collapsePaths;
       meta.lockAllowlist = lockCfg.userAllowlist;
       meta.lockBuiltins = lockCfg.useBuiltins;
+      meta.channelTypes = channelCfg.registeredTypes;
       // meta.files stays empty: the parent ignores shard meta except as a
       // config sanity check.
       if (!vycor::SnapshotIO::save(McpWorkerOut, baked.graph, baked.cfIndex,
-                                   meta)) {
+                                   meta, baked.channels)) {
         llvm::errs() << "megascope: worker: cannot write shard to "
                      << McpWorkerOut << "\n";
         return 1;
@@ -1480,6 +1476,8 @@ int main(int argc, const char **argv) {
         bakeCfg.extraArgs = vycor::globalExtraArgs();
         bakeCfg.sysroot = sysroot;
         bakeCfg.lockTypes = lockCfg.userAllowlist;
+        bakeCfg.channelTypesJson = McpChannelTypesJson;
+        bakeCfg.orgConfig = McpOrgConfig;
         baked = vycor::bakeIsolated(selfExe, bakeCfg, files, workerCount,
                                     &buildStats);
       } else {
@@ -1490,9 +1488,6 @@ int main(int argc, const char **argv) {
       bakeMs = msSince(bakeStart);
       graph = std::move(baked.graph);
       cfIndex = std::move(baked.cfIndex);
-      // Empty when this build went through bakeIsolated (--isolate-workers
-      // doesn't thread channelCfg through the shard/worker protocol yet —
-      // see the warning printed above).
       channels = std::move(baked.channels);
       llvm::errs() << "megascope: indexes built ("
                    << graph.nodeCount() << " nodes, "

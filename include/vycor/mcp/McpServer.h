@@ -20,7 +20,7 @@
 #include "vycor/callgraph/ControlFlowIndex.h"
 #include "vycor/callgraph/ControlFlowOracle.h"
 #include "vycor/mcp/McpProtocol.h"
-#include "vycor/mcp/McpTools.h"
+#include "vycor/query/Tools.h"
 
 #include "clang/Tooling/CompilationDatabase.h"
 
@@ -32,6 +32,14 @@
 namespace vycor {
 
 class PchCache;
+
+/// Translate a query-tool payload (vycor/query/Tools.h result contract)
+/// into an MCP tools/call result: the payload is stringified into one
+/// `content[0].text` block; an error payload becomes `isError: true` with
+/// the bare message as text.
+llvm::json::Value wrapToolResult(const llvm::json::Value &payload);
+/// MCP tools/call result carrying plain text (no JSON payload).
+llvm::json::Value mcpTextResult(llvm::StringRef text, bool isError = false);
 
 struct McpBuildParams {
   std::shared_ptr<clang::tooling::CompilationDatabase> compDb;
@@ -77,7 +85,7 @@ private:
   QueryCache queryCache_;
   bool initialized_ = false;
   // Tool name -> handler, populated lazily on the first tools/call.
-  std::unordered_map<std::string, McpToolHandler> handlers_;
+  std::unordered_map<std::string, ToolHandler> handlers_;
 
   void dispatch(const McpRequest &req);
 

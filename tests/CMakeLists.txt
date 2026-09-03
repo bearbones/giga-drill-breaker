@@ -76,7 +76,8 @@ add_executable(vycor_tests
   test_control_flow.cpp
   test_concurrency_index.cpp
   test_channel_index.cpp
-  test_mcp.cpp
+  test_query_tools.cpp
+  test_mcp_server.cpp
   test_deep_chains.cpp
   test_snapshot.cpp
   test_worker_pool.cpp

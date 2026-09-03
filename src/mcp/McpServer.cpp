@@ -14,7 +14,8 @@
 // limitations under the License.
 
 #include "vycor/mcp/McpServer.h"
-#include "vycor/mcp/McpTools.h"
+#include "vycor/Version.h"
+#include "vycor/query/Tools.h"
 #include "vycor/callgraph/CallGraphBuilder.h"
 #include "vycor/callgraph/ControlFlowIndex.h"
 
@@ -23,6 +24,31 @@
 #include <unordered_map>
 
 namespace vycor {
+
+llvm::json::Value mcpTextResult(llvm::StringRef text, bool isError) {
+  llvm::json::Object content;
+  content["type"] = "text";
+  content["text"] = text.str();
+
+  llvm::json::Array contentArr;
+  contentArr.push_back(llvm::json::Value(std::move(content)));
+
+  llvm::json::Object result;
+  result["content"] = std::move(contentArr);
+  if (isError)
+    result["isError"] = true;
+  return llvm::json::Value(std::move(result));
+}
+
+llvm::json::Value wrapToolResult(const llvm::json::Value &payload) {
+  if (auto msg = errorMessage(payload))
+    return mcpTextResult(*msg, /*isError=*/true);
+  std::string text;
+  llvm::raw_string_ostream os(text);
+  os << payload;
+  os.flush();
+  return mcpTextResult(text);
+}
 
 McpServer::McpServer(CallGraph &&graph, ControlFlowIndex &&cfIndex,
                      ChannelIndex &&channels,
@@ -103,7 +129,7 @@ llvm::json::Value McpServer::handleInitialize(
 
   llvm::json::Object serverInfo;
   serverInfo["name"] = "vycor-cpp";
-  serverInfo["version"] = "0.1.0";
+  serverInfo["version"] = VYCOR_VERSION_STRING;
 
   // Echo the client's requested protocol version: the stdio transport and
   // tools capability are unchanged across spec revisions we care about, so
@@ -140,16 +166,8 @@ llvm::json::Value McpServer::handleToolsCall(
     const llvm::json::Object &params) {
   auto toolName = params.getString("name");
   if (!toolName) {
-    llvm::json::Object content;
-    content["type"] = "text";
-    content["text"] = "Missing 'name' field in tools/call request";
-    llvm::json::Array contentArr;
-    contentArr.push_back(llvm::json::Value(std::move(content)));
-
-    llvm::json::Object result;
-    result["content"] = std::move(contentArr);
-    result["isError"] = true;
-    return llvm::json::Value(std::move(result));
+    return mcpTextResult("Missing 'name' field in tools/call request",
+                         /*isError=*/true);
   }
 
   // Look up tool by name.
@@ -160,16 +178,8 @@ llvm::json::Value McpServer::handleToolsCall(
 
   auto it = handlers_.find(toolName->str());
   if (it == handlers_.end()) {
-    llvm::json::Object content;
-    content["type"] = "text";
-    content["text"] = "Unknown tool: " + toolName->str();
-    llvm::json::Array contentArr;
-    contentArr.push_back(llvm::json::Value(std::move(content)));
-
-    llvm::json::Object result;
-    result["content"] = std::move(contentArr);
-    result["isError"] = true;
-    return llvm::json::Value(std::move(result));
+    return mcpTextResult("Unknown tool: " + toolName->str(),
+                         /*isError=*/true);
   }
 
   // Extract arguments.
@@ -182,26 +192,12 @@ llvm::json::Value McpServer::handleToolsCall(
   if (*toolName == "reindex_tu") {
     auto filePath = args.getString("file");
     if (!filePath) {
-      llvm::json::Object content;
-      content["type"] = "text";
-      content["text"] = "Missing required 'file' argument";
-      llvm::json::Array contentArr;
-      contentArr.push_back(llvm::json::Value(std::move(content)));
-      llvm::json::Object result;
-      result["content"] = std::move(contentArr);
-      result["isError"] = true;
-      return llvm::json::Value(std::move(result));
+      return mcpTextResult("Missing required 'file' argument",
+                           /*isError=*/true);
     }
     if (!buildParams_.compDb) {
-      llvm::json::Object content;
-      content["type"] = "text";
-      content["text"] = "reindex_tu unavailable: no compilation database";
-      llvm::json::Array contentArr;
-      contentArr.push_back(llvm::json::Value(std::move(content)));
-      llvm::json::Object result;
-      result["content"] = std::move(contentArr);
-      result["isError"] = true;
-      return llvm::json::Value(std::move(result));
+      return mcpTextResult("reindex_tu unavailable: no compilation database",
+                           /*isError=*/true);
     }
     auto r = reindexTU(filePath->str());
     std::string msg = "Reindexed " + filePath->str() + "\n" +
@@ -209,19 +205,12 @@ llvm::json::Value McpServer::handleToolsCall(
                       ", total edges: " + std::to_string(r.edgesAfter) + "\n" +
                       "Contexts removed: " + std::to_string(r.contextsRemoved) +
                       ", total contexts: " + std::to_string(r.contextsAfter);
-    llvm::json::Object content;
-    content["type"] = "text";
-    content["text"] = std::move(msg);
-    llvm::json::Array contentArr;
-    contentArr.push_back(llvm::json::Value(std::move(content)));
-    llvm::json::Object result;
-    result["content"] = std::move(contentArr);
-    return llvm::json::Value(std::move(result));
+    return mcpTextResult(msg);
   }
 
-  McpToolContext ctx{graph_,  oracle_,      cfIndex_,
-                    entryPoints_, &channels_, &queryCache_};
-  return it->second(args, ctx);
+  ToolContext ctx{graph_,       oracle_,    cfIndex_,
+                  entryPoints_, &channels_, &queryCache_};
+  return wrapToolResult(it->second(args, ctx));
 }
 
 } // namespace vycor
