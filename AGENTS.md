@@ -255,7 +255,7 @@ objects:
 vycor-cpp anneal     --build-path <dir> --source <files...> [--list-checks] [--checks <spec>] [--checks-config <file>] [--threads <n>] [--checkpoint <file>] [--isolate-workers [--workers <n>]] [--org-config <file>]
 vycor-cpp morph     --rules-json <file> --build-path <dir> --source <files...> [--dry-run]
 vycor-cpp prism    --build-path <dir> --source <files...> --mode <dump|query> [--collapse-paths <pattern>...] [--org-config <file>]
-vycor-cpp megascope index   --build-path <dir> --source <files...> [--index <file>] [--collapse-paths <pattern>...] [--org-config <file>] [--threads <n>] [--isolate-workers]
+vycor-cpp megascope index   --build-path <dir> [--source <file>... | --source-list <file|-> | --source-re <regex>] [--skip-paths <pattern>...] [--index <file>] [--collapse-paths <pattern>...] [--org-config <file>] [--threads <n>] [--isolate-workers]
 vycor-cpp megascope <tool>  [--index <file> | --build-path <dir>] [tool flags from its schema...] [--format json|ndjson|tsv] [--pretty]
 vycor-cpp megascope batch   [--index <file>]      # NDJSON {"tool":..,"args":{..}} on stdin
 vycor-cpp megascope serve   --build-path <dir> --source <files...> [--index <file>] [--entry-point <name>...] [-v]
@@ -499,7 +499,6 @@ relying on a real tag push.
 | `TransformPipeline` | Write final replacements to disk when `!dryRun` |
 | Tests | Implement full integration tests in `test_transforms.cpp` (currently stubs) |
 | Matcher DSL | Define and document the JSON schema for rules files |
-| `megascope` | Add `--source-glob` flag for directory-based source selection |
 | `find_call_chain` | Annotate path edges with try/catch depth and caught types |
 | `call-site-context` | Include catch handler type and body summary in response |
 | Concurrency | `query_raii_scopes_at_callsite` — list RAII objects live at a call site |

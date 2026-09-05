@@ -30,6 +30,7 @@
 #include "vycor/callgraph/Snapshot.h"
 #include "vycor/callgraph/WorkerPool.h"
 #include "vycor/cli/MegascopeCli.h"
+#include "vycor/cli/SourceSelection.h"
 #include "vycor/compat/PchCache.h"
 #include "vycor/mcp/McpServer.h"
 #include "vycor/Version.h"
@@ -546,10 +547,25 @@ static llvm::cl::opt<std::string>
 
 static llvm::cl::list<std::string>
     McpSourceFiles("source",
-                   llvm::cl::desc("Source files to analyze"),
+                   llvm::cl::desc("Source files to index (repeatable). "
+                                  "Default: every entry of the compilation "
+                                  "database"),
                    llvm::cl::value_desc("file"),
-                   llvm::cl::OneOrMore,
                    llvm::cl::sub(MegascopeCmd));
+
+static llvm::cl::opt<std::string>
+    McpSourceList("source-list",
+        llvm::cl::desc("File with one source path per line ('-' = stdin; "
+                       "'#' comments); unioned with --source"),
+        llvm::cl::value_desc("file"),
+        llvm::cl::sub(MegascopeCmd));
+
+static llvm::cl::opt<std::string>
+    McpSourceRe("source-re",
+        llvm::cl::desc("Keep only source paths matching this POSIX extended "
+                       "regex (searched, not anchored)"),
+        llvm::cl::value_desc("regex"),
+        llvm::cl::sub(MegascopeCmd));
 
 static llvm::cl::list<std::string>
     McpEntryPoints("entry-point",
@@ -1323,8 +1339,12 @@ int main(int argc, const char **argv) {
       llvm::errs() << "megascope: --build-path is required\n";
       return 1;
     }
-    if (McpSourceFiles.empty()) {
-      llvm::errs() << "megascope: at least one --source file is required\n";
+    // The serve loop owns stdin; a list piped in would be consumed to
+    // EOF before the first request could arrive.
+    if (McpSourceList == "-" && megascopeVerb != MegascopeVerb::Index) {
+      llvm::errs() << "megascope: --source-list - is only available with "
+                      "the index verb (serve reads MCP requests from "
+                      "stdin)\n";
       return 1;
     }
     if (!McpMcp && megascopeVerb != MegascopeVerb::Index) {
@@ -1350,24 +1370,36 @@ int main(int argc, const char **argv) {
       return 1;
     }
 
-    std::vector<std::string> files(McpSourceFiles.begin(),
+    vycor::SourceSelection selection;
+    selection.explicitFiles.assign(McpSourceFiles.begin(),
                                    McpSourceFiles.end());
+    selection.listFile = McpSourceList;
+    selection.regex = McpSourceRe;
+    selection.skipPaths.assign(McpSkipPaths.begin(), McpSkipPaths.end());
+    vycor::SourceSelectionStats selStats;
+    auto selected =
+        vycor::selectSources(*compDb, selection, std::cin, &selStats);
+    if (!selected) {
+      llvm::errs() << "megascope: " << llvm::toString(selected.takeError())
+                   << "\n";
+      return 1;
+    }
+    std::vector<std::string> files = std::move(*selected);
+    if (files.empty()) {
+      llvm::errs() << "megascope: no TUs selected (" << selStats.base
+                   << " from " << selStats.baseSource << ", "
+                   << selStats.regexDropped << " dropped by --source-re, "
+                   << selStats.skipDropped << " by --skip-paths)\n";
+      return 1;
+    }
+    if (selStats.regexDropped || selStats.skipDropped) {
+      llvm::errs() << "megascope: " << files.size() << " of "
+                   << selStats.base << " TUs selected ("
+                   << selStats.regexDropped << " dropped by --source-re, "
+                   << selStats.skipDropped << " by --skip-paths)\n";
+    }
     std::vector<std::string> collapsePaths(McpCollapsePaths.begin(),
                                            McpCollapsePaths.end());
-
-    // Filter out TUs matching --skip-paths.
-    if (!McpSkipPaths.empty()) {
-      vycor::CollapseFilter skipFilter(
-          {McpSkipPaths.begin(), McpSkipPaths.end()});
-      size_t before = files.size();
-      files.erase(std::remove_if(files.begin(), files.end(),
-                                  [&](const std::string &f) {
-                                    return skipFilter.isCollapsed(f);
-                                  }),
-                  files.end());
-      llvm::errs() << "megascope: skip-paths: " << (before - files.size())
-                   << " of " << before << " TUs skipped\n";
-    }
 
     // Pre-compile PCH headers if --pch-dir is set.
     std::unique_ptr<vycor::PchCache> pchCache;

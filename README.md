@@ -302,10 +302,12 @@ file, then answers queries from the shell (one process per query, or a
 batch on one loaded index) or over MCP.
 
 ```bash
-# Build the index once (default location: <build-path>/.vycor/megascope.vycs)
+# Build the index once (default location: <build-path>/.vycor/megascope.vycs).
+# No --source means every TU in compile_commands.json; narrow with
+# --source-re / --skip-paths, or pipe a list into --source-list -.
 ./build/vycor-cpp megascope index \
   --build-path /path/to/compile_commands_dir \
-  --source file1.cpp --source file2.cpp --source file3.cpp \
+  --source-re '/Client/(Network|Core)/' --skip-paths ThirdParty \
   --collapse-paths Client/Math
 
 # Query it. Flags come from each tool's schema; `megascope <tool> --help`.
@@ -340,7 +342,9 @@ JSON (`--pretty`, `--format ndjson|tsv`); exit codes are the contract:
 `reindex_tu` (serve only).
 See `docs/mcp-usage.md`.
 
-Bake flags (`index`/`serve`): `--index` (warm starts — only changed TUs
+Bake flags (`index`/`serve`): `--source`/`--source-list`/`--source-re`/
+`--skip-paths` (TU selection; default is the whole compilation database),
+`--index` (warm starts — only changed TUs
 are re-indexed; `--snapshot` is the old spelling), `--threads`,
 `--pch-dir`, `--isolate-workers`/`--workers` (subprocess baking: a
 crashing TU costs only that TU), `--stats-json`, `-v`.
