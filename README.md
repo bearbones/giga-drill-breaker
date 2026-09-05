@@ -6,10 +6,11 @@ analysis. It exposes four features as subcommands:
 - **anneal** — detect problems such as fragile ADL/CTAD resolutions across translation units. Like if `clang-tidy` went Super Saiyan.
 - **morph** — apply rule-driven, multi-pass AST matcher transformations
 - **prism** — query control flow, exception handling, and call site guard context from the command line
-- **megascope** — start an MCP (Model Context Protocol) server for interactive call graph queries, designed for LLM-assisted code analysis
+- **megascope** — index a multi-TU call graph once, then query it from the shell (`megascope get-callers --name f`), in batches, or over MCP (Model Context Protocol); designed for LLM-assisted code analysis
 
 Designed as a backend for external systems (e.g. a Python script translating
-a custom DSL, or an LLM agent performing security audits via the MCP server),
+a custom DSL, or an LLM agent performing security audits via the megascope
+verbs or MCP server),
 and as a **base for organization forks**: lock types, feature-flag
 conventions, and custom checks slot in without touching upstream code — see
 [Customizing for your organization](#customizing-for-your-organization).
@@ -294,34 +295,55 @@ Other useful flags: `--threads`, `--pch-dir` (PCH reuse), `--lock-types`
 (extra RAII lock types), `--channel-types-json` (queue/bus tracing),
 `--org-config`.
 
-### megascope — Interactive Call Graph MCP Server
+### megascope — Cross-TU Call Graph Index and Query Tools
 
-Starts a persistent MCP server that pre-bakes a unified cross-TU call
-graph and control flow index, then serves interactive queries via JSON-RPC
-over stdio.
+Bakes a unified cross-TU call graph and control-flow index into an index
+file, then answers queries from the shell (one process per query, or a
+batch on one loaded index) or over MCP.
 
 ```bash
-./build/vycor-cpp megascope \
+# Build the index once (default location: <build-path>/.vycor/megascope.vycs)
+./build/vycor-cpp megascope index \
   --build-path /path/to/compile_commands_dir \
   --source file1.cpp --source file2.cpp --source file3.cpp \
-  --entry-point "main" \
-  --collapse-paths Client/Math \
-  --snapshot /tmp/proj.snap
+  --collapse-paths Client/Math
+
+# Query it. Flags come from each tool's schema; `megascope <tool> --help`.
+./build/vycor-cpp megascope get-callers --name Foo::bar --build-path /path/to/compile_commands_dir
+./build/vycor-cpp megascope find-call-chain --to Foo::bar --format ndjson
+./build/vycor-cpp megascope search-functions --query Foo --format tsv | cut -f4
+./build/vycor-cpp megascope info            # what the index holds
+./build/vycor-cpp megascope tools           # the 21 tools
+
+# Many queries, one load: NDJSON requests in, one response per line out.
+printf '{"id":1,"tool":"get_callers","args":{"name":"Foo::bar"}}\n' | \
+  ./build/vycor-cpp megascope batch
+
+# The same tools over MCP stdio, for clients that speak it.
+./build/vycor-cpp megascope serve --build-path /path/to/compile_commands_dir --source ...
 ```
 
-**21 MCP tools**: `search_functions`, `lookup_function`, `get_callees`,
+Query verbs find the index via `--index`, `$VYCOR_INDEX`,
+`<build-path>/.vycor/megascope.vycs`, or `./.vycor/megascope.vycs`, so a
+query run from the build directory needs no path at all. Output is compact
+JSON (`--pretty`, `--format ndjson|tsv`); exit codes are the contract:
+0 results, 1 empty, 2 usage, 3 index missing/unreadable, 4 ambiguous name
+(candidates on stdout — re-run with `--usr`).
+
+**21 tools**: `search_functions`, `lookup_function`, `get_callees`,
 `get_callers`, `find_call_chain`, `query_exception_safety`,
 `query_call_site_context`, `query_raii_scopes_at_callsite`,
 `query_locks_held`, `query_same_lock`, `analyze_dead_code`,
 `get_class_hierarchy`, `list_entry_points`, `graph_summary`,
 `list_callback_sites`, `list_concurrency_entry_points`, `list_channels`,
 `query_channel`, `query_channels_for_function`, `explain_ordering`,
-`reindex_tu`.
+`reindex_tu` (serve only).
 See `docs/mcp-usage.md`.
 
-Scaling flags: `--snapshot` (warm starts — only changed TUs are
-re-indexed), `--threads`, `--pch-dir`, `--isolate-workers`/`--workers`
-(subprocess baking: a crashing TU costs only that TU), `--stats-json`.
+Bake flags (`index`/`serve`): `--index` (warm starts — only changed TUs
+are re-indexed; `--snapshot` is the old spelling), `--threads`,
+`--pch-dir`, `--isolate-workers`/`--workers` (subprocess baking: a
+crashing TU costs only that TU), `--stats-json`, `-v`.
 
 **Key difference from prism**: `megascope` indexes all specified sources
 into a unified cross-TU call graph held in memory. `prism` parses per
@@ -373,6 +395,8 @@ include/vycor/
   query/                        Transport-neutral megascope tools (Tools.h:
                                 ToolEntry/ToolContext/result contract,
                                 Identity, Serialize)
+  cli/                          megascope verbs: schema-derived flags,
+                                output contract, exit codes (MegascopeCli)
   mcp/                          MCP adapter (McpServer, McpProtocol)
   ext/                          Organization extension API (Extensions.h,
                                 OrgConfig.h)
@@ -380,7 +404,7 @@ include/vycor/
 
 src/
   main.cpp                      CLI entry point (anneal/morph/prism/megascope)
-  anneal/ morph/ callgraph/ query/ mcp/ ext/ compat/   Implementations
+  anneal/ morph/ callgraph/ query/ cli/ mcp/ ext/ compat/   Implementations
 
 ext/                            Organization slot-in (fork-owned; globbed
                                 into the build — see ext/README.md)
@@ -473,4 +497,4 @@ just hints at what it's about. **anneal** surfaces latent stress — ADL/CTAD
 fragility — in order to relieve it. **morph** reshapes amorphous structure —
 AST transforms. **prism** decomposes one point into its components — call-site
 control flow. **megascope** is the persistent far-seeing instrument — the
-MCP server.
+cross-TU index and its query verbs.

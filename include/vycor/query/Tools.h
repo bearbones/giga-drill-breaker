@@ -91,6 +91,11 @@ struct ToolEntry {
   llvm::json::Value inputSchema; // JSON Schema object
   // Null for adapter-implemented tools (reindex_tu mutates the indexes).
   ToolHandler handler;
+  /// Name of the payload member holding this tool's record list (callers,
+  /// matches, paths, ...), or empty when the payload is one scalar record.
+  /// Drives the CLI's ndjson/tsv output and its empty-result exit code
+  /// (vycor/cli/MegascopeCli.h); the MCP adapter ignores it.
+  std::string recordsKey;
 };
 
 /// Returns the list of all registered tools, in tools/list order.

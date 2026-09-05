@@ -86,13 +86,15 @@ int McpServer::run() {
     if (!req)
       break; // EOF or unrecoverable error.
 
-    llvm::errs() << "megascope: received method: " << req->method << "\n";
+    if (verbose_)
+      llvm::errs() << "megascope: received method: " << req->method << "\n";
 
     // Notifications have no id and get no response.
     if (req->isNotification()) {
       if (req->method == "notifications/initialized") {
         initialized_ = true;
-        llvm::errs() << "megascope: client initialized\n";
+        if (verbose_)
+          llvm::errs() << "megascope: client initialized\n";
       }
       // Silently ignore unknown notifications.
       continue;

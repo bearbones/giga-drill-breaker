@@ -405,6 +405,11 @@ mapping and NDJSON/TSV emitters.
 | — | D1, D2, D7, D8 | — | trivial, any time |
 
 Status: item 1 and defects D1, D2, D7, D8 landed in #56 (2026-09-03).
+Items 2, 3 (except D4, which belongs to item 8), 5, and D9 landed next
+(2026-09-05): verbs, schema→flags, `--index`, default index path, output
+contract, exit codes, `batch`. Entry points are still a query-time flag
+(`--entry-point`) because the index does not record them; fold that into
+the v8 meta with item 6.
 
 Items 1–5 make the CLI real and can land in one or two PRs. Item 6 is the
 one performance change the CLI model actually needs, and it is gated on a

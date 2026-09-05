@@ -17,6 +17,8 @@
 #include "vycor/query/Tools.h"
 #include "Registry.h"
 
+#include <map>
+
 namespace vycor {
 
 llvm::json::Value errorResult(llvm::StringRef message) {
@@ -44,6 +46,28 @@ bool isAmbiguousResult(const llvm::json::Value &result) {
   return b && *b;
 }
 
+// The list-shaped member of each tool's payload (ToolEntry::recordsKey).
+// Tools absent here answer with one scalar record. Where a payload carries
+// two lists (analyze_dead_code, get_class_hierarchy, query_channel) the
+// primary one is named; the other stays in the ndjson _summary line.
+static const std::map<std::string, std::string> kRecordsKeys = {
+    {"search_functions", "matches"},
+    {"get_callees", "callees"},
+    {"get_callers", "callers"},
+    {"find_call_chain", "paths"},
+    {"get_class_hierarchy", "derivedClasses"},
+    {"list_entry_points", "entryPoints"},
+    {"list_callback_sites", "targets"},
+    {"list_concurrency_entry_points", "entries"},
+    {"query_raii_scopes_at_callsite", "locals"},
+    {"query_locks_held", "locksHeld"},
+    {"query_same_lock", "sharedLocks"},
+    {"analyze_dead_code", "dead"},
+    {"list_channels", "channels"},
+    {"query_channel", "producers"},
+    {"query_channels_for_function", "sites"},
+};
+
 std::vector<ToolEntry> getRegisteredTools() {
   std::vector<ToolEntry> tools;
   registerGraphTools(tools);
@@ -51,6 +75,11 @@ std::vector<ToolEntry> getRegisteredTools() {
   registerLockTools(tools);
   registerDeadCodeTools(tools);
   registerChannelTools(tools);
+  for (auto &tool : tools) {
+    auto it = kRecordsKeys.find(tool.name);
+    if (it != kRecordsKeys.end())
+      tool.recordsKey = it->second;
+  }
 
   // reindex_tu — handler is null: it mutates the indexes, so each adapter
   // (McpServer today) implements it against its own owned state.

@@ -18,12 +18,15 @@ Tree) infrastructure to:
    C++ source code using Clang's dynamic matcher DSL.
 3. **Query control flow and exception context** (`prism`) — one-shot CLI
    queries for call site guards, try/catch scopes, and exception safety.
-4. **Interactive call graph MCP server** (`megascope`) — pre-bakes a multi-TU
-   call graph and control flow index, then serves interactive queries via
-   JSON-RPC for LLM-assisted code analysis (security audits, dead code, etc.).
+4. **Cross-TU call graph index and query tools** (`megascope`) — bakes a
+   multi-TU call graph and control flow index into a file, then answers
+   queries from the shell (`megascope <tool>`, `batch`) or over MCP
+   (`serve`) for LLM-assisted code analysis (security audits, dead code,
+   etc.).
 
 It is designed to be called by external tooling (e.g. a Python orchestrator,
-or an LLM agent using the MCP server for security vulnerability analysis).
+or an LLM agent using the megascope verbs or MCP server for security
+vulnerability analysis).
 
 ---
 
@@ -35,7 +38,7 @@ leaves the bare `vycor` for a future Python sibling. **anneal** relieves
 latent stress — ADL/CTAD fragility. **morph** reshapes amorphous structure —
 AST transforms. **prism** decomposes one point into its components — call-site
 control flow. **megascope** is the persistent far-seeing instrument — the
-MCP server.
+cross-TU index and its query verbs.
 
 ---
 
@@ -150,13 +153,13 @@ are preserved. This reduces noise from utility/math headers while keeping entry 
 **Sources:** `src/query/`
 
 Every megascope tool is a pure function `(json::Object args, ToolContext)
--> json::Value` over the in-memory indexes. Transports (the MCP server
-today, the CLI next) are thin adapters over this table; tests call the
+-> json::Value` over the in-memory indexes. Transports (the CLI verbs and
+the MCP server) are thin adapters over this table; tests call the
 handlers directly.
 
 | File | Purpose |
 |---|---|
-| `Tools.h` | `ToolContext`, `ToolEntry` (name, description, JSON Schema, handler), `QueryCache`, `getRegisteredTools()`, and the result contract: success = payload object; error = `{"error": msg}` (`errorResult`/`isErrorResult`); ambiguity = `{"ambiguous": true, candidates...}` (`isAmbiguousResult`) |
+| `Tools.h` | `ToolContext`, `ToolEntry` (name, description, JSON Schema, handler, `recordsKey` — the payload's list member, which drives the CLI's ndjson/tsv output and empty-result exit code), `QueryCache`, `getRegisteredTools()`, and the result contract: success = payload object; error = `{"error": msg}` (`errorResult`/`isErrorResult`); ambiguity = `{"ambiguous": true, candidates...}` (`isAmbiguousResult`) |
 | `Identity.h/.cpp` | F8 identity resolution: `resolveIdentity` (name/usr/site/filter → USR), the disambiguation payload, `attachUsr` |
 | `Serialize.h/.cpp` | Enum spellings (`EdgeKind`, `Confidence`, `ExecutionContext`, `ChannelOperation`) and JSON serializers for edges, guards, channel sites — part of the output contract |
 | `GraphTools.cpp` | lookup, search, callers, callees, call chain, class hierarchy, entry points, graph summary, callback/concurrency sites |
@@ -166,6 +169,20 @@ handlers directly.
 | `ChannelTools.cpp` | channel listing/query, channels-for-function, explain-ordering |
 | `Registry.cpp` / `Registry.h` | Composes the per-family `register*Tools` lists into `getRegisteredTools()` (tools/list order); result-contract helpers |
 | `Schema.h` | JSON Schema property builders shared by the registrations |
+
+### `cli` — megascope Verbs (adapter)
+
+**Headers:** `include/vycor/cli/`
+**Sources:** `src/cli/`
+
+| File | Purpose |
+|---|---|
+| `MegascopeCli.h/.cpp` | The query verbs (`<tool>`, `call`, `tools`, `info`, `batch`): `parseToolArgs` derives `--flags` from each tool's JSON Schema (strings take a value, integers parse, booleans are bare, arrays repeat; hyphens and underscores interchangeable; `--args '<json>'` seeds), `emitToolResult` implements the output contract (compact JSON / `--pretty` / `--format ndjson` with a leading `{"_summary":...}` line / `--format tsv` with sorted columns) and `exitCodeFor` the exit codes (0 results, 1 empty, 2 usage, 3 index, 4 ambiguous); `resolveIndexPath` is the `--index` → `$VYCOR_INDEX` → `<build-path>/.vycor/megascope.vycs` → `./.vycor/megascope.vycs` chain |
+
+`main.cpp` peels the verb off argv before `llvm::cl` runs: query verbs
+never touch `llvm::cl`; `index` and `serve` share the bake option block
+with the legacy verb-less form (which keeps `--snapshot`'s opt-in
+semantics). `megascope index` prints a one-line JSON summary on stdout.
 
 ### `mcp` — MCP Server (adapter)
 
@@ -177,7 +194,7 @@ handlers directly.
 | `McpServer.h/.cpp` | JSON-RPC dispatch loop; owns the indexes and `QueryCache`; `wrapToolResult` turns a query payload into a `content[0].text` block (error payload → `isError`); implements `reindex_tu` (needs mutable indexes) |
 | `McpProtocol.h/.cpp` | MCP stdio framing: newline-delimited JSON, with Content-Length autodetect for legacy clients |
 
-**21 MCP tools**: `search_functions`, `lookup_function`, `get_callees`,
+**21 tools** (CLI verbs and MCP): `search_functions`, `lookup_function`, `get_callees`,
 `get_callers`, `find_call_chain`, `query_exception_safety`,
 `query_call_site_context`, `query_raii_scopes_at_callsite`,
 `query_locks_held`, `query_same_lock`, `analyze_dead_code`,
@@ -238,7 +255,11 @@ objects:
 vycor-cpp anneal     --build-path <dir> --source <files...> [--list-checks] [--checks <spec>] [--checks-config <file>] [--threads <n>] [--checkpoint <file>] [--isolate-workers [--workers <n>]] [--org-config <file>]
 vycor-cpp morph     --rules-json <file> --build-path <dir> --source <files...> [--dry-run]
 vycor-cpp prism    --build-path <dir> --source <files...> --mode <dump|query> [--collapse-paths <pattern>...] [--org-config <file>]
-vycor-cpp megascope  --build-path <dir> --source <files...> [--entry-point <name>...] [--collapse-paths <pattern>...] [--snapshot <file>] [--org-config <file>]
+vycor-cpp megascope index   --build-path <dir> --source <files...> [--index <file>] [--collapse-paths <pattern>...] [--org-config <file>] [--threads <n>] [--isolate-workers]
+vycor-cpp megascope <tool>  [--index <file> | --build-path <dir>] [tool flags from its schema...] [--format json|ndjson|tsv] [--pretty]
+vycor-cpp megascope batch   [--index <file>]      # NDJSON {"tool":..,"args":{..}} on stdin
+vycor-cpp megascope serve   --build-path <dir> --source <files...> [--index <file>] [--entry-point <name>...] [-v]
+vycor-cpp megascope tools | info [--files] | help
 ```
 
 `--org-config` (anneal/prism/megascope) loads the organization config JSON
@@ -268,7 +289,7 @@ To add a new subcommand, follow the pattern in `main.cpp`:
 ### prism vs megascope
 
 - **prism**: One-shot CLI tool. Parses AST per invocation, outputs JSON to stdout. Best for quick single-file investigations.
-- **megascope**: Persistent server. Pre-bakes a unified cross-TU call graph at startup, then serves interactive queries via JSON-RPC over stdio. **Always use megascope for security audits or multi-file analysis** — prism is single-TU and cannot see cross-file callers.
+- **megascope**: Cross-TU. `megascope index` bakes a unified call graph + control-flow index into a file once; every query verb (`megascope get-callers --name f`, `megascope batch`) loads it and answers, and `megascope serve` exposes the same tools over MCP stdio. **Always use megascope for security audits or multi-file analysis** — prism is single-TU and cannot see cross-file callers.
 
 ### Edge Collapse (--collapse-paths)
 
@@ -311,7 +332,7 @@ boundary edges (non-collapsed caller → collapsed callee) are preserved.
   single binary doesn't need it). Used by `.github/workflows/release.yml`.
 
 `src/CMakeLists.txt`:
-- Builds `vycor_lib` from `anneal/*.cpp`, `morph/*.cpp`, `callgraph/*.cpp`, `mcp/*.cpp`, and `ext/*.cpp`.
+- Builds `vycor_lib` from `anneal/*.cpp`, `morph/*.cpp`, `callgraph/*.cpp`, `query/*.cpp`, `cli/*.cpp`, `mcp/*.cpp`, and `ext/*.cpp`.
 - Builds `vycor-cpp` executable from `main.cpp` plus a `CONFIGURE_DEPENDS`
   glob of top-level `ext/*.cpp` (organization slot-in — attached to the
   executable, not the archive, so static registrars survive linking).
