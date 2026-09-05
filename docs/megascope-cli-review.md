@@ -405,9 +405,14 @@ mapping and NDJSON/TSV emitters.
 | — | D1, D2, D7, D8 | — | trivial, any time |
 
 Status: item 1 and defects D1, D2, D7, D8 landed in #56 (2026-09-03).
-Items 2, 3 (except D4, which belongs to item 8), 5, and D9 landed next
+Items 2, 3 (except D4, which belongs to item 8), 5, and D9 landed in #57
 (2026-09-05): verbs, schema→flags, `--index`, default index path, output
-contract, exit codes, `batch`. Entry points are still a query-time flag
+contract, exit codes, `batch`. Item 4 (default-all, `--source-re`,
+`--source-list`; `src/cli/SourceSelection.cpp`) landed in #58 the same
+day, with the rule that a bare `index`/`serve` refreshes the TU set the
+index already records rather than widening it to the database. Item 7's
+parallel warm refresh is still open; #58 only falls back to the cold
+bake when more than half the selection is dirty. Entry points are still a query-time flag
 (`--entry-point`) because the index does not record them; fold that into
 the v8 meta with item 6.
 

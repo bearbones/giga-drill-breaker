@@ -30,6 +30,7 @@ add_library(vycor_lib
   query/ChannelTools.cpp
   query/Registry.cpp
   cli/MegascopeCli.cpp
+  cli/SourceSelection.cpp
   ext/Extensions.cpp
   ext/OrgConfig.cpp
 )

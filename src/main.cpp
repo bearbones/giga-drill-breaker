@@ -30,6 +30,7 @@
 #include "vycor/callgraph/Snapshot.h"
 #include "vycor/callgraph/WorkerPool.h"
 #include "vycor/cli/MegascopeCli.h"
+#include "vycor/cli/SourceSelection.h"
 #include "vycor/compat/PchCache.h"
 #include "vycor/mcp/McpServer.h"
 #include "vycor/Version.h"
@@ -546,10 +547,25 @@ static llvm::cl::opt<std::string>
 
 static llvm::cl::list<std::string>
     McpSourceFiles("source",
-                   llvm::cl::desc("Source files to analyze"),
+                   llvm::cl::desc("Source files to index (repeatable). "
+                                  "Default: every entry of the compilation "
+                                  "database"),
                    llvm::cl::value_desc("file"),
-                   llvm::cl::OneOrMore,
                    llvm::cl::sub(MegascopeCmd));
+
+static llvm::cl::opt<std::string>
+    McpSourceList("source-list",
+        llvm::cl::desc("File with one source path per line ('-' = stdin; "
+                       "'#' comments); unioned with --source"),
+        llvm::cl::value_desc("file"),
+        llvm::cl::sub(MegascopeCmd));
+
+static llvm::cl::opt<std::string>
+    McpSourceRe("source-re",
+        llvm::cl::desc("Keep only source paths matching this POSIX extended "
+                       "regex (searched, not anchored)"),
+        llvm::cl::value_desc("regex"),
+        llvm::cl::sub(MegascopeCmd));
 
 static llvm::cl::list<std::string>
     McpEntryPoints("entry-point",
@@ -1323,9 +1339,20 @@ int main(int argc, const char **argv) {
       llvm::errs() << "megascope: --build-path is required\n";
       return 1;
     }
-    if (McpSourceFiles.empty()) {
-      llvm::errs() << "megascope: at least one --source file is required\n";
-      return 1;
+    // The serve loop owns stdin; a list piped in (or any /dev/stdin-style
+    // alias, pipe, or device) would be drained before the first request
+    // could arrive. Only a regular file is safe to read here.
+    if (!McpSourceList.empty() && megascopeVerb != MegascopeVerb::Index) {
+      llvm::sys::fs::file_status st;
+      bool regular = McpSourceList != "-" &&
+                     !llvm::sys::fs::status(McpSourceList, st) &&
+                     llvm::sys::fs::is_regular_file(st);
+      if (!regular) {
+        llvm::errs() << "megascope: --source-list must be a regular file "
+                        "with the serve verb (stdin, pipes, and devices "
+                        "are only available with `megascope index`)\n";
+        return 1;
+      }
     }
     if (!McpMcp && megascopeVerb != MegascopeVerb::Index) {
       llvm::errs() << "megascope: MCP is the only serve transport\n";
@@ -1350,24 +1377,73 @@ int main(int argc, const char **argv) {
       return 1;
     }
 
-    std::vector<std::string> files(McpSourceFiles.begin(),
+    using StatsClock = std::chrono::steady_clock;
+    auto msSince = [](StatsClock::time_point t0) {
+      return std::chrono::duration<double, std::milli>(StatsClock::now() -
+                                                       t0)
+          .count();
+    };
+
+    // An existing index is loaded before the TU selection: with no
+    // selection flag at all its recorded TU set is what gets refreshed,
+    // so a bare `serve` never silently widens a narrow index to the whole
+    // database (and re-saves the result). Workers never carry an index.
+    std::optional<vycor::SnapshotData> snap;
+    double snapLoadMs = 0;
+    if (!indexPath.empty() && !McpBakeWorker) {
+      auto t0 = StatsClock::now();
+      snap = vycor::SnapshotIO::load(indexPath);
+      if (snap)
+        snapLoadMs = msSince(t0);
+    }
+
+    vycor::SourceSelection selection;
+    selection.explicitFiles.assign(McpSourceFiles.begin(),
                                    McpSourceFiles.end());
+    selection.listFile = McpSourceList;
+    selection.regex = McpSourceRe;
+    selection.skipPaths.assign(McpSkipPaths.begin(), McpSkipPaths.end());
+    if (snap)
+      for (const auto &fs : snap->meta.files)
+        selection.recordedFiles.push_back(fs.path);
+    vycor::SourceSelectionStats selStats;
+    auto selected =
+        vycor::selectSources(*compDb, selection, std::cin, &selStats);
+    if (!selected) {
+      llvm::errs() << "megascope: " << llvm::toString(selected.takeError())
+                   << "\n";
+      return 1;
+    }
+    std::vector<std::string> files = std::move(*selected);
+    auto describeSelection = [&]() {
+      std::string d = std::to_string(files.size()) + " of " +
+                      std::to_string(selStats.base) + " TUs selected from " +
+                      selStats.baseSource + " (" +
+                      std::to_string(selStats.regexDropped) +
+                      " dropped by --source-re, " +
+                      std::to_string(selStats.skipDropped) +
+                      " by --skip-paths";
+      if (selStats.dbSkipped)
+        d += ", " + std::to_string(selStats.dbSkipped) +
+             " database entries skipped: not C/C++ or missing";
+      return d + ")";
+    };
+    if (files.empty()) {
+      llvm::errs() << "megascope: no TUs to index — " << describeSelection()
+                   << "\n";
+      return 1;
+    }
+    if (llvm::StringRef(selStats.baseSource) == "index") {
+      llvm::errs() << "megascope: no --source/--source-list/--source-re — "
+                      "refreshing the " << selStats.base
+                   << " TUs recorded in " << indexPath
+                   << " (pass --source-re . to re-select the whole "
+                      "database)\n";
+    }
+    if (selStats.regexDropped || selStats.skipDropped || selStats.dbSkipped)
+      llvm::errs() << "megascope: " << describeSelection() << "\n";
     std::vector<std::string> collapsePaths(McpCollapsePaths.begin(),
                                            McpCollapsePaths.end());
-
-    // Filter out TUs matching --skip-paths.
-    if (!McpSkipPaths.empty()) {
-      vycor::CollapseFilter skipFilter(
-          {McpSkipPaths.begin(), McpSkipPaths.end()});
-      size_t before = files.size();
-      files.erase(std::remove_if(files.begin(), files.end(),
-                                  [&](const std::string &f) {
-                                    return skipFilter.isCollapsed(f);
-                                  }),
-                  files.end());
-      llvm::errs() << "megascope: skip-paths: " << (before - files.size())
-                   << " of " << before << " TUs skipped\n";
-    }
 
     // Pre-compile PCH headers if --pch-dir is set.
     std::unique_ptr<vycor::PchCache> pchCache;
@@ -1438,13 +1514,7 @@ int main(int argc, const char **argv) {
     // start skips the snapshot re-save — measured 3.1s per start on a
     // 301 MB / 6.37M-call-site snapshot.
     bool indexesChanged = true;
-    using StatsClock = std::chrono::steady_clock;
-    auto msSince = [](StatsClock::time_point t0) {
-      return std::chrono::duration<double, std::milli>(StatsClock::now() -
-                                                       t0)
-          .count();
-    };
-    double snapLoadMs = 0, snapSaveMs = 0, warmRefreshMs = 0, bakeMs = 0;
+    double snapSaveMs = 0, warmRefreshMs = 0, bakeMs = 0;
     bool snapLoaded = false;
     size_t warmRefreshed = 0, warmDropped = 0;
 
@@ -1452,18 +1522,33 @@ int main(int argc, const char **argv) {
     // stale stamp and is conservatively re-indexed on the next warm start.
     auto currentStamps = vycor::SnapshotIO::stampFiles(files);
 
-    auto snapLoadStart = StatsClock::now();
     if (!indexPath.empty()) {
-      if (auto snap = vycor::SnapshotIO::load(indexPath)) {
-        snapLoadMs = msSince(snapLoadStart);
+      if (snap) {
         bool configMatch =
             snap->meta.collapsePaths == collapsePaths &&
             snap->meta.lockAllowlist == lockCfg.userAllowlist &&
             snap->meta.lockBuiltins == lockCfg.useBuiltins &&
             snap->meta.channelTypes == channelCfg.registeredTypes;
+        std::unordered_map<std::string, const vycor::FileStamp *> baked;
+        for (const auto &fs : snap->meta.files)
+          baked[fs.path] = &fs;
+        // The warm refresh re-bakes dirty TUs one at a time in-process
+        // (bakeTU), ignoring --threads/--isolate-workers. Past half the
+        // selection the parallel cold path wins, so a widened selection
+        // does not crawl through it serially.
+        size_t dirty = 0;
+        for (const auto &stamp : currentStamps) {
+          auto it = baked.find(stamp.path);
+          if (it == baked.end() || !(*it->second == stamp))
+            ++dirty;
+        }
         if (!configMatch) {
           llvm::errs() << "megascope: snapshot build configuration differs "
                           "— full rebuild\n";
+        } else if (dirty * 2 > files.size()) {
+          llvm::errs() << "megascope: " << dirty << " of " << files.size()
+                       << " selected TUs are new or changed — full "
+                          "rebuild instead of a serial warm refresh\n";
         } else {
           graph = std::move(snap->graph);
           cfIndex = std::move(snap->cfIndex);
@@ -1472,9 +1557,6 @@ int main(int argc, const char **argv) {
           snapLoaded = true;
           auto refreshStart = StatsClock::now();
 
-          std::unordered_map<std::string, const vycor::FileStamp *> baked;
-          for (const auto &fs : snap->meta.files)
-            baked[fs.path] = &fs;
           std::set<std::string> current(files.begin(), files.end());
 
           size_t dropped = 0, refreshed = 0;
