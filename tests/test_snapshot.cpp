@@ -182,9 +182,27 @@ TEST_CASE("snapshot round-trips graph, CF index, and meta",
 
   REQUIRE(SnapshotIO::save(path, g, cf, meta));
 
-  auto loaded = SnapshotIO::load(path);
+  SnapshotLoadStats loadStats;
+  auto loaded = SnapshotIO::load(path, &loadStats);
   std::remove(path.c_str());
   REQUIRE(loaded.has_value());
+
+  SECTION("load stats account for every section of the file") {
+    std::vector<std::string> names;
+    uint64_t bytes = 0;
+    for (const auto &sec : loadStats.sections) {
+      names.push_back(sec.name);
+      bytes += sec.bytes;
+      CHECK(sec.ms >= 0);
+    }
+    CHECK(names == std::vector<std::string>{
+                       "meta", "graph_interner", "nodes", "edges",
+                       "graph_relations", "cf_interner", "cf_set_tables",
+                       "cf_contexts", "channels"});
+    // Everything after the 8-byte magic + version header is a section.
+    CHECK(bytes + 8 == loadStats.fileBytes);
+    CHECK(loadStats.totalMs >= 0);
+  }
 
   SECTION("meta") {
     CHECK(loaded->meta.collapsePaths == meta.collapsePaths);

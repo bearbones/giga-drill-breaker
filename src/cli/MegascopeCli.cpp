@@ -19,6 +19,7 @@
 
 #include "llvm/ADT/SmallString.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Format.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/Path.h"
 
@@ -861,17 +862,30 @@ int runMegascopeQueryVerb(llvm::ArrayRef<std::string> args,
            "or pass --index)\n";
     return kExitIndex;
   }
-  auto snap = SnapshotIO::load(indexPath);
+  SnapshotLoadStats loadStats;
+  // Deliberately leaked: a one-shot process never frees the indexes.
+  // Destroying maps holding millions of entries costs seconds at exit
+  // (measured 2-3.5 s against a 5 s load on the 938-TU testbed) and buys
+  // nothing — the OS reclaims the pages.
+  auto *snapHolder =
+      new std::optional<SnapshotData>(SnapshotIO::load(indexPath, &loadStats));
+  auto &snap = *snapHolder;
   if (!snap) {
     err << "megascope: cannot load index " << indexPath
         << " (wrong format version or unreadable; re-run `megascope "
            "index`)\n";
     return kExitIndex;
   }
-  if (common->verbose)
+  if (common->verbose) {
     err << "megascope: loaded " << indexPath << " ("
         << snap->graph.nodeCount() << " nodes, " << snap->graph.edgeCount()
-        << " edges, " << snap->cfIndex.size() << " call sites)\n";
+        << " edges, " << snap->cfIndex.size() << " call sites) in "
+        << llvm::format("%.1f", loadStats.totalMs) << " ms:";
+    for (const auto &sec : loadStats.sections)
+      err << " " << sec.name << " " << llvm::format("%.1f", sec.ms) << " ms/"
+          << (sec.bytes >> 10) << " KiB";
+    err << "\n";
+  }
 
   if (verb == "info")
     return runInfo(*snap, indexPath, *common, *format, out, err);
