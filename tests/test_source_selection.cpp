@@ -85,7 +85,7 @@ TEST_CASE("no --source means every database entry, deduplicated",
   CHECK(std::string(stats.baseSource) == "database");
 }
 
-TEST_CASE("--source-re and --skip-paths narrow the set", "[source-selection]") {
+TEST_CASE("source-re and skip-paths narrow the set", "[source-selection]") {
   SourceSelection sel;
   sel.regex = "/Network/";
   SourceSelectionStats stats;
