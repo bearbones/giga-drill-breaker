@@ -27,10 +27,10 @@ The **build must be complete** — generated headers (OpenAPI stubs, Protobuf
 outputs, reflection registration files) must exist on disk or ClangTool will
 crash while parsing TUs that include them.
 
-### 3. Launch the server
+### 3. Build the index
 
 ```bash
-./build/src/vycor-cpp megascope \
+./build/src/vycor-cpp megascope index \
   --build-path /path/to/build \
   --source /path/to/file1.cpp \
   --source /path/to/file2.cpp \
@@ -40,42 +40,98 @@ crash while parsing TUs that include them.
 ```
 
 `--source` must be repeated once per file — it does not accept globs.
-The server prints progress to stderr and then blocks on stdin waiting for
-JSON-RPC requests:
+Progress goes to stderr; when the bake finishes the index is written to
+`<build-path>/.vycor/megascope.vycs` (override with `--index <file>`) and
+one JSON summary line goes to stdout:
 
 ```
 megascope: baking call graph + control flow index (68 files, 8 threads)...
 megascope: indexes built (59893 nodes, 412051 edges, 1098163 call sites)
+megascope: index saved to /path/to/build/.vycor/megascope.vycs
+{"call_sites":1098163,"edges":412051,"files":68,"index":"/path/to/build/.vycor/megascope.vycs","mode":"cold","nodes":59893,...}
+```
+
+Re-running `index` is a warm start: it loads the file, compares per-file
+mtime+size stamps, re-parses **only the TUs that changed** (and drops TUs
+removed from the `--source` set), and skips the re-save when nothing
+changed. The index is rebuilt from scratch when `--collapse-paths`,
+`--lock-types`, or the channel-type registrations differ from the run
+that produced it, when the format version changes, or when the file fails
+to decode. Deleting it is always safe.
+
+### 4. Query it
+
+Every tool is a verb. Its flags come from the tool's input schema (the
+same names an MCP client passes, hyphens or underscores), so
+`megascope <tool> --help` is the reference:
+
+```bash
+cd /path/to/build                     # or pass --build-path / --index
+vycor-cpp megascope get-callers --name Foo::bar
+vycor-cpp megascope find-call-chain --to Foo::bar --max-depth 6 --format ndjson
+vycor-cpp megascope search-functions --query Replicator --format tsv | cut -f4
+vycor-cpp megascope analyze-dead-code --limit 50 --pretty
+vycor-cpp megascope call get_callers --args '{"name":"Foo::bar","min_confidence":"Plausible"}'
+vycor-cpp megascope info --files       # what the index holds
+vycor-cpp megascope tools              # the tool list
+```
+
+stdout is the payload and nothing else: compact JSON by default,
+`--pretty` to indent, `--format ndjson` for one record per line (after a
+`{"_summary":...}` line carrying the scalar fields, so `head`, `grep`,
+and `jq -c` work without loading the whole result), `--format tsv` for
+the flat tables (sorted columns, header first). stderr carries only error
+messages unless `-v`.
+
+Exit codes are the contract to branch on:
+
+| Code | Meaning |
+|---|---|
+| 0 | answered, results |
+| 1 | answered, empty (not found, no paths, no dead code) |
+| 2 | usage or argument error |
+| 3 | index missing, wrong format version, or unreadable |
+| 4 | ambiguous identity — candidates on stdout; re-run with `--usr` |
+
+For many related queries, `megascope batch` reads NDJSON requests from
+stdin and answers each on one line, in order, on one loaded index:
+
+```bash
+printf '%s\n' \
+  '{"id":1,"tool":"get_callers","args":{"name":"Foo::bar"}}' \
+  '{"id":2,"tool":"query_exception_safety","args":{"function":"Foo::bar"}}' \
+  | vycor-cpp megascope batch
+# {"exit":0,"id":1,"result":{...},"tool":"get_callers"}
+# {"exit":0,"id":2,"result":{...},"tool":"query_exception_safety"}
+```
+
+`exit` carries the same code the one-shot verb would have returned.
+
+### 5. Serve over MCP
+
+The same tools are available over MCP stdio for clients that speak it:
+
+```bash
+./build/src/vycor-cpp megascope serve --build-path /path/to/build \
+  --source /path/to/file1.cpp --source /path/to/file2.cpp
+```
+
+`serve` warm-starts from the same default index (saving it after a
+bake), prints progress to stderr, and then blocks on stdin waiting for
+JSON-RPC requests:
+
+```
+megascope: warm start from /path/to/build/.vycor/megascope.vycs (2 TU(s) re-indexed, 0 dropped, ...)
 megascope: server started, waiting for requests...
 ```
 
 Do not send requests until "server started" appears — the index is not
-ready before that point.
+ready before that point. Per-request logging is off unless `-v`.
+`reindex_tu` is only available here (it mutates the live indexes).
 
-### 4. Warm starts with `--snapshot`
-
-Pass `--snapshot <file>` to persist the baked graph and control-flow index
-across launches:
-
-```bash
-./build/src/vycor-cpp megascope --build-path ... --source ... \
-  --snapshot /tmp/myproject.vycs
-```
-
-On the first run the server builds normally and saves the snapshot. On later
-runs it loads the snapshot, compares per-file mtime+size stamps, and
-re-parses **only the TUs that changed** (plus drops TUs removed from the
-`--source` set). For a large file set this turns minutes of startup into
-seconds:
-
-```
-megascope: warm start from /tmp/myproject.vycs (2 TU(s) re-indexed, 0 dropped, ...)
-```
-
-The snapshot is invalidated wholesale (full rebuild) when `--collapse-paths`
-or `--lock-types` differ from the run that produced it, when the format
-version changes, or when the file fails to decode. It is a cache, never a
-source of truth — deleting it is always safe.
+The pre-verb form `megascope --build-path ... --source ... [--snapshot F]`
+still works and means `serve`; it only touches an index file when
+`--snapshot`/`--index` is given.
 
 ---
 

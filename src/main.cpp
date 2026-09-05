@@ -29,6 +29,7 @@
 #include "vycor/callgraph/CollapseFilter.h"
 #include "vycor/callgraph/Snapshot.h"
 #include "vycor/callgraph/WorkerPool.h"
+#include "vycor/cli/MegascopeCli.h"
 #include "vycor/compat/PchCache.h"
 #include "vycor/mcp/McpServer.h"
 #include "vycor/Version.h"
@@ -37,6 +38,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <iostream>
 #include <optional>
 #include <set>
 #include <thread>
@@ -179,7 +181,8 @@ static llvm::cl::SubCommand
 
 static llvm::cl::SubCommand
     MegascopeCmd("megascope",
-                "Start MCP server for interactive call graph queries");
+                 "Index a project's call graph and query it (verbs: index, "
+                 "serve, tools, info, batch, <tool>; `megascope help`)");
 
 // ---------------------------------------------------------------------------
 // options common to all subcommands
@@ -601,9 +604,7 @@ static llvm::cl::opt<std::string>
     McpChannelTypesJson("channel-types-json",
         llvm::cl::desc("JSON file registering channel/queue types to trace "
                        "producer/consumer call sites for (see "
-                       "ChannelIndex.h for the schema). Only populated on a "
-                       "fresh full build — not supported yet with "
-                       "--snapshot warm start or --isolate-workers."),
+                       "ChannelIndex.h for the schema)."),
         llvm::cl::value_desc("file"),
         llvm::cl::sub(MegascopeCmd));
 
@@ -617,11 +618,31 @@ static llvm::cl::opt<std::string>
         llvm::cl::sub(MegascopeCmd));
 
 static llvm::cl::opt<std::string>
-    McpSnapshot("snapshot",
-        llvm::cl::desc("Snapshot file for warm starts: load the baked graph "
-                       "if present (reindexing only changed TUs), and save "
-                       "after building"),
+    McpIndex("index",
+        llvm::cl::desc("Index file: load the baked graph if present "
+                       "(re-indexing only changed TUs) and save after "
+                       "building. The index/serve verbs default it to "
+                       "<build-path>/.vycor/megascope.vycs"),
         llvm::cl::value_desc("file"),
+        llvm::cl::sub(MegascopeCmd));
+
+// Pre-verb spelling; cl::alias must not carry cl::sub (it inherits
+// McpIndex's subcommand).
+static llvm::cl::alias
+    McpSnapshotAlias("snapshot", llvm::cl::desc("Alias for --index"),
+                     llvm::cl::aliasopt(McpIndex), llvm::cl::NotHidden);
+
+static llvm::cl::opt<bool>
+    McpVerbose("v",
+        llvm::cl::desc("Verbose: per-request logging in the serve loop"),
+        llvm::cl::init(false),
+        llvm::cl::sub(MegascopeCmd));
+
+static llvm::cl::opt<bool>
+    McpMcp("mcp",
+        llvm::cl::desc("serve: speak MCP over stdio (the only transport "
+                       "today; on by default)"),
+        llvm::cl::init(true),
         llvm::cl::sub(MegascopeCmd));
 
 static llvm::cl::opt<bool>
@@ -678,6 +699,34 @@ static llvm::cl::opt<std::string>
 // ---------------------------------------------------------------------------
 
 int main(int argc, const char **argv) {
+  // megascope verbs (docs/megascope-cli-review.md §2.1). llvm::cl
+  // subcommands are single-level, so the verb is peeled off argv here:
+  // query verbs never reach llvm::cl (their flags come from each tool's
+  // JSON schema), while `index`/`serve` share the bake option block with
+  // the legacy verb-less form and hand the remaining argv to llvm::cl.
+  enum class MegascopeVerb { Legacy, Index, Serve };
+  MegascopeVerb megascopeVerb = MegascopeVerb::Legacy;
+  std::vector<const char *> peeledArgv;
+  if (argc >= 2 && llvm::StringRef(argv[1]) == "megascope") {
+    if (argc == 2)
+      return vycor::runMegascopeQueryVerb({}, llvm::outs(), llvm::errs(),
+                                          std::cin);
+    llvm::StringRef verb = argv[2];
+    if (vycor::isMegascopeQueryVerb(verb)) {
+      std::vector<std::string> rest(argv + 2, argv + argc);
+      return vycor::runMegascopeQueryVerb(rest, llvm::outs(), llvm::errs(),
+                                          std::cin);
+    }
+    if (verb == "index" || verb == "serve") {
+      megascopeVerb =
+          verb == "index" ? MegascopeVerb::Index : MegascopeVerb::Serve;
+      peeledArgv.assign(argv, argv + argc);
+      peeledArgv.erase(peeledArgv.begin() + 2);
+      argv = peeledArgv.data();
+      --argc;
+    }
+  }
+
   llvm::cl::AddExtraVersionPrinter([](llvm::raw_ostream &os) {
     os << "vycor-cpp version " << VYCOR_VERSION_STRING << "\n";
     os << "Host compiler: " << VYCOR_HOST_COMPILER_ID << " "
@@ -691,7 +740,8 @@ int main(int argc, const char **argv) {
       "  anneal     Detect fragile ADL/CTAD resolution across translation units\n"
       "  morph     Apply rule-driven AST matcher transformations\n"
       "  prism    Query control flow and exception handling context\n"
-      "  megascope  Start MCP server for interactive call graph queries\n");
+      "  megascope  Index a project's call graph and query it "
+      "(`megascope help`)\n");
 
   vycor::appendGlobalExtraArgs({ExtraArgs.begin(), ExtraArgs.end()});
 
@@ -1277,6 +1327,19 @@ int main(int argc, const char **argv) {
       llvm::errs() << "megascope: at least one --source file is required\n";
       return 1;
     }
+    if (!McpMcp && megascopeVerb != MegascopeVerb::Index) {
+      llvm::errs() << "megascope: MCP is the only serve transport\n";
+      return 1;
+    }
+
+    // The verb forms default the index location to
+    // <build-path>/.vycor/megascope.vycs — not $VYCOR_INDEX, which is a
+    // query-side convenience and must never become a write target (see
+    // resolveIndexPath). The legacy verb-less form keeps --snapshot's
+    // opt-in semantics.
+    std::string indexPath = McpIndex;
+    if (megascopeVerb != MegascopeVerb::Legacy && indexPath.empty())
+      indexPath = vycor::defaultIndexPath(McpBuildPath);
 
     std::string dbError;
     auto compDb = clang::tooling::CompilationDatabase::loadFromDirectory(
@@ -1390,8 +1453,8 @@ int main(int argc, const char **argv) {
     auto currentStamps = vycor::SnapshotIO::stampFiles(files);
 
     auto snapLoadStart = StatsClock::now();
-    if (!McpSnapshot.empty()) {
-      if (auto snap = vycor::SnapshotIO::load(McpSnapshot)) {
+    if (!indexPath.empty()) {
+      if (auto snap = vycor::SnapshotIO::load(indexPath)) {
         snapLoadMs = msSince(snapLoadStart);
         bool configMatch =
             snap->meta.collapsePaths == collapsePaths &&
@@ -1441,15 +1504,19 @@ int main(int argc, const char **argv) {
           warmRefreshed = refreshed;
           warmDropped = dropped;
           indexesChanged = refreshed > 0 || dropped > 0;
-          llvm::errs() << "megascope: warm start from " << McpSnapshot
+          llvm::errs() << "megascope: warm start from " << indexPath
                        << " (" << refreshed << " TU(s) re-indexed, "
                        << dropped << " dropped, "
                        << graph.nodeCount() << " nodes, "
                        << graph.edgeCount() << " edges, "
                        << cfIndex.size() << " call sites)\n";
         }
+      } else if (llvm::sys::fs::exists(indexPath)) {
+        llvm::errs() << "megascope: cannot load index " << indexPath
+                     << " (wrong format version or unreadable) — full "
+                        "build\n";
       } else {
-        llvm::errs() << "megascope: no usable snapshot at " << McpSnapshot
+        llvm::errs() << "megascope: no index yet at " << indexPath
                      << " — full build\n";
       }
     }
@@ -1495,9 +1562,10 @@ int main(int argc, const char **argv) {
                    << cfIndex.size() << " call sites)\n";
     }
 
-    if (!McpSnapshot.empty() && !indexesChanged) {
-      llvm::errs() << "megascope: snapshot unchanged — skipping re-save\n";
-    } else if (!McpSnapshot.empty()) {
+    bool saveFailed = false;
+    if (!indexPath.empty() && !indexesChanged) {
+      llvm::errs() << "megascope: index unchanged — skipping re-save\n";
+    } else if (!indexPath.empty()) {
       vycor::SnapshotMeta meta;
       meta.collapsePaths = collapsePaths;
       meta.lockAllowlist = lockCfg.userAllowlist;
@@ -1505,13 +1573,14 @@ int main(int argc, const char **argv) {
       meta.channelTypes = channelCfg.registeredTypes;
       meta.files = std::move(currentStamps);
       auto snapSaveStart = StatsClock::now();
-      if (vycor::SnapshotIO::save(McpSnapshot, graph, cfIndex, meta,
+      if (vycor::SnapshotIO::save(indexPath, graph, cfIndex, meta,
                                   channels)) {
         snapSaveMs = msSince(snapSaveStart);
-        llvm::errs() << "megascope: snapshot saved to " << McpSnapshot << "\n";
+        llvm::errs() << "megascope: index saved to " << indexPath << "\n";
       } else {
-        llvm::errs() << "megascope: WARNING: could not save snapshot to "
-                     << McpSnapshot << "\n";
+        saveFailed = true;
+        llvm::errs() << "megascope: WARNING: could not save index to "
+                     << indexPath << "\n";
       }
     }
 
@@ -1608,6 +1677,24 @@ int main(int argc, const char **argv) {
       }
     }
 
+    if (megascopeVerb == MegascopeVerb::Index) {
+      // The index file is the product: failing to write it is the error.
+      if (saveFailed)
+        return 1;
+      llvm::json::Object summary;
+      summary["index"] = indexPath;
+      summary["mode"] = needFullBuild ? "cold" : "warm";
+      summary["files"] = static_cast<int64_t>(files.size());
+      summary["refreshed"] = static_cast<int64_t>(warmRefreshed);
+      summary["dropped"] = static_cast<int64_t>(warmDropped);
+      summary["nodes"] = static_cast<int64_t>(graph.nodeCount());
+      summary["edges"] = static_cast<int64_t>(graph.edgeCount());
+      summary["call_sites"] = static_cast<int64_t>(cfIndex.size());
+      summary["channel_sites"] = static_cast<int64_t>(channels.size());
+      llvm::outs() << llvm::json::Value(std::move(summary)) << "\n";
+      return 0;
+    }
+
     std::vector<std::string> entryPoints(McpEntryPoints.begin(),
                                          McpEntryPoints.end());
     if (entryPoints.empty())
@@ -1625,6 +1712,7 @@ int main(int argc, const char **argv) {
     vycor::McpServer server(std::move(graph), std::move(cfIndex),
                                  std::move(channels), std::move(entryPoints),
                                  std::move(buildParams));
+    server.setVerbose(McpVerbose);
     return server.run();
   }
 

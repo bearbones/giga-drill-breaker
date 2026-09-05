@@ -17,6 +17,7 @@
 
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
@@ -448,6 +449,9 @@ bool SnapshotIO::save(const std::string &path, const CallGraph &graph,
   // and rename so a crash mid-write never leaves a torn snapshot.
   std::string tmpPath = path + ".tmp";
   {
+    // The default index location lives in a directory that may not exist
+    // yet (<build-path>/.vycor/); the rename below needs it to.
+    llvm::sys::fs::create_directories(llvm::sys::path::parent_path(path));
     std::error_code ec;
     llvm::raw_fd_ostream os(tmpPath, ec, llvm::sys::fs::OF_None);
     if (ec)

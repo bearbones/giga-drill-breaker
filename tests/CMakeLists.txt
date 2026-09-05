@@ -78,6 +78,7 @@ add_executable(vycor_tests
   test_channel_index.cpp
   test_query_tools.cpp
   test_mcp_server.cpp
+  test_megascope_cli.cpp
   test_deep_chains.cpp
   test_snapshot.cpp
   test_worker_pool.cpp

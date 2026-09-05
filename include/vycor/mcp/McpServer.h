@@ -63,6 +63,10 @@ public:
   /// Run the MCP stdio loop. Returns 0 on clean shutdown.
   int run();
 
+  /// Per-request stderr logging (method names, client initialized). Off by
+  /// default: the "server started" readiness line is always printed.
+  void setVerbose(bool verbose) { verbose_ = verbose; }
+
   /// Re-index a single TU. Removes old edges/contexts, re-runs Phase 1+2+3.
   /// Returns {edgesRemoved, edgesAfter, contextsRemoved, contextsAfter}.
   struct ReindexResult {
@@ -74,6 +78,7 @@ public:
   ReindexResult reindexTU(const std::string &filePath);
 
 private:
+  bool verbose_ = false;
   CallGraph graph_;
   ControlFlowIndex cfIndex_;
   ChannelIndex channels_;
