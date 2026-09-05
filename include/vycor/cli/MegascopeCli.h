@@ -46,7 +46,12 @@
 // default, `--pretty` on request, `--format ndjson` (one record per line,
 // preceded by a {"_summary":...} line) or `--format tsv` for list-shaped
 // results (ToolEntry::recordsKey). Exit codes are the CLI's primary
-// signal; see MegascopeExit.
+// signal; see MegascopeExit. `dump` streams every call-site context and
+// channel site (ndjson by default).
+//
+// Ephemeral mode (2.1, 4.1): a query verb given --source/--source-list/
+// --source-re (with --build-path) bakes the selected TUs in memory and
+// answers from that — no index is read or written. What `prism` was.
 // ============================================================================
 
 namespace vycor {

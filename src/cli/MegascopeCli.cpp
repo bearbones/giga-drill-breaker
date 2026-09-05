@@ -16,6 +16,11 @@
 #include "vycor/cli/MegascopeCli.h"
 #include "vycor/callgraph/ControlFlowOracle.h"
 #include "vycor/callgraph/Snapshot.h"
+#include "vycor/cli/BakeConfig.h"
+#include "vycor/cli/SourceSelection.h"
+#include "vycor/query/Serialize.h"
+
+#include "clang/Tooling/CompilationDatabase.h"
 
 #include "llvm/ADT/SmallString.h"
 #include "llvm/Support/FileSystem.h"
@@ -24,6 +29,7 @@
 #include "llvm/Support/Path.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <set>
 #include <string>
@@ -476,7 +482,21 @@ struct CommonOpts {
   bool help = false;
   bool files = false; // info --files
   std::vector<std::string> entryPoints;
+  // Ephemeral mode (§2.1): any of the three selection flags means "bake
+  // these TUs in memory and answer" instead of reading an index. The
+  // remaining four only qualify that bake.
+  std::vector<std::string> sources;   // --source
+  std::string sourceList;             // --source-list
+  std::string sourceRe;               // --source-re
+  std::vector<std::string> skipPaths; // --skip-paths
+  std::vector<std::string> collapsePaths;
+  std::string threads;
+  std::string orgConfig;
   std::vector<std::string> rest; // everything else, in order
+
+  bool ephemeral() const {
+    return !sources.empty() || !sourceList.empty() || !sourceRe.empty();
+  }
 };
 
 /// Split the common query flags out of `argv`. The tool flags that remain
@@ -511,6 +531,7 @@ llvm::Expected<CommonOpts> splitCommonFlags(llvm::ArrayRef<std::string> argv,
     std::replace(keyStorage.begin(), keyStorage.end(), '_', '-');
     const llvm::StringRef key = keyStorage;
     std::string *target = nullptr;
+    std::vector<std::string> *listTarget = nullptr;
     if (a.starts_with("--")) {
       if (key == "index")
         target = &o.index;
@@ -520,9 +541,24 @@ llvm::Expected<CommonOpts> splitCommonFlags(llvm::ArrayRef<std::string> argv,
         target = &o.argsJson;
       else if (key == "format")
         target = &o.format;
+      else if (key == "source-list")
+        target = &o.sourceList;
+      else if (key == "source-re")
+        target = &o.sourceRe;
+      else if (key == "threads")
+        target = &o.threads;
+      else if (key == "org-config")
+        target = &o.orgConfig;
+      else if (key == "entry-point")
+        listTarget = &o.entryPoints;
+      else if (key == "source")
+        listTarget = &o.sources;
+      else if (key == "skip-paths")
+        listTarget = &o.skipPaths;
+      else if (key == "collapse-paths")
+        listTarget = &o.collapsePaths;
     }
-    const bool isEntry = a.starts_with("--") && key == "entry-point";
-    if (!target && !isEntry) {
+    if (!target && !listTarget) {
       o.rest.push_back(argv[i]);
       continue;
     }
@@ -535,8 +571,8 @@ llvm::Expected<CommonOpts> splitCommonFlags(llvm::ArrayRef<std::string> argv,
     } else {
       return usageError("flag '--" + key + "' requires a value");
     }
-    if (isEntry)
-      o.entryPoints.push_back(value.str());
+    if (listTarget)
+      listTarget->push_back(value.str());
     else
       *target = value.str();
   }
@@ -573,9 +609,15 @@ void printVerbHelp(llvm::raw_ostream &os) {
         "  info      Describe a saved index (--files lists indexed TUs)\n"
         "  batch     Answer NDJSON requests {\"tool\":..,\"args\":{..}} from\n"
         "            stdin, one JSON response per line, on one loaded index\n"
+        "  dump      Stream every call-site context and channel site\n"
+        "            (--format ndjson, the default, or json)\n"
         "\n"
         "Query verbs read the index from --index, $VYCOR_INDEX,\n"
         "<build-path>/.vycor/megascope.vycs, or ./.vycor/megascope.vycs.\n"
+        "Given --source/--source-list/--source-re (with --build-path) they\n"
+        "bake the selected TUs in memory instead and answer from that; no\n"
+        "index is read or written (--skip-paths, --collapse-paths,\n"
+        "--threads, and --org-config qualify the bake as for `index`).\n"
         "Run `megascope <tool> --help` for a tool's flags.\n"
         "\n"
         "Exit codes: 0 results, 1 empty, 2 usage, 3 index missing or\n"
@@ -755,6 +797,196 @@ int runBatch(const std::vector<ToolEntry> &tools, const ToolContext &ctx,
 
 } // namespace
 
+// ============================================================================
+// Ephemeral mode (§2.1)
+// ============================================================================
+
+/// Bake the TUs `common` selects in memory — the query-verb counterpart of
+/// `megascope index`, minus the file: the same selection flags, the same
+/// single-parse bake, no snapshot read or written. What `prism --mode
+/// query` used to do. Returns kExitResults with `snapOut` set (leaked on
+/// purpose, like a loaded index), else the exit code to return.
+static int bakeEphemeral(const CommonOpts &common, llvm::StringRef verb,
+                         std::istream &in, llvm::raw_ostream &err,
+                         SnapshotData *&snapOut) {
+  const std::string prefix = ("megascope " + verb + ": ").str();
+  if (!common.index.empty()) {
+    err << prefix
+        << "--source/--source-list/--source-re bake the selected TUs in "
+           "memory; drop --index, or run `megascope index` to bake to a "
+           "file\n";
+    return kExitUsage;
+  }
+  if (common.buildPath.empty()) {
+    err << prefix << "--build-path is required with --source/--source-list/"
+                     "--source-re\n";
+    return kExitUsage;
+  }
+  if (verb == "info") {
+    err << prefix << "describes a saved index; `megascope index` writes one\n";
+    return kExitUsage;
+  }
+  if (verb == "batch" && common.sourceList == "-") {
+    err << prefix << "stdin carries the requests; --source-list - cannot "
+                     "read it too\n";
+    return kExitUsage;
+  }
+  unsigned threads = 0;
+  if (!common.threads.empty() &&
+      llvm::StringRef(common.threads).getAsInteger(10, threads)) {
+    err << prefix << "--threads expects a number, got '" << common.threads
+        << "'\n";
+    return kExitUsage;
+  }
+
+  std::string dbError;
+  auto compDb = clang::tooling::CompilationDatabase::loadFromDirectory(
+      common.buildPath, dbError);
+  if (!compDb) {
+    err << "megascope: cannot load compilation database from "
+        << common.buildPath << ": " << dbError << "\n";
+    return kExitIndex;
+  }
+  SourceSelection sel;
+  sel.explicitFiles = common.sources;
+  sel.listFile = common.sourceList;
+  sel.regex = common.sourceRe;
+  sel.skipPaths = common.skipPaths;
+  auto files = selectSources(*compDb, sel, in);
+  if (!files) {
+    err << "megascope: " << llvm::toString(files.takeError()) << "\n";
+    return kExitUsage;
+  }
+  if (files->empty()) {
+    err << "megascope: the selection matches no TU of " << common.buildPath
+        << "\n";
+    return kExitIndex;
+  }
+
+  std::vector<std::string> collapsePaths = common.collapsePaths;
+  LockTypeConfig lockCfg;
+  ChannelTypeConfig channelCfg;
+  OrgConfig orgCfg;
+  if (!loadOrgConfigIfSet(common.orgConfig, orgCfg))
+    return kExitUsage;
+  mergeExtensionConfig(orgCfg, lockCfg, channelCfg, collapsePaths);
+
+  const auto t0 = std::chrono::steady_clock::now();
+  auto baked = bakeIndexes(*compDb, *files, collapsePaths, threads, nullptr,
+                           "", lockCfg, nullptr, nullptr, channelCfg);
+  auto *snap = new SnapshotData;
+  snap->graph = std::move(baked.graph);
+  snap->cfIndex = std::move(baked.cfIndex);
+  snap->channels = std::move(baked.channels);
+  snap->meta.collapsePaths = collapsePaths;
+  snap->summary.nodes = snap->graph.nodeCount();
+  snap->summary.edges = snap->graph.edgeCount();
+  snap->summary.callSites = snap->cfIndex.size();
+  snap->summary.channelSites = snap->channels.size();
+  snap->loaded = kSectionAll;
+  if (common.verbose) {
+    const double ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - t0)
+                          .count();
+    err << "megascope: baked " << files->size() << " TU(s) in memory ("
+        << snap->summary.nodes << " nodes, " << snap->summary.edges
+        << " edges, " << snap->summary.callSites << " call sites) in "
+        << llvm::format("%.1f", ms) << " ms\n";
+  }
+  snapOut = snap;
+  return kExitResults;
+}
+
+// ============================================================================
+// dump
+// ============================================================================
+
+static llvm::json::Object dumpRecord(const CallSiteContext &ctx) {
+  llvm::json::Object rec;
+  rec["callerName"] = ctx.callerName;
+  rec["callerUsr"] = ctx.callerUsr;
+  rec["calleeName"] = ctx.calleeName;
+  rec["calleeUsr"] = ctx.calleeUsr;
+  rec["callSite"] = ctx.callSite;
+  rec["tu"] = ctx.tuPath;
+  rec["callerNoexcept"] = noexceptSpecToString(ctx.callerNoexcept);
+  rec["insideCatchBlock"] = ctx.insideCatchBlock;
+  llvm::json::Array scopes;
+  for (const auto &scope : ctx.enclosingTryCatches)
+    scopes.push_back(serializeTryCatchScope(scope));
+  rec["enclosingTryCatches"] = std::move(scopes);
+  llvm::json::Array guards;
+  for (const auto &g : ctx.enclosingGuards)
+    guards.push_back(serializeGuard(g));
+  rec["enclosingGuards"] = std::move(guards);
+  llvm::json::Array locals;
+  for (const auto &l : ctx.liveRaiiLocals)
+    locals.push_back(serializeRaiiLocal(l));
+  rec["liveRaiiLocals"] = std::move(locals);
+  return rec;
+}
+
+/// `dump`: every call-site context, then every channel site, streamed —
+/// ndjson writes a {"_summary":...} line then one record per line, each
+/// tagged "kind": "call_site" | "channel_site"; json writes one document
+/// {callSiteCount, callSites: [...], channelSiteCount, channelSites:
+/// [...]} through llvm::json::OStream. Either way the materialized index
+/// is never held whole (ControlFlowIndex::forEachContext).
+static int runDump(const SnapshotData &snap, const CommonOpts &common,
+                   OutputFormat format, llvm::raw_ostream &out,
+                   llvm::raw_ostream &err) {
+  if (!common.rest.empty()) {
+    err << "megascope dump: unexpected argument '" << common.rest.front()
+        << "'\n";
+    return kExitUsage;
+  }
+  if (format == OutputFormat::Tsv) {
+    err << "megascope dump: records are nested; --format tsv is not "
+           "available (use ndjson or json)\n";
+    return kExitUsage;
+  }
+  const auto channelSites = snap.channels.allSites();
+  const int64_t callSiteCount = static_cast<int64_t>(snap.cfIndex.size());
+  const int64_t channelSiteCount = static_cast<int64_t>(channelSites.size());
+
+  if (format == OutputFormat::Ndjson) {
+    llvm::json::Object summary;
+    summary["callSiteCount"] = callSiteCount;
+    summary["channelSiteCount"] = channelSiteCount;
+    llvm::json::Object head;
+    head["_summary"] = std::move(summary);
+    out << llvm::json::Value(std::move(head)) << "\n";
+    snap.cfIndex.forEachContext([&](const CallSiteContext &ctx) {
+      llvm::json::Object rec = dumpRecord(ctx);
+      rec["kind"] = "call_site";
+      out << llvm::json::Value(std::move(rec)) << "\n";
+    });
+    for (const auto &site : channelSites) {
+      llvm::json::Value v = serializeChannelSite(site);
+      llvm::json::Object rec = std::move(*v.getAsObject());
+      rec["kind"] = "channel_site";
+      out << llvm::json::Value(std::move(rec)) << "\n";
+    }
+  } else {
+    llvm::json::OStream J(out, common.pretty ? 2 : 0);
+    J.object([&] {
+      J.attribute("callSiteCount", callSiteCount);
+      J.attributeArray("callSites", [&] {
+        snap.cfIndex.forEachContext([&](const CallSiteContext &ctx) {
+          J.value(llvm::json::Value(dumpRecord(ctx)));
+        });
+      });
+      J.attribute("channelSiteCount", channelSiteCount);
+      J.attributeArray("channelSites", [&] {
+        for (const auto &site : channelSites)
+          J.value(serializeChannelSite(site));
+      });
+    });
+    out << "\n";
+  }
+  return callSiteCount + channelSiteCount > 0 ? kExitResults : kExitEmpty;
+}
+
 int runMegascopeQueryVerb(llvm::ArrayRef<std::string> args,
                           llvm::raw_ostream &out, llvm::raw_ostream &err,
                           std::istream &in) {
@@ -782,7 +1014,8 @@ int runMegascopeQueryVerb(llvm::ArrayRef<std::string> args,
     typed = tail.front();
     toolName = canonicalToolName(typed);
     tail = tail.drop_front();
-  } else if (verb != "tools" && verb != "info" && verb != "batch") {
+  } else if (verb != "tools" && verb != "info" && verb != "batch" &&
+             verb != "dump") {
     toolName = canonicalToolName(verb);
   }
 
@@ -793,7 +1026,8 @@ int runMegascopeQueryVerb(llvm::ArrayRef<std::string> args,
         tool = &t;
     if (!tool) {
       err << "megascope: unknown verb or tool '" << typed
-          << "'. Verbs: index, serve, tools, info, batch, call, <tool>; "
+          << "'. Verbs: index, serve, tools, info, batch, dump, call, "
+             "<tool>; "
              "run `vycor-cpp megascope tools` for the tool list.\n";
       return kExitUsage;
     }
@@ -820,7 +1054,9 @@ int runMegascopeQueryVerb(llvm::ArrayRef<std::string> args,
   if (verb == "tools")
     return runTools(tools, *common, out, err);
 
-  auto format = parseFormat(common->format.empty() ? "json" : common->format);
+  auto format = parseFormat(
+      common->format.empty() ? (verb == "dump" ? "ndjson" : "json")
+                             : common->format);
   if (!format) {
     err << "megascope " << verb << ": " << llvm::toString(format.takeError())
         << "\n";
@@ -857,54 +1093,81 @@ int runMegascopeQueryVerb(llvm::ArrayRef<std::string> args,
     return kExitUsage;
   }
 
-  const char *envIndex = std::getenv("VYCOR_INDEX");
-  const std::string indexPath = resolveIndexPath(
-      common->index, envIndex ? envIndex : "", common->buildPath);
-  if (!llvm::sys::fs::exists(indexPath)) {
-    err << "megascope: no index at " << indexPath
-        << " (run `vycor-cpp megascope index --build-path <dir> ...` first, "
-           "or pass --index)\n";
-    return kExitIndex;
-  }
   // Decode only what the verb reads: info wants the meta section, batch
-  // may run any tool, a single tool declares its needs (§3.1.1).
+  // may run any tool, dump the contexts and channel sites, a single tool
+  // declares its needs (§3.1.1).
   unsigned needs = kSectionAll;
   if (verb == "info")
     needs = 0;
+  else if (verb == "dump")
+    needs = kSectionControlFlow | kSectionChannels;
   else if (verb != "batch")
     needs = tool->needs;
-  SnapshotLoadStats loadStats;
+
   // Deliberately leaked: a one-shot process never frees the indexes.
   // Destroying maps holding millions of entries costs seconds at exit
   // (measured 2-3.5 s against a 5 s load on the 938-TU testbed) and buys
   // nothing — the OS reclaims the pages.
-  auto *snapHolder = new std::optional<SnapshotData>(
-      SnapshotIO::load(indexPath, &loadStats, LoadMode::ReadOnly, needs));
-  auto &snap = *snapHolder;
-  if (!snap) {
-    err << "megascope: cannot load index " << indexPath
-        << " (wrong format version or unreadable; re-run `megascope "
-           "index`)\n";
-    return kExitIndex;
-  }
-  if (common->verbose) {
-    err << "megascope: loaded " << indexPath << " ("
-        << snap->summary.nodes << " nodes, " << snap->summary.edges
-        << " edges, " << snap->summary.callSites << " call sites) in "
-        << llvm::format("%.1f", loadStats.totalMs) << " ms:";
-    for (const auto &sec : loadStats.sections) {
-      err << " " << sec.name << " ";
-      if (sec.skipped)
-        err << "skipped/";
-      else
-        err << llvm::format("%.1f", sec.ms) << " ms/";
-      err << (sec.bytes >> 10) << " KiB";
+  SnapshotData *snap = nullptr;
+  std::string indexPath;
+  if (common->ephemeral()) {
+    int rc = bakeEphemeral(*common, verb, in, err, snap);
+    if (rc != kExitResults)
+      return rc;
+  } else {
+    // The bake qualifiers mean nothing against a saved index; silently
+    // ignoring them would hide a forgotten --source.
+    const char *stray = !common->skipPaths.empty()       ? "--skip-paths"
+                        : !common->collapsePaths.empty() ? "--collapse-paths"
+                        : !common->threads.empty()       ? "--threads"
+                        : !common->orgConfig.empty()     ? "--org-config"
+                                                         : nullptr;
+    if (stray) {
+      err << "megascope " << verb << ": " << stray
+          << " only applies with --source/--source-list/--source-re (the "
+             "in-memory bake); a saved index carries its own\n";
+      return kExitUsage;
     }
-    err << "\n";
+    const char *envIndex = std::getenv("VYCOR_INDEX");
+    indexPath = resolveIndexPath(common->index, envIndex ? envIndex : "",
+                                 common->buildPath);
+    if (!llvm::sys::fs::exists(indexPath)) {
+      err << "megascope: no index at " << indexPath
+          << " (run `vycor-cpp megascope index --build-path <dir> ...` "
+             "first, pass --index, or pass --source to bake in memory)\n";
+      return kExitIndex;
+    }
+    SnapshotLoadStats loadStats;
+    auto *snapHolder = new std::optional<SnapshotData>(
+        SnapshotIO::load(indexPath, &loadStats, LoadMode::ReadOnly, needs));
+    if (!*snapHolder) {
+      err << "megascope: cannot load index " << indexPath
+          << " (wrong format version or unreadable; re-run `megascope "
+             "index`)\n";
+      return kExitIndex;
+    }
+    snap = &**snapHolder;
+    if (common->verbose) {
+      err << "megascope: loaded " << indexPath << " ("
+          << snap->summary.nodes << " nodes, " << snap->summary.edges
+          << " edges, " << snap->summary.callSites << " call sites) in "
+          << llvm::format("%.1f", loadStats.totalMs) << " ms:";
+      for (const auto &sec : loadStats.sections) {
+        err << " " << sec.name << " ";
+        if (sec.skipped)
+          err << "skipped/";
+        else
+          err << llvm::format("%.1f", sec.ms) << " ms/";
+        err << (sec.bytes >> 10) << " KiB";
+      }
+      err << "\n";
+    }
   }
 
   if (verb == "info")
     return runInfo(*snap, indexPath, *common, *format, out, err);
+  if (verb == "dump")
+    return runDump(*snap, *common, *format, out, err);
 
   ControlFlowOracle oracle(snap->graph, snap->cfIndex);
   QueryCache cache;

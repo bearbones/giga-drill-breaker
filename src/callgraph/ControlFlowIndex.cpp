@@ -402,13 +402,19 @@ ControlFlowIndex::unprotectedCallsTo(const std::string &calleeName) const {
   return result;
 }
 
+void ControlFlowIndex::forEachContext(
+    llvm::function_ref<void(const CallSiteContext &)> fn) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  for (const auto &se : contexts_) {
+    if (se.live)
+      fn(materialize(se));
+  }
+}
+
 std::vector<CallSiteContext> ControlFlowIndex::allContexts() const {
   std::vector<CallSiteContext> result;
   result.reserve(liveCount_);
-  for (const auto &se : contexts_) {
-    if (se.live)
-      result.push_back(materialize(se));
-  }
+  forEachContext([&](const CallSiteContext &ctx) { result.push_back(ctx); });
   return result;
 }
 

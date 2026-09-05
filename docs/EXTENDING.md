@@ -26,8 +26,8 @@ config.
 ## Tier 1: the org config file (`--org-config`)
 
 A single JSON file, typically checked into your fork (convention:
-`ext/vycor.org.json`, but any path works) and passed to `anneal`, `prism`,
-and `megascope`:
+`ext/vycor.org.json`, but any path works) and passed to `anneal` and
+`megascope`:
 
 ```bash
 vycor-cpp megascope --build-path build --source ... --org-config ext/vycor.org.json
@@ -98,9 +98,8 @@ in every place guards are reported:
 
 Combined with `inTrueBranch`, this answers "this call site / channel send
 runs only with `NewNav` **on**" (or off, when `inTrueBranch` is false).
-Surfaced in `prism --mode dump`, `prism --query-type call-site-context`
-(via the MCP-equivalent field), the `query_call_site_context` MCP tool, and
-channel-site listings.
+Surfaced in `megascope dump`, the `query_call_site_context` tool (CLI
+verb and MCP), the path tools' `guardsOnPath`, and channel-site listings.
 
 Classification happens at **query/serialization time**, not at index time —
 adding or changing patterns does not invalidate megascope `--snapshot`
@@ -256,8 +255,9 @@ index build:        merged configs drive RAII/lock and channel indexing
                     (and land in snapshot meta for warm-start validation)
 anneal per TU:      built-in analyzer, then each registered AnnealCheck
                     not listed in disabledAnnealChecks
-query/serialize:    guard classifiers annotate guards in prism dump,
-                    query_call_site_context, and channel-site listings
+query/serialize:    guard classifiers annotate guards in megascope dump,
+                    query_call_site_context, the path tools, and
+                    channel-site listings
 ```
 
 `--isolate-workers` note: worker processes receive the already-merged lock

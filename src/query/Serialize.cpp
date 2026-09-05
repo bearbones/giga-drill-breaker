@@ -171,6 +171,53 @@ llvm::json::Value serializeGuard(const ConditionalGuard &g) {
   return llvm::json::Value(std::move(obj));
 }
 
+llvm::json::Value serializeTryCatchScope(const TryCatchScope &scope) {
+  llvm::json::Object s;
+  s["tryLocation"] = scope.tryLocation;
+  s["enclosingFunction"] = scope.enclosingFunction;
+  s["nestingDepth"] = static_cast<int64_t>(scope.nestingDepth);
+  llvm::json::Array handlers;
+  for (const auto &h : scope.handlers) {
+    llvm::json::Object ho;
+    ho["caughtType"] = h.caughtType;
+    ho["isCatchAll"] = h.isCatchAll;
+    ho["location"] = h.location;
+    ho["body"] = h.bodySummary;
+    handlers.push_back(llvm::json::Value(std::move(ho)));
+  }
+  s["handlers"] = std::move(handlers);
+  return llvm::json::Value(std::move(s));
+}
+
+const char *noexceptSpecToString(NoexceptSpec spec) {
+  switch (spec) {
+  case NoexceptSpec::None: return "none";
+  case NoexceptSpec::Noexcept: return "noexcept";
+  case NoexceptSpec::NoexceptFalse: return "noexcept(false)";
+  case NoexceptSpec::ThrowNone: return "throw()";
+  case NoexceptSpec::Unknown: return "unknown";
+  }
+  return "none";
+}
+
+const char *raiiKindToString(RaiiKind k) {
+  switch (k) {
+  case RaiiKind::Lock: return "lock";
+  case RaiiKind::SmartPtr: return "smart_ptr";
+  case RaiiKind::Other: return "other";
+  }
+  return "other";
+}
+
+llvm::json::Value serializeRaiiLocal(const RaiiLocal &l) {
+  llvm::json::Object obj;
+  obj["typeName"] = l.typeName;
+  obj["varName"] = l.varName;
+  obj["declLocation"] = l.declLocation;
+  obj["kind"] = raiiKindToString(l.kind);
+  return llvm::json::Value(std::move(obj));
+}
+
 llvm::json::Value serializeChannelSite(const ChannelSite &s) {
   llvm::json::Object obj;
   obj["channelId"] = s.channelId;

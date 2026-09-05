@@ -24,6 +24,7 @@
 #include "llvm/ADT/SmallString.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/JSON.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <catch2/catch_test_macros.hpp>
@@ -712,4 +713,233 @@ TEST_CASE("tools lists every registered tool", "[megascope][cli]") {
 
   auto stray = run({"tools", "extra"});
   CHECK(stray.code == kExitUsage);
+}
+
+// ============================================================================
+// dump
+// ============================================================================
+
+namespace {
+
+// An index whose control-flow section has two contexts (one under a
+// try/catch with a guard) so dump has something to stream.
+std::string saveContextIndex(llvm::StringRef tag) {
+  CallGraph g;
+  g.addNode({"main", "/src/a.cpp", 10, true, false, ""}, "/src/a.cpp");
+  g.addNode({"helper", "/src/a.cpp", 3, false, false, ""}, "/src/a.cpp");
+  g.addEdge({"main", "helper", EdgeKind::DirectCall, Confidence::Proven,
+             "/src/a.cpp:11:3", 0, ExecutionContext::Synchronous},
+            "/src/a.cpp");
+  ControlFlowIndex cf;
+  {
+    CallSiteContext ctx;
+    ctx.callerName = "main";
+    ctx.calleeName = "helper";
+    ctx.callSite = "/src/a.cpp:11:3";
+    ctx.tuPath = "/src/a.cpp";
+    TryCatchScope scope;
+    scope.tryLocation = "/src/a.cpp:10:3";
+    scope.enclosingFunction = "main";
+    CatchHandlerInfo h;
+    h.caughtType = "std::exception";
+    h.location = "/src/a.cpp:13:3";
+    scope.handlers.push_back(std::move(h));
+    ctx.enclosingTryCatches.push_back(std::move(scope));
+    ConditionalGuard guard;
+    guard.conditionText = "n > \"0\"";
+    guard.location = "/src/a.cpp:10:7";
+    guard.inTrueBranch = true;
+    ctx.enclosingGuards.push_back(std::move(guard));
+    cf.addCallSiteContext(std::move(ctx));
+  }
+  {
+    CallSiteContext ctx;
+    ctx.callerName = "main";
+    ctx.calleeName = "printf";
+    ctx.callSite = "/src/a.cpp:12:3";
+    ctx.tuPath = "/src/a.cpp";
+    ctx.callerNoexcept = NoexceptSpec::Noexcept;
+    cf.addCallSiteContext(std::move(ctx));
+  }
+  SnapshotMeta meta;
+  meta.files = {{"/src/a.cpp", 1, 2}};
+  std::string path = tempIndexPath(tag);
+  REQUIRE(SnapshotIO::save(path, g, cf, meta));
+  return path;
+}
+
+} // namespace
+
+TEST_CASE("dump streams every call-site context", "[megascope][cli]") {
+  std::string path = saveContextIndex("dump");
+
+  SECTION("ndjson is the default: a summary line then one record each") {
+    auto r = run({"dump", "--index", path});
+    CHECK(r.code == kExitResults);
+    CHECK(r.err.empty());
+    auto ls = lines(r.out);
+    REQUIRE(ls.size() == 3);
+    auto head = parseObject(ls[0]);
+    REQUIRE(head.getObject("_summary") != nullptr);
+    CHECK(head.getObject("_summary")->getInteger("callSiteCount") == 2);
+    CHECK(head.getObject("_summary")->getInteger("channelSiteCount") == 0);
+    auto first = parseObject(ls[1]);
+    CHECK(first.getString("kind") == "call_site");
+    CHECK(first.getString("callerName") == "main");
+    CHECK(first.getString("calleeName") == "helper");
+    CHECK(first.getString("tu") == "/src/a.cpp");
+    CHECK(first.getString("callerNoexcept") == "none");
+    REQUIRE(first.getArray("enclosingTryCatches") != nullptr);
+    REQUIRE(first.getArray("enclosingTryCatches")->size() == 1);
+    auto *scope = (*first.getArray("enclosingTryCatches"))[0].getAsObject();
+    CHECK(scope->getString("tryLocation") == "/src/a.cpp:10:3");
+    REQUIRE(first.getArray("enclosingGuards") != nullptr);
+    // The quote in the condition survives (D3: real JSON, not hand-built).
+    CHECK((*first.getArray("enclosingGuards"))[0]
+              .getAsObject()
+              ->getString("conditionText") == "n > \"0\"");
+    auto second = parseObject(ls[2]);
+    CHECK(second.getString("calleeName") == "printf");
+    CHECK(second.getString("callerNoexcept") == "noexcept");
+  }
+
+  SECTION("json is one document with the same records") {
+    auto r = run({"dump", "--index", path, "--format", "json"});
+    CHECK(r.code == kExitResults);
+    CHECK(lines(r.out).size() == 1);
+    auto obj = parseObject(r.out);
+    CHECK(obj.getInteger("callSiteCount") == 2);
+    REQUIRE(obj.getArray("callSites") != nullptr);
+    CHECK(obj.getArray("callSites")->size() == 2);
+    REQUIRE(obj.getArray("channelSites") != nullptr);
+    CHECK(obj.getArray("channelSites")->empty());
+    auto pretty = run({"dump", "--index", path, "--format", "json",
+                       "--pretty"});
+    CHECK(pretty.code == kExitResults);
+    CHECK(lines(pretty.out).size() > 3);
+    CHECK(parseObject(pretty.out).getInteger("callSiteCount") == 2);
+  }
+
+  SECTION("tsv and stray arguments are usage errors") {
+    auto tsv = run({"dump", "--index", path, "--format", "tsv"});
+    CHECK(tsv.code == kExitUsage);
+    CHECK(tsv.err.find("tsv") != std::string::npos);
+    auto stray = run({"dump", "--index", path, "extra"});
+    CHECK(stray.code == kExitUsage);
+  }
+
+  SECTION("an index without contexts is empty") {
+    IndexFile bare("dump-empty");
+    auto r = run({"dump", "--index", bare.path});
+    CHECK(r.code == kExitEmpty);
+    CHECK(lines(r.out).size() == 1);
+  }
+  std::remove(path.c_str());
+}
+
+// ============================================================================
+// Ephemeral mode: --source et al. bake in memory
+// ============================================================================
+
+namespace {
+
+// A compilation database over examples/deep_chains in a scratch directory
+// (the checked-in one carries its author's absolute paths).
+struct ScratchBuildDir {
+  std::string dir;
+  std::string base =
+      std::string(PROJECT_SOURCE_DIR) + "/examples/deep_chains/";
+  ScratchBuildDir() {
+    llvm::SmallString<128> tmp;
+    llvm::sys::path::system_temp_directory(/*ErasedOnReboot=*/true, tmp);
+    llvm::sys::path::append(tmp, "vycor-cli-ephemeral");
+    llvm::SmallString<128> made;
+    REQUIRE(!llvm::sys::fs::createUniqueDirectory(tmp, made));
+    dir = std::string(made);
+    llvm::json::Array entries;
+    for (const char *tu : {"main.cpp", "callbacks.cpp"}) {
+      llvm::json::Object e;
+      e["directory"] = base;
+      e["file"] = base + tu;
+      e["arguments"] = llvm::json::Array{"clang++", "-std=c++17",
+                                         "-I" + base, "-c", base + tu};
+      entries.push_back(std::move(e));
+    }
+    std::error_code ec;
+    llvm::raw_fd_ostream os(dir + "/compile_commands.json", ec);
+    REQUIRE(!ec);
+    os << llvm::json::Value(std::move(entries));
+  }
+  ~ScratchBuildDir() {
+    std::remove((dir + "/compile_commands.json").c_str());
+    llvm::sys::fs::remove(dir);
+  }
+};
+
+} // namespace
+
+TEST_CASE("query verbs bake in memory when given --source",
+          "[megascope][cli][ephemeral]") {
+  ScratchBuildDir build;
+
+  SECTION("a tool answers from the in-memory bake") {
+    auto r = run({"get-callees", "--build-path", build.dir, "--source",
+                  build.base + "main.cpp", "--name", "main", "--threads",
+                  "1", "-v"});
+    CHECK(r.code == kExitResults);
+    CHECK(r.err.find("baked 1 TU(s) in memory") != std::string::npos);
+    auto obj = parseObject(r.out);
+    REQUIRE(obj.getArray("callees") != nullptr);
+    CHECK(!obj.getArray("callees")->empty());
+  }
+
+  SECTION("--source-re selects from the database; dump streams the bake") {
+    auto r = run({"dump", "--build-path", build.dir, "--source-re",
+                  "callbacks\\.cpp$", "--threads", "1"});
+    CHECK(r.code == kExitResults);
+    auto ls = lines(r.out);
+    REQUIRE(ls.size() >= 2);
+    auto head = parseObject(ls[0]);
+    CHECK(head.getObject("_summary")->getInteger("callSiteCount") ==
+          static_cast<int64_t>(ls.size() - 1));
+    auto tu = parseObject(ls[1]).getString("tu");
+    REQUIRE(tu.has_value());
+    CHECK(tu->ends_with("callbacks.cpp"));
+  }
+
+  SECTION("selection that matches nothing") {
+    auto r = run({"get-callers", "--build-path", build.dir, "--source-re",
+                  "nothing-here", "--name", "main"});
+    CHECK(r.code == kExitIndex);
+    CHECK(r.err.find("matches no TU") != std::string::npos);
+  }
+
+  SECTION("usage errors") {
+    auto withIndex = run({"get-callers", "--build-path", build.dir,
+                          "--source", build.base + "main.cpp", "--index",
+                          "/nowhere.vycs", "--name", "main"});
+    CHECK(withIndex.code == kExitUsage);
+    CHECK(withIndex.err.find("drop --index") != std::string::npos);
+    auto noBuild = run({"get-callers", "--source", build.base + "main.cpp",
+                        "--name", "main"});
+    CHECK(noBuild.code == kExitUsage);
+    CHECK(noBuild.err.find("--build-path is required") != std::string::npos);
+    auto info = run({"info", "--build-path", build.dir, "--source",
+                     build.base + "main.cpp"});
+    CHECK(info.code == kExitUsage);
+    auto threads = run({"get-callers", "--build-path", build.dir, "--source",
+                        build.base + "main.cpp", "--threads", "many",
+                        "--name", "main"});
+    CHECK(threads.code == kExitUsage);
+    CHECK(threads.err.find("--threads") != std::string::npos);
+    auto badDb = run({"get-callers", "--build-path", build.dir + "/none",
+                      "--source", build.base + "main.cpp", "--name", "main"});
+    CHECK(badDb.code == kExitIndex);
+    // A bake qualifier without a selection flag is not silently ignored.
+    IndexFile idx("ephemeral-stray");
+    auto stray = run({"get-callers", "--index", idx.path, "--threads", "2",
+                      "--name", "helper"});
+    CHECK(stray.code == kExitUsage);
+    CHECK(stray.err.find("--threads only applies") != std::string::npos);
+  }
 }

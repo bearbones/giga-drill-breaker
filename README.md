@@ -5,7 +5,6 @@ analysis. It exposes four features as subcommands:
 
 - **anneal** — detect problems such as fragile ADL/CTAD resolutions across translation units. Like if `clang-tidy` went Super Saiyan.
 - **morph** — apply rule-driven, multi-pass AST matcher transformations
-- **prism** — query control flow, exception handling, and call site guard context from the command line
 - **megascope** — index a multi-TU call graph once, then query it from the shell (`megascope get-callers --name f`), in batches, or over MCP (Model Context Protocol); designed for LLM-assisted code analysis
 
 Designed as a backend for external systems (e.g. a Python script translating
@@ -216,7 +215,7 @@ legacy check toggles (`--coverage-diag`, `--odr-diag`, `--dead-code` with
 below).
 
 Both analysis phases run per-TU on a worker pool (`--threads`, same
-semantics as prism/megascope). For long runs, `--checkpoint <file>`
+semantics as megascope). For long runs, `--checkpoint <file>`
 journals per-TU progress: a run killed partway (OOM, Ctrl-C, CI timeout)
 resumes where it left off instead of restarting, source edits invalidate
 exactly the affected entries, and a TU whose parse fatally died twice is
@@ -247,54 +246,6 @@ a bind ID for the root node, and an action; passes run in sequence, each
 building on the previous. `--dry-run` collects replacements without
 writing them to disk.
 
-### prism — Query Control Flow and Exception Context
-
-One-shot CLI queries against a compilation database. Useful for quick
-investigations of individual files.
-
-```bash
-# Dump all call sites with guards and try/catch context
-./build/vycor-cpp prism \
-  --build-path /path/to/compile_commands_dir \
-  --source SecurityModule.cpp \
-  --mode dump
-
-# Query exception protection for a specific function
-./build/vycor-cpp prism \
-  --build-path /path/to/compile_commands_dir \
-  --source SecurityModule.cpp \
-  --mode query --query-type exception-protection \
-  --function "RBX::Security::ServerSecurityInstance::onClientChallengeResponse"
-
-# Query call site context (try/catch, guards) at a specific location
-./build/vycor-cpp prism \
-  --build-path /path/to/compile_commands_dir \
-  --source ServerReplicator.cpp \
-  --mode query --query-type call-site-context \
-  --call-site "ServerReplicator.cpp:2342:13"
-```
-
-**Query types**: `exception-protection`, `call-site-context`, `all-path-contexts`,
-`throw-propagation`, `nearest-catches`
-
-**Edge collapse** — reduce noise from header-inlined utility code:
-```bash
-./build/vycor-cpp prism \
-  --build-path /path/to/compile_commands_dir \
-  --source SecurityModule.cpp \
-  --collapse-paths Client/Math \
-  --collapse-paths Client/Core \
-  --mode dump
-```
-
-This skips internal edges where both caller and callee are in collapsed
-paths, while preserving boundary edges (calls from non-collapsed code into
-the collapsed region). `--skip-paths` excludes matching TUs entirely.
-
-Other useful flags: `--threads`, `--pch-dir` (PCH reuse), `--lock-types`
-(extra RAII lock types), `--channel-types-json` (queue/bus tracing),
-`--org-config`.
-
 ### megascope — Cross-TU Call Graph Index and Query Tools
 
 Bakes a unified cross-TU call graph and control-flow index into an index
@@ -316,7 +267,7 @@ batch on one loaded index) or over MCP.
 ./build/vycor-cpp megascope find-call-chain --to Foo::bar --format ndjson
 ./build/vycor-cpp megascope search-functions --query Foo --format tsv | cut -f4
 ./build/vycor-cpp megascope info            # what the index holds
-./build/vycor-cpp megascope tools           # the 21 tools
+./build/vycor-cpp megascope tools           # the 24 tools
 
 # Many queries, one load: NDJSON requests in, one response per line out.
 printf '{"id":1,"tool":"get_callers","args":{"name":"Foo::bar"}}\n' | \
@@ -324,6 +275,13 @@ printf '{"id":1,"tool":"get_callers","args":{"name":"Foo::bar"}}\n' | \
 
 # The same tools over MCP stdio, for clients that speak it.
 ./build/vycor-cpp megascope serve --build-path /path/to/compile_commands_dir
+
+# No index: --source/--source-list/--source-re bake the selected TUs in
+# memory and answer from that (quick single-file investigations).
+./build/vycor-cpp megascope query-nearest-catches --build-path /path/to/compile_commands_dir \
+  --source SecurityModule.cpp --function onClientChallengeResponse
+./build/vycor-cpp megascope dump --build-path /path/to/compile_commands_dir \
+  --source SecurityModule.cpp | jq -c 'select(.kind=="call_site" and .enclosingTryCatches==[])'
 ```
 
 Query verbs find the index via `--index`, `$VYCOR_INDEX`,
@@ -331,11 +289,18 @@ Query verbs find the index via `--index`, `$VYCOR_INDEX`,
 query run from the build directory needs no path at all. Output is compact
 JSON (`--pretty`, `--format ndjson|tsv`); exit codes are the contract:
 0 results, 1 empty, 2 usage, 3 index missing/unreadable, 4 ambiguous name
-(candidates on stdout — re-run with `--usr`).
+(candidates on stdout — re-run with `--usr`). `megascope dump` streams
+every call-site context (caller/callee with USRs, try/catch scopes,
+guards, live RAII locals) and channel site as NDJSON — one record per
+line after a `{"_summary":...}` line — or as one JSON document with
+`--format json`; the stream never holds the materialized index, so it
+scales to the largest indexes.
 
-**21 tools**: `search_functions`, `lookup_function`, `get_callees`,
+**24 tools**: `search_functions`, `lookup_function`, `get_callees`,
 `get_callers`, `find_call_chain`, `query_exception_safety`,
 `query_call_site_context`, `query_raii_scopes_at_callsite`,
+`query_throw_propagation`, `query_all_path_contexts`,
+`query_nearest_catches`,
 `query_locks_held`, `query_same_lock`, `analyze_dead_code`,
 `get_class_hierarchy`, `list_entry_points`, `graph_summary`,
 `list_callback_sites`, `list_concurrency_entry_points`, `list_channels`,
@@ -354,10 +319,13 @@ crashing TU costs only that TU), `--stats-json` (bake timings plus the
 per-section index load split), `-v`. Query verbs also take `-v`, which
 reports the load time section by section.
 
-**Key difference from prism**: `megascope` indexes all specified sources
-into a unified cross-TU call graph held in memory. `prism` parses per
-invocation and is limited to single-TU context. For security audits or
-multi-file analysis, always use `megascope`.
+**Ephemeral mode**: a query verb given `--source`/`--source-list`/
+`--source-re` (with `--build-path`) bakes those TUs in memory and
+answers, reading and writing no index — the former `prism` subcommand.
+`--skip-paths`, `--collapse-paths`, `--threads`, and `--org-config`
+qualify the bake as they do for `index`. The bake sees only the selected
+TUs, so callers in other files are invisible; for security audits or
+multi-file analysis, index the project once and query that.
 
 ---
 
@@ -369,7 +337,7 @@ without editing upstream files (so upstream merges stay conflict-free):
 - **Org config JSON** (`--org-config vycor.org.json`) — declarative:
   in-house lock types for the RAII/lock queries, channel/queue types,
   **feature-flag patterns** (regexes over guard conditions; matching
-  guards are annotated with the flag name in prism/MCP output, so "this
+  guards are annotated with the flag name in query output, so "this
   path only runs with `FFlag::NewNav` on" becomes queryable), collapse
   paths, and per-check kill switches.
 - **`ext/` slot-in directory** — compiled hooks: custom **anneal checks**
@@ -412,7 +380,7 @@ include/vycor/
   compat/                       LLVM-version compat, PCH cache, tool adjusters
 
 src/
-  main.cpp                      CLI entry point (anneal/morph/prism/megascope)
+  main.cpp                      CLI entry point (anneal/morph/megascope)
   anneal/ morph/ callgraph/ query/ cli/ mcp/ ext/ compat/   Implementations
 
 ext/                            Organization slot-in (fork-owned; globbed
@@ -447,7 +415,7 @@ Phase 2 — Analyze:
       → emit Diagnostic entries
 ```
 
-### Single-parse bake (prism / megascope)
+### Single-parse bake
 
 `bakeIndexes()` runs the declaration/hierarchy index, edge building, and
 control-flow context extraction over **one** frontend parse per TU.
@@ -504,6 +472,6 @@ Glass and optics. **vycor** is the Corning glass family the C++ tool draws
 its name from (sibling to Pyrex, more demanding spec); the `-cpp` suffix
 just hints at what it's about. **anneal** surfaces latent stress — ADL/CTAD
 fragility — in order to relieve it. **morph** reshapes amorphous structure —
-AST transforms. **prism** decomposes one point into its components — call-site
-control flow. **megascope** is the persistent far-seeing instrument — the
-cross-TU index and its query verbs.
+AST transforms. **megascope** is the persistent far-seeing instrument — the
+cross-TU index and its query verbs (its ephemeral mode absorbed **prism**,
+which decomposed one point into its components — call-site control flow).

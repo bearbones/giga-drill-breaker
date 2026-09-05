@@ -29,6 +29,7 @@ add_library(vycor_lib
   query/DeadCodeTools.cpp
   query/ChannelTools.cpp
   query/Registry.cpp
+  cli/BakeConfig.cpp
   cli/MegascopeCli.cpp
   cli/SourceSelection.cpp
   ext/Extensions.cpp

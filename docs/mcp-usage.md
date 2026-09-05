@@ -335,23 +335,19 @@ r = call(proc, 1, "search_functions", {"query": "handleServerSecurity"})
 # -> ranked candidates with qualifiedName, file, line
 ```
 
-For bulk name mining outside the server, a `prism` dump also works:
+For bulk name mining outside the server, `megascope dump` streams every
+call-site context as NDJSON (from the saved index, or from an in-memory
+bake of a few files):
 
 ```bash
-# Get a prism dump (faster than megascope for discovery)
-vycor-cpp prism \
+# Every call-site record of two TUs, baked in memory (no index needed)
+vycor-cpp megascope dump \
   --build-path /path/to/build \
-  --source file1.cpp --source file2.cpp \
-  --mode dump --threads 8 > dump.json
+  --source file1.cpp --source file2.cpp --threads 8 > dump.ndjson
 
 # Find callers of interest
-python3 -c "
-import json
-data = json.load(open('dump.json'))
-callers = {s['callerName'] for s in data['callSites']
-           if 'Replicat' in s['callerName']}
-print('\n'.join(sorted(callers)[:50]))
-"
+jq -r 'select(.kind=="call_site" and (.callerName|test("Replicat"))) | .callerName' \
+  dump.ndjson | sort -u | head -50
 ```
 
 Use this to populate `lookup_function` calls and `entry_points` lists
@@ -469,7 +465,8 @@ is hidden.
 
 **`lookup_function` is exact-match only.** Partial names, namespaces
 without the full path, and operator spellings will all fail silently
-with `isError: true`. Mine real names from a prism dump first.
+with `isError: true`. Mine real names from `search_functions` or a
+`megascope dump` first.
 
 **Duplicate edges in `get_callers`/`get_callees`.** The same function can
 appear multiple times with different `callSite` values. Deduplicate on
@@ -489,8 +486,9 @@ paths for older protocol versions. Exception safety audits must include them.
 **Build completeness matters.** TUs that include missing generated headers
 (OpenAPI stubs, Protobuf outputs, reflection registration) will crash
 ClangTool during parsing. The crash guard skips them and reports
-`N TU(s) crashed and were skipped` to stderr. Run a `prism --mode dump`
-pass first to confirm your crash count before a long `megascope` session.
+`N TU(s) crashed and were skipped` to stderr. A `megascope dump
+--source-re ...` pass over a sample confirms your crash count before a
+long `megascope index` run.
 
 **Index build takes time proportional to file count.** Expect roughly
 4–6 seconds per 10 source files at 8 threads on ARM64. For 68 Replicator

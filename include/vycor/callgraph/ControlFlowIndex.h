@@ -22,6 +22,8 @@
 #include "vycor/callgraph/FileStamp.h"
 #include "vycor/callgraph/StringInterner.h"
 
+#include "llvm/ADT/STLFunctionalExtras.h"
+
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -196,7 +198,14 @@ public:
 
   size_t size() const { return liveCount_; }
 
-  // All stored contexts (for dump mode).
+  // Visit every live context, materialized one at a time: `megascope
+  // dump` streams a multi-million-site index through this without ever
+  // holding a second copy of it. Insertion order. The callback must not
+  // call back into this index (mutex_ is held for the whole walk).
+  void forEachContext(
+      llvm::function_ref<void(const CallSiteContext &)> fn) const;
+
+  // All live contexts as one vector (forEachContext collected).
   std::vector<CallSiteContext> allContexts() const;
 
   // Merge another index into this one, id-remapped (the worker-shard merge
