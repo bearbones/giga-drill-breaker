@@ -179,6 +179,13 @@ handlers directly.
 |---|---|
 | `MegascopeCli.h/.cpp` | The query verbs (`<tool>`, `call`, `tools`, `info`, `batch`): `parseToolArgs` derives `--flags` from each tool's JSON Schema (strings take a value, integers parse, booleans are bare, arrays repeat; hyphens and underscores interchangeable; `--args '<json>'` seeds), `emitToolResult` implements the output contract (compact JSON / `--pretty` / `--format ndjson` with a leading `{"_summary":...}` line / `--format tsv` with sorted columns) and `exitCodeFor` the exit codes (0 results, 1 empty, 2 usage, 3 index, 4 ambiguous); `resolveIndexPath` is the `--index` → `$VYCOR_INDEX` → `<build-path>/.vycor/megascope.vycs` → `./.vycor/megascope.vycs` chain |
 
+The query verbs load the index with `LoadMode::ReadOnly`
+(`callgraph/Snapshot.h`): the edge dedup map and per-TU provenance that
+only `removeTU`/`absorb` read are skipped (halves the load on the 938-TU
+testbed), the graph asserts on any later mutation, and the loaded
+indexes are deliberately leaked at exit. `index`/`serve` and worker
+shards load `Mutable`.
+
 `main.cpp` peels the verb off argv before `llvm::cl` runs: query verbs
 never touch `llvm::cl`; `index` and `serve` share the bake option block
 with the legacy verb-less form (which keeps `--snapshot`'s opt-in

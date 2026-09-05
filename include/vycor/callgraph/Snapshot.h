@@ -92,6 +92,15 @@ struct SnapshotLoadStats {
   double totalMs = 0;
 };
 
+/// What the loaded indexes will be used for. ReadOnly skips the state that
+/// only mutation needs — CallGraph's edge dedup key map and per-TU
+/// provenance (edgeIndex_, tuEdges_, nodeContributors_, tuNodes_), the
+/// ControlFlowIndex set-dedup keys and per-TU map, ChannelIndex's per-TU
+/// map — none of which a query reads (docs/megascope-cli-review.md §3.1.2).
+/// A read-only graph asserts if mutated afterwards; `index`/`serve` and
+/// worker shards must load Mutable.
+enum class LoadMode { Mutable, ReadOnly };
+
 class SnapshotIO {
 public:
   /// Current on-disk format version. Bump on any layout change.
@@ -130,7 +139,8 @@ public:
   /// receives the per-section decode timing (filled even on failure, up
   /// to the section that failed).
   static std::optional<SnapshotData>
-  load(const std::string &path, SnapshotLoadStats *stats = nullptr);
+  load(const std::string &path, SnapshotLoadStats *stats = nullptr,
+       LoadMode mode = LoadMode::Mutable);
 
   /// Stat the given files into stamps. Files that cannot be stat'ed get
   /// mtimeNs = 0 and size = 0 (which never matches a real stamp, forcing a

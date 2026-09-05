@@ -867,8 +867,8 @@ int runMegascopeQueryVerb(llvm::ArrayRef<std::string> args,
   // Destroying maps holding millions of entries costs seconds at exit
   // (measured 2-3.5 s against a 5 s load on the 938-TU testbed) and buys
   // nothing — the OS reclaims the pages.
-  auto *snapHolder =
-      new std::optional<SnapshotData>(SnapshotIO::load(indexPath, &loadStats));
+  auto *snapHolder = new std::optional<SnapshotData>(
+      SnapshotIO::load(indexPath, &loadStats, LoadMode::ReadOnly));
   auto &snap = *snapHolder;
   if (!snap) {
     err << "megascope: cannot load index " << indexPath

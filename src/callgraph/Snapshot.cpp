@@ -474,9 +474,11 @@ bool SnapshotIO::save(const std::string &path, const CallGraph &graph,
 }
 
 std::optional<SnapshotData> SnapshotIO::load(const std::string &path,
-                                             SnapshotLoadStats *stats) {
+                                             SnapshotLoadStats *stats,
+                                             LoadMode mode) {
   using SId = StringInterner::Id;
   using Clock = std::chrono::steady_clock;
+  const bool mutableLoad = mode == LoadMode::Mutable;
 
   const auto loadStart = Clock::now();
   auto bufOrErr = llvm::MemoryBuffer::getFile(path, /*IsText=*/false,
@@ -552,12 +554,16 @@ std::optional<SnapshotData> SnapshotIO::load(const std::string &path,
     // Freshly constructed and not yet shared, but keep the mutating-ops-
     // hold-mutex_ discipline while writing private state.
     std::lock_guard<std::mutex> lock(g.mutex_);
+    g.readOnly_ = !mutableLoad;
 
     // Nodes: direct install, rebuilding nodeContributors_/tuNodes_ from the
-    // per-node contributor lists.
+    // per-node contributor lists (skipped over on a read-only load: they
+    // exist for removeTU/absorb only, and were ~12 us per node — 1.2 s of
+    // a 5.3 s load on the 938-TU testbed).
     uint32_t nodeCount = r.count();
     g.nodes_.reserve(nodeCount);
-    g.nodeContributors_.reserve(nodeCount);
+    if (mutableLoad)
+      g.nodeContributors_.reserve(nodeCount);
     g.outEdges_.reserve(nodeCount);
     g.inEdges_.reserve(nodeCount);
     for (uint32_t i = 0; r.ok && i < nodeCount; ++i) {
@@ -583,8 +589,8 @@ std::optional<SnapshotData> SnapshotIO::load(const std::string &path,
       g.nodes_.emplace(nameId, std::move(node));
       for (uint32_t c = 0; r.ok && c < contribCount; ++c) {
         SId tuId = gid(r.u32());
-        if (!r.ok)
-          break;
+        if (!r.ok || !mutableLoad)
+          continue;
         if (g.nodeContributors_[nameId].insert(tuId).second)
           g.tuNodes_[tuId].push_back(nameId);
       }
@@ -596,7 +602,8 @@ std::optional<SnapshotData> SnapshotIO::load(const std::string &path,
     // rebuilding edgeIndex_/outEdges_/inEdges_/tuEdges_ as we go. Saved
     // edges are all live, so refs == 0 marks a corrupt record.
     uint32_t edgeCount = r.count();
-    g.edgeIndex_.reserve(edgeCount);
+    if (mutableLoad)
+      g.edgeIndex_.reserve(edgeCount);
     for (uint32_t i = 0; r.ok && i < edgeCount; ++i) {
       CallGraph::StoredEdge se;
       se.caller = gid(r.u32());
@@ -615,12 +622,13 @@ std::optional<SnapshotData> SnapshotIO::load(const std::string &path,
       size_t idx = g.edges_.size();
       g.outEdges_[se.caller].push_back(idx);
       g.inEdges_[se.callee].push_back(idx);
-      g.edgeIndex_.emplace(CallGraph::keyOf(se), idx);
+      if (mutableLoad)
+        g.edgeIndex_.emplace(CallGraph::keyOf(se), idx);
       g.edges_.push_back(se);
       ++g.liveEdgeCount_;
       for (uint32_t c = 0; r.ok && c < contribCount; ++c) {
         SId tuId = gid(r.u32());
-        if (r.ok)
+        if (r.ok && mutableLoad)
           g.tuEdges_[tuId].push_back(idx);
       }
     }
@@ -762,7 +770,7 @@ std::optional<SnapshotData> SnapshotIO::load(const std::string &path,
     // Rebuild the dedup key maps so post-load addCallSiteContext dedups
     // against the loaded tables (tables are small; the empty entry 0 is
     // never keyed — intern*Set returns 0 for empty sets structurally).
-    if (r.ok) {
+    if (r.ok && mutableLoad) {
       for (uint32_t i = 1; i < cf.scopeSets_.size(); ++i)
         cf.scopeSetIds_.emplace(
             ControlFlowIndex::scopeSetKey(cf.scopeSets_[i]), i);
@@ -802,7 +810,7 @@ std::optional<SnapshotData> SnapshotIO::load(const std::string &path,
         break;
       cf.insertStored(caller, callee, callerDisplay, calleeDisplay, site,
                       tuPath, scopeSet, guardSet, raiiSet, noexceptSpec,
-                      insideCatch);
+                      insideCatch, /*trackTu=*/mutableLoad);
     }
     mark("cf_contexts");
   }
@@ -860,8 +868,9 @@ std::optional<SnapshotData> SnapshotIO::load(const std::string &path,
       ch.byFunctionUsr_[funcUsr].push_back(idx);
       if (differentDisplay)
         ch.byFunctionDisplay_[funcDisplay].push_back(idx);
-      for (const auto &tu : tus)
-        ch.byTu_[tu].push_back(idx);
+      if (mutableLoad)
+        for (const auto &tu : tus)
+          ch.byTu_[tu].push_back(idx);
       ++ch.liveCount_;
     }
     mark("channels");

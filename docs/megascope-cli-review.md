@@ -252,6 +252,14 @@ edges, hierarchy/returns, CF interner, CF contexts, channels. Then:
   stopped destroying the indexes at exit (now leaked deliberately; the
   remaining ~1 s is kernel time faulting in and unmapping 2 GB of heap,
   which only a smaller working set — 3.1.2, 3.1.5 — reduces).
+
+  **3.1.2 measured** (same testbed, `LoadMode::ReadOnly` — the one-shot
+  verbs skip `edgeIndex_`, `tuEdges_`, `nodeContributors_`, `tuNodes_`,
+  the CF set-key maps and `byTu_`, the channel `byTu_`): nodes 1200 →
+  130 ms, edges 300 → 65 ms, cf_contexts 3000–3500 → 2250–2360 ms, load
+  total 5.1–5.6 → 2.9–3.0 s, one-shot wall 6.2–6.9 → 3.9–4.1 s, RSS 2.1
+  → 1.5 GB. The remaining load is 75% `cf_contexts`; a graph-only tool
+  under a sectioned layout (3.1.1) would load in about 0.65 s.
 - Declare per-tool needs in `McpToolEntry` (a small `Needs` bitmask) so
   the CLI dispatcher knows what to load, and `batch`/`serve` load
   everything.
@@ -443,8 +451,9 @@ parallel warm refresh is still open; #58 only falls back to the cold
 bake when more than half the selection is dirty. Item 6's measurement
 landed next (`SnapshotLoadStats`: `--stats-json` `snapshot.load_sections`
 and the query verbs' `-v`; numbers under 3.1.1) together with the
-leak-at-exit for one-shot verbs; the sectioned v8 layout and read-only
-load mode follow it as separate PRs. Entry points are still a query-time flag
+leak-at-exit for one-shot verbs (#59), then the read-only load mode
+(3.1.2, numbers under 3.1.1 too). The sectioned v8 layout with per-tool
+`Needs` is the remaining half of item 6. Entry points are still a query-time flag
 (`--entry-point`) because the index does not record them; fold that into
 the v8 meta with item 6.
 
