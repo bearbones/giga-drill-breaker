@@ -24,6 +24,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <cstdio>
+#include <iterator>
 #include <fstream>
 #include <string>
 
@@ -199,8 +200,8 @@ TEST_CASE("snapshot round-trips graph, CF index, and meta",
                        "meta", "graph_interner", "nodes", "edges",
                        "graph_relations", "cf_interner", "cf_set_tables",
                        "cf_contexts", "channels"});
-    // Everything after the 8-byte magic + version header is a section.
-    CHECK(bytes + 8 == loadStats.fileBytes);
+    // Everything after the fixed header is a section.
+    CHECK(bytes + SnapshotIO::kHeaderBytes == loadStats.fileBytes);
     CHECK(loadStats.totalMs >= 0);
   }
 
@@ -286,6 +287,81 @@ TEST_CASE("snapshot round-trips graph, CF index, and meta",
     REQUIRE(bare.has_value());
     CHECK(bare->callerNoexcept == NoexceptSpec::Noexcept);
   }
+}
+
+TEST_CASE("a sectioned load decodes only the requested sections",
+          "[snapshot]") {
+  auto path = tempSnapshotPath("sections");
+  CallGraph g = makeGraph();
+  ControlFlowIndex cf = makeCfIndex();
+  SnapshotMeta meta = makeMeta();
+  meta.entryPoints = {"main", "worker_entry"};
+  REQUIRE(SnapshotIO::save(path, g, cf, meta));
+
+  SECTION("meta only: header counts and entry points, empty indexes") {
+    SnapshotLoadStats stats;
+    auto snap = SnapshotIO::load(path, &stats, LoadMode::ReadOnly, 0);
+    REQUIRE(snap.has_value());
+    CHECK(snap->loaded == 0);
+    CHECK(snap->summary.nodes == g.nodeCount());
+    CHECK(snap->summary.edges == g.edgeCount());
+    CHECK(snap->summary.callSites == cf.size());
+    CHECK(snap->summary.channelSites == 0);
+    CHECK(snap->meta.entryPoints ==
+          std::vector<std::string>{"main", "worker_entry"});
+    CHECK(snap->graph.nodeCount() == 0);
+    CHECK(snap->cfIndex.size() == 0);
+    std::vector<std::string> names;
+    size_t skipped = 0;
+    for (const auto &sec : stats.sections) {
+      names.push_back(sec.name);
+      skipped += sec.skipped;
+      if (sec.skipped)
+        CHECK(sec.bytes > 0);
+    }
+    CHECK(names == std::vector<std::string>{"meta", "graph", "control_flow",
+                                            "channels"});
+    CHECK(skipped == 3);
+  }
+
+  SECTION("graph only: queries work, control flow stays empty") {
+    auto snap =
+        SnapshotIO::load(path, nullptr, LoadMode::ReadOnly, kSectionGraph);
+    REQUIRE(snap.has_value());
+    CHECK(snap->loaded == kSectionGraph);
+    CHECK(snap->graph.calleesOf("main").size() == 3);
+    CHECK(snap->cfIndex.size() == 0);
+    CHECK(snap->summary.callSites == 2);
+  }
+
+  SECTION("control flow only") {
+    auto snap = SnapshotIO::load(path, nullptr, LoadMode::ReadOnly,
+                                 kSectionControlFlow);
+    REQUIRE(snap.has_value());
+    CHECK(snap->loaded == kSectionControlFlow);
+    CHECK(snap->graph.nodeCount() == 0);
+    CHECK(snap->cfIndex.contextAtSite("/src/a.cpp:11:3").has_value());
+  }
+
+  SECTION("a section table pointing past the file is rejected") {
+    std::string bytes;
+    {
+      std::ifstream in(path, std::ios::binary);
+      bytes.assign(std::istreambuf_iterator<char>(in), {});
+    }
+    // Corrupt the graph entry's length (kind byte at 4+4+32+4, then the
+    // meta entry: 17 bytes; graph entry length lives 9 bytes into it).
+    size_t graphLen = 4 + 4 + 32 + 4 + 17 + 1 + 8;
+    REQUIRE(bytes.size() > graphLen + 8);
+    for (int i = 0; i < 8; ++i)
+      bytes[graphLen + i] = static_cast<char>(0xff);
+    {
+      std::ofstream out(path, std::ios::binary | std::ios::trunc);
+      out << bytes;
+    }
+    CHECK_FALSE(SnapshotIO::load(path).has_value());
+  }
+  std::remove(path.c_str());
 }
 
 TEST_CASE("a read-only load answers the same queries as a mutable one",

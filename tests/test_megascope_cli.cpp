@@ -239,6 +239,40 @@ TEST_CASE("parseToolArgs maps schema property types onto flags",
   }
 }
 
+TEST_CASE("tools declare the index sections they read", "[megascope][cli]") {
+  auto tools = getRegisteredTools();
+  CHECK(toolNamed(tools, "get_callers").needs == kSectionGraph);
+  CHECK(toolNamed(tools, "graph_summary").needs == kSectionGraph);
+  CHECK(toolNamed(tools, "query_exception_safety").needs ==
+        (kSectionGraph | kSectionControlFlow));
+  CHECK(toolNamed(tools, "query_same_lock").needs ==
+        (kSectionGraph | kSectionControlFlow));
+  CHECK(toolNamed(tools, "list_channels").needs ==
+        (kSectionGraph | kSectionChannels));
+  CHECK(toolNamed(tools, "reindex_tu").needs == kSectionAll);
+  CHECK(sectionNames(kSectionGraph | kSectionChannels) ==
+        std::vector<std::string>{"graph", "channels"});
+
+  SECTION("the query verbs load only those sections") {
+    IndexFile idx("needs");
+    auto r = run({"graph-summary", "--index", idx.path, "-v"});
+    CHECK(r.code == kExitResults);
+    CHECK(r.err.find("control_flow skipped/") != std::string::npos);
+    CHECK(r.err.find("channels skipped/") != std::string::npos);
+    CHECK(r.err.find(" nodes ") != std::string::npos);
+    CHECK(parseObject(r.out).getInteger("nodeCount") == 4);
+
+    auto info = run({"info", "--index", idx.path, "-v"});
+    CHECK(info.err.find("graph skipped/") != std::string::npos);
+    CHECK(parseObject(info.out).getInteger("nodes") == 4);
+    CHECK(parseObject(info.out).getArray("entry_points") != nullptr);
+
+    auto tools = run({"tools", "--format", "json"});
+    CHECK(tools.out.find("\"needs\":[\"graph\",\"control_flow\"]") !=
+          std::string::npos);
+  }
+}
+
 TEST_CASE("records keys name real list members", "[megascope][cli]") {
   auto tools = getRegisteredTools();
   CHECK(toolNamed(tools, "query_locks_held").recordsKey == "paths");

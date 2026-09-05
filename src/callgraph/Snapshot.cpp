@@ -21,6 +21,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <unordered_map>
 
@@ -171,6 +172,9 @@ void emitMeta(std::string &out, const SnapshotMeta &meta) {
     putU64(out, f.mtimeNs);
     putU64(out, f.size);
   }
+  putU32(out, static_cast<uint32_t>(meta.entryPoints.size()));
+  for (const auto &s : meta.entryPoints)
+    putLenStr(out, s);
 }
 
 bool readMeta(Reader &r, SnapshotMeta &meta) {
@@ -192,8 +196,19 @@ bool readMeta(Reader &r, SnapshotMeta &meta) {
     fs.size = r.u64();
     meta.files.push_back(std::move(fs));
   }
+  n = r.count();
+  for (uint32_t i = 0; r.ok && i < n; ++i)
+    meta.entryPoints.push_back(r.lenStr());
   return r.ok;
 }
+
+// v8 section table kinds, in file order. The bit a kind maps to in
+// IndexSection is 1 << (kind - 1); meta (kind 0) is always present.
+constexpr uint8_t kMetaKind = 0;
+constexpr uint8_t kGraphKind = 1;
+constexpr uint8_t kControlFlowKind = 2;
+constexpr uint8_t kChannelsKind = 3;
+constexpr uint32_t kSectionKinds = 4;
 
 void emitInternerTable(std::string &out, const StringInterner &interner) {
   putU32(out, static_cast<uint32_t>(interner.size()));
@@ -221,9 +236,10 @@ bool SnapshotIO::save(const std::string &path, const CallGraph &graph,
                       const ControlFlowIndex &cfIndex,
                       const SnapshotMeta &meta, const ChannelIndex &channels) {
   using SId = StringInterner::Id;
-  std::string data;
+  // One buffer per v8 section, concatenated behind the header below.
+  std::string sections[kSectionKinds];
 
-  emitMeta(data, meta);
+  emitMeta(sections[kMetaKind], meta);
 
   {
     // Reading private state directly; hold the graph lock for a consistent
@@ -232,6 +248,7 @@ bool SnapshotIO::save(const std::string &path, const CallGraph &graph,
     // lock too, so the interner cannot grow between the table emit and the
     // record emits below.
     std::lock_guard<std::mutex> lock(graph.mutex_);
+    std::string &data = sections[kGraphKind];
 
     emitInternerTable(data, graph.interner_);
 
@@ -333,6 +350,7 @@ bool SnapshotIO::save(const std::string &path, const CallGraph &graph,
   // raw-id records.
   {
     std::lock_guard<std::mutex> lock(cfIndex.mutex_);
+    std::string &data = sections[kControlFlowKind];
 
     emitInternerTable(data, cfIndex.interner_);
 
@@ -407,6 +425,7 @@ bool SnapshotIO::save(const std::string &path, const CallGraph &graph,
   // correctly across several contributing TUs after a warm start.
   {
     std::lock_guard<std::mutex> lock(channels.mutex_);
+    std::string &data = sections[kChannelsKind];
 
     std::unordered_map<size_t, std::vector<std::string>> siteTus;
     for (const auto &[tuPath, idxs] : channels.byTu_)
@@ -445,8 +464,9 @@ bool SnapshotIO::save(const std::string &path, const CallGraph &graph,
     }
   }
 
-  // Assemble the file: header, then the data section. Write to a temp file
-  // and rename so a crash mid-write never leaves a torn snapshot.
+  // Assemble the file: header (version, summary counts, section table),
+  // then the sections. Write to a temp file and rename so a crash
+  // mid-write never leaves a torn snapshot.
   std::string tmpPath = path + ".tmp";
   {
     // The default index location lives in a directory that may not exist
@@ -460,7 +480,22 @@ bool SnapshotIO::save(const std::string &path, const CallGraph &graph,
     os.write(kMagic, 4);
     std::string header;
     putU32(header, kFormatVersion);
-    os << header << data;
+    putU64(header, graph.nodeCount());
+    putU64(header, graph.edgeCount());
+    putU64(header, cfIndex.size());
+    putU64(header, channels.size());
+    putU32(header, kSectionKinds);
+    uint64_t offset = kHeaderBytes;
+    for (uint32_t kind = 0; kind < kSectionKinds; ++kind) {
+      putU8(header, static_cast<uint8_t>(kind));
+      putU64(header, offset);
+      putU64(header, sections[kind].size());
+      offset += sections[kind].size();
+    }
+    assert(header.size() + 4 == kHeaderBytes);
+    os << header;
+    for (const auto &section : sections)
+      os << section;
     os.flush();
     if (os.has_error())
       return false;
@@ -475,7 +510,7 @@ bool SnapshotIO::save(const std::string &path, const CallGraph &graph,
 
 std::optional<SnapshotData> SnapshotIO::load(const std::string &path,
                                              SnapshotLoadStats *stats,
-                                             LoadMode mode) {
+                                             LoadMode mode, unsigned needs) {
   using SId = StringInterner::Id;
   using Clock = std::chrono::steady_clock;
   const bool mutableLoad = mode == LoadMode::Mutable;
@@ -524,356 +559,437 @@ std::optional<SnapshotData> SnapshotIO::load(const std::string &path,
     finish();
     return std::nullopt;
   }
-  sectionStart = r.p; // the 8-byte magic + version header is no section
 
   SnapshotData out;
+  out.summary.nodes = r.u64();
+  out.summary.edges = r.u64();
+  out.summary.callSites = r.u64();
+  out.summary.channelSites = r.u64();
+
+  // Section table: every kind must be present exactly once and lie within
+  // the file. Each section is decoded through its own bounded Reader, so
+  // a record overrunning its section is caught as corruption.
+  struct Range {
+    const char *begin = nullptr;
+    uint64_t length = 0;
+    bool present = false;
+  };
+  Range ranges[kSectionKinds];
+  const uint64_t fileSize = buf->getBufferSize();
+  uint32_t tableCount = r.u32();
+  if (!r.ok || tableCount != kSectionKinds) {
+    finish();
+    return std::nullopt;
+  }
+  for (uint32_t i = 0; r.ok && i < tableCount; ++i) {
+    uint8_t kind = r.u8();
+    uint64_t offset = r.u64();
+    uint64_t length = r.u64();
+    if (!r.ok || kind >= kSectionKinds || ranges[kind].present ||
+        offset > fileSize || length > fileSize - offset) {
+      r.ok = false;
+      break;
+    }
+    ranges[kind] = Range{buf->getBufferStart() + offset, length, true};
+  }
+  if (!r.ok || static_cast<uint64_t>(r.p - buf->getBufferStart()) !=
+                   kHeaderBytes) {
+    finish();
+    return std::nullopt;
+  }
+  auto beginSection = [&](uint8_t kind) {
+    r = Reader{ranges[kind].begin, ranges[kind].begin + ranges[kind].length};
+    sectionStart = r.p;
+    sectionClock = Clock::now();
+  };
+  // A section must be consumed exactly; a short read is layout drift.
+  auto sectionDone = [&]() {
+    if (r.ok && r.p != r.end)
+      r.ok = false;
+  };
+  auto skipSection = [&](const char *name, uint8_t kind) {
+    if (stats) {
+      SnapshotLoadSection sec;
+      sec.name = name;
+      sec.bytes = ranges[kind].length;
+      sec.skipped = true;
+      stats->sections.push_back(sec);
+    }
+  };
+
+  beginSection(kMetaKind);
   if (!readMeta(r, out.meta)) {
+    finish();
+    return std::nullopt;
+  }
+  sectionDone();
+  if (!r.ok) {
     finish();
     return std::nullopt;
   }
   mark("meta");
 
-  // Graph interner table: installed ids match the saved ids by position, so
-  // every raw id below is valid verbatim — no interning per record.
-  if (!readInternerTable(r, out.graph.interner_)) {
-    finish();
-    return std::nullopt;
-  }
-  mark("graph_interner");
-
-  {
-    CallGraph &g = out.graph;
-    const uint32_t internedCount = static_cast<uint32_t>(g.interner_.size());
-    // Bounds-check a stored graph-interner id (corrupt-input guard).
-    auto gid = [&](uint32_t id) {
-      if (id >= internedCount)
-        r.ok = false;
-      return id;
-    };
-
-    // Freshly constructed and not yet shared, but keep the mutating-ops-
-    // hold-mutex_ discipline while writing private state.
-    std::lock_guard<std::mutex> lock(g.mutex_);
-    g.readOnly_ = !mutableLoad;
-
-    // Nodes: direct install, rebuilding nodeContributors_/tuNodes_ from the
-    // per-node contributor lists (skipped over on a read-only load: they
-    // exist for removeTU/absorb only, and were ~12 us per node — 1.2 s of
-    // a 5.3 s load on the 938-TU testbed).
-    uint32_t nodeCount = r.count();
-    g.nodes_.reserve(nodeCount);
-    if (mutableLoad)
-      g.nodeContributors_.reserve(nodeCount);
-    g.outEdges_.reserve(nodeCount);
-    g.inEdges_.reserve(nodeCount);
-    for (uint32_t i = 0; r.ok && i < nodeCount; ++i) {
-      SId nameId = gid(r.u32());
-      SId displayId = gid(r.u32());
-      CallGraphNode node;
-      node.file = r.lenStr();
-      node.line = r.u32();
-      uint8_t flags = r.u8();
-      node.isEntryPoint = (flags & 1) != 0;
-      node.isVirtual = (flags & 2) != 0;
-      node.enclosingClass = r.lenStr();
-      uint32_t contribCount = r.count();
-      if (!r.ok)
-        break;
-      node.usr = g.interner_.resolve(nameId);
-      node.qualifiedName = g.interner_.resolve(displayId);
-      // Rebuild the disambiguation index (no extra serialization needed).
-      auto &candidates = g.byName_[displayId];
-      if (std::find(candidates.begin(), candidates.end(), nameId) ==
-          candidates.end())
-        candidates.push_back(nameId);
-      g.nodes_.emplace(nameId, std::move(node));
-      for (uint32_t c = 0; r.ok && c < contribCount; ++c) {
-        SId tuId = gid(r.u32());
-        if (!r.ok || !mutableLoad)
-          continue;
-        if (g.nodeContributors_[nameId].insert(tuId).second)
-          g.tuNodes_[tuId].push_back(nameId);
-      }
+  if (needs & kSectionGraph) {
+    beginSection(kGraphKind);
+    // Graph interner table: installed ids match the saved ids by position, so
+    // every raw id below is valid verbatim — no interning per record.
+    if (!readInternerTable(r, out.graph.interner_)) {
+      finish();
+      return std::nullopt;
     }
+    mark("graph_interner");
 
-    mark("nodes");
+    {
+      CallGraph &g = out.graph;
+      const uint32_t internedCount = static_cast<uint32_t>(g.interner_.size());
+      // Bounds-check a stored graph-interner id (corrupt-input guard).
+      auto gid = [&](uint32_t id) {
+        if (id >= internedCount)
+          r.ok = false;
+        return id;
+      };
 
-    // Edges: direct install (indices are the new deque positions),
-    // rebuilding edgeIndex_/outEdges_/inEdges_/tuEdges_ as we go. Saved
-    // edges are all live, so refs == 0 marks a corrupt record.
-    uint32_t edgeCount = r.count();
-    if (mutableLoad)
-      g.edgeIndex_.reserve(edgeCount);
-    for (uint32_t i = 0; r.ok && i < edgeCount; ++i) {
-      CallGraph::StoredEdge se;
-      se.caller = gid(r.u32());
-      se.callee = gid(r.u32());
-      se.callSite = gid(r.u32());
-      se.kind = static_cast<EdgeKind>(r.u8());
-      se.confidence = static_cast<Confidence>(r.u8());
-      se.execContext = static_cast<ExecutionContext>(r.u8());
-      se.indirectionDepth = r.u32();
-      se.refs = r.u32();
-      uint32_t contribCount = r.count();
-      if (se.refs == 0)
-        r.ok = false;
-      if (!r.ok)
-        break;
-      size_t idx = g.edges_.size();
-      g.outEdges_[se.caller].push_back(idx);
-      g.inEdges_[se.callee].push_back(idx);
+      // Freshly constructed and not yet shared, but keep the mutating-ops-
+      // hold-mutex_ discipline while writing private state.
+      std::lock_guard<std::mutex> lock(g.mutex_);
+      g.readOnly_ = !mutableLoad;
+
+      // Nodes: direct install, rebuilding nodeContributors_/tuNodes_ from the
+      // per-node contributor lists (skipped over on a read-only load: they
+      // exist for removeTU/absorb only, and were ~12 us per node — 1.2 s of
+      // a 5.3 s load on the 938-TU testbed).
+      uint32_t nodeCount = r.count();
+      g.nodes_.reserve(nodeCount);
       if (mutableLoad)
-        g.edgeIndex_.emplace(CallGraph::keyOf(se), idx);
-      g.edges_.push_back(se);
-      ++g.liveEdgeCount_;
-      for (uint32_t c = 0; r.ok && c < contribCount; ++c) {
-        SId tuId = gid(r.u32());
-        if (r.ok && mutableLoad)
-          g.tuEdges_[tuId].push_back(idx);
-      }
-    }
-
-    mark("edges");
-
-    // Relationship pairs: direct install into the forward AND reverse maps.
-    // Saved data is already deduped (it came out of these same maps), so the
-    // linear dedup find the public mutators do is skipped.
-    auto readVecPairs =
-        [&](std::unordered_map<SId, std::vector<SId>> &fwd,
-            std::unordered_map<SId, std::vector<SId>> *rev) {
-          uint32_t n = r.count();
-          for (uint32_t i = 0; r.ok && i < n; ++i) {
-            SId a = gid(r.u32());
-            SId b = gid(r.u32());
-            if (!r.ok)
-              break;
-            fwd[a].push_back(b);
-            if (rev)
-              (*rev)[b].push_back(a);
-          }
-        };
-    readVecPairs(g.derivedClasses_, nullptr);
-    readVecPairs(g.methodOverrides_, &g.overrideBases_);
-    uint32_t n = r.count();
-    for (uint32_t i = 0; r.ok && i < n; ++i) {
-      SId impl = gid(r.u32());
-      SId cls = gid(r.u32());
-      if (r.ok)
-        g.effectiveImplClasses_[impl].insert(cls);
-    }
-    n = r.count();
-    for (uint32_t i = 0; r.ok && i < n; ++i) {
-      SId fn = gid(r.u32());
-      SId ret = gid(r.u32());
-      if (!r.ok)
-        break;
-      g.functionReturns_[fn].insert(ret);
-      g.returnedBy_[ret].push_back(fn);
-    }
-    mark("graph_relations");
-  }
-  if (!r.ok) {
-    finish();
-    return std::nullopt;
-  }
-
-  // Control flow: interner, set tables (positions preserved verbatim), then
-  // the direct-install context loop — no interning, no key building per
-  // context.
-  if (!readInternerTable(r, out.cfIndex.interner_)) {
-    finish();
-    return std::nullopt;
-  }
-  mark("cf_interner");
-
-  {
-    ControlFlowIndex &cf = out.cfIndex;
-    const uint32_t internedCount = static_cast<uint32_t>(cf.interner_.size());
-    auto cid = [&](uint32_t id) {
-      if (id >= internedCount)
-        r.ok = false;
-      return id;
-    };
-
-    std::lock_guard<std::mutex> lock(cf.mutex_);
-
-    // Set tables were saved in full table order (entry 0 = the seeded empty
-    // set), so clear the constructor's seed and refill: stored indices need
-    // no remap.
-    cf.scopeSets_.clear();
-    uint32_t setCount = r.count();
-    for (uint32_t i = 0; r.ok && i < setCount; ++i) {
-      std::vector<TryCatchScope> set;
-      uint32_t tryCount = r.count();
-      set.reserve(tryCount);
-      for (uint32_t t = 0; r.ok && t < tryCount; ++t) {
-        TryCatchScope scope;
-        scope.tryLocation = r.lenStr();
-        scope.enclosingFunction = r.lenStr();
-        scope.nestingDepth = r.u32();
-        uint32_t handlerCount = r.count();
-        for (uint32_t h = 0; r.ok && h < handlerCount; ++h) {
-          CatchHandlerInfo info;
-          info.caughtType = r.lenStr();
-          info.isCatchAll = r.u8() != 0;
-          info.location = r.lenStr();
-          info.bodySummary = r.lenStr();
-          scope.handlers.push_back(std::move(info));
+        g.nodeContributors_.reserve(nodeCount);
+      g.outEdges_.reserve(nodeCount);
+      g.inEdges_.reserve(nodeCount);
+      for (uint32_t i = 0; r.ok && i < nodeCount; ++i) {
+        SId nameId = gid(r.u32());
+        SId displayId = gid(r.u32());
+        CallGraphNode node;
+        node.file = r.lenStr();
+        node.line = r.u32();
+        uint8_t flags = r.u8();
+        node.isEntryPoint = (flags & 1) != 0;
+        node.isVirtual = (flags & 2) != 0;
+        node.enclosingClass = r.lenStr();
+        uint32_t contribCount = r.count();
+        if (!r.ok)
+          break;
+        node.usr = g.interner_.resolve(nameId);
+        node.qualifiedName = g.interner_.resolve(displayId);
+        // Rebuild the disambiguation index (no extra serialization needed).
+        auto &candidates = g.byName_[displayId];
+        if (std::find(candidates.begin(), candidates.end(), nameId) ==
+            candidates.end())
+          candidates.push_back(nameId);
+        g.nodes_.emplace(nameId, std::move(node));
+        for (uint32_t c = 0; r.ok && c < contribCount; ++c) {
+          SId tuId = gid(r.u32());
+          if (!r.ok || !mutableLoad)
+            continue;
+          if (g.nodeContributors_[nameId].insert(tuId).second)
+            g.tuNodes_[tuId].push_back(nameId);
         }
-        set.push_back(std::move(scope));
       }
-      cf.scopeSets_.push_back(std::move(set));
-    }
 
-    cf.guardSets_.clear();
-    setCount = r.count();
-    for (uint32_t i = 0; r.ok && i < setCount; ++i) {
-      std::vector<ConditionalGuard> set;
-      uint32_t guardCount = r.count();
-      set.reserve(guardCount);
-      for (uint32_t gi = 0; r.ok && gi < guardCount; ++gi) {
-        ConditionalGuard guard;
-        guard.conditionText = r.lenStr();
-        guard.location = r.lenStr();
-        guard.inTrueBranch = r.u8() != 0;
-        guard.isAssertion = r.u8() != 0;
-        set.push_back(std::move(guard));
-      }
-      cf.guardSets_.push_back(std::move(set));
-    }
+      mark("nodes");
 
-    cf.raiiSets_.clear();
-    setCount = r.count();
-    for (uint32_t i = 0; r.ok && i < setCount; ++i) {
-      std::vector<ControlFlowIndex::StoredRaiiLocal> set;
-      uint32_t raiiCount = r.count();
-      set.reserve(raiiCount);
-      for (uint32_t l = 0; r.ok && l < raiiCount; ++l) {
-        ControlFlowIndex::StoredRaiiLocal local;
-        local.typeName = cid(r.u32());
-        local.varName = cid(r.u32());
-        local.declLocation = cid(r.u32());
-        local.kind = static_cast<RaiiKind>(r.u8());
-        set.push_back(local);
-      }
-      cf.raiiSets_.push_back(std::move(set));
-    }
-
-    // The empty set must live at index 0 of each table (addCallSiteContext
-    // maps empty sets to 0 without a lookup); a snapshot violating that is
-    // corrupt.
-    if (cf.scopeSets_.empty() || !cf.scopeSets_[0].empty() ||
-        cf.guardSets_.empty() || !cf.guardSets_[0].empty() ||
-        cf.raiiSets_.empty() || !cf.raiiSets_[0].empty())
-      r.ok = false;
-
-    // Rebuild the dedup key maps so post-load addCallSiteContext dedups
-    // against the loaded tables (tables are small; the empty entry 0 is
-    // never keyed — intern*Set returns 0 for empty sets structurally).
-    if (r.ok && mutableLoad) {
-      for (uint32_t i = 1; i < cf.scopeSets_.size(); ++i)
-        cf.scopeSetIds_.emplace(
-            ControlFlowIndex::scopeSetKey(cf.scopeSets_[i]), i);
-      for (uint32_t i = 1; i < cf.guardSets_.size(); ++i)
-        cf.guardSetIds_.emplace(
-            ControlFlowIndex::guardSetKey(cf.guardSets_[i]), i);
-      for (uint32_t i = 1; i < cf.raiiSets_.size(); ++i)
-        cf.raiiSetIds_.emplace(ControlFlowIndex::raiiSetKey(cf.raiiSets_[i]),
-                               i);
-    }
-
-    mark("cf_set_tables");
-
-    uint32_t ctxCount = r.count();
-    // Same pre-sizing reserveContexts does (it locks mutex_, held here).
-    cf.byCallee_.reserve(ctxCount);
-    cf.byCaller_.reserve(ctxCount);
-    cf.bySite_.reserve(ctxCount);
-    for (uint32_t i = 0; r.ok && i < ctxCount; ++i) {
-      SId caller = cid(r.u32());
-      SId callee = cid(r.u32());
-      SId callerDisplay = cid(r.u32());
-      SId calleeDisplay = cid(r.u32());
-      SId site = cid(r.u32());
-      SId tuPath = r.u32();
-      if (tuPath != ControlFlowIndex::kNoString)
-        cid(tuPath);
-      uint32_t scopeSet = r.u32();
-      uint32_t guardSet = r.u32();
-      uint32_t raiiSet = r.u32();
-      auto noexceptSpec = static_cast<NoexceptSpec>(r.u8());
-      bool insideCatch = r.u8() != 0;
-      if (scopeSet >= cf.scopeSets_.size() ||
-          guardSet >= cf.guardSets_.size() || raiiSet >= cf.raiiSets_.size())
-        r.ok = false;
-      if (!r.ok)
-        break;
-      cf.insertStored(caller, callee, callerDisplay, calleeDisplay, site,
-                      tuPath, scopeSet, guardSet, raiiSet, noexceptSpec,
-                      insideCatch, /*trackTu=*/mutableLoad);
-    }
-    mark("cf_contexts");
-  }
-
-  if (!r.ok) {
-    finish();
-    return std::nullopt;
-  }
-
-  {
-    ChannelIndex &ch = out.channels;
-    std::lock_guard<std::mutex> lock(ch.mutex_);
-    uint32_t count = r.count();
-    for (uint32_t i = 0; r.ok && i < count; ++i) {
-      ChannelSite site;
-      site.channelId = r.lenStr();
-      site.channelTypeName = r.lenStr();
-      site.category = r.lenStr();
-      site.op = static_cast<ChannelOperation>(r.u8());
-      site.siteFunctionUsr = r.lenStr();
-      site.siteFunctionDisplay = r.lenStr();
-      site.callSite = r.lenStr();
-      uint32_t refs = r.u32();
-      uint32_t guardCount = r.count();
-      for (uint32_t g = 0; r.ok && g < guardCount; ++g) {
-        ConditionalGuard guard;
-        guard.conditionText = r.lenStr();
-        guard.location = r.lenStr();
-        guard.inTrueBranch = r.u8() != 0;
-        guard.isAssertion = r.u8() != 0;
-        site.enclosingGuards.push_back(std::move(guard));
-      }
-      uint32_t tuCount = r.count();
-      std::vector<std::string> tus;
-      tus.reserve(tuCount);
-      for (uint32_t t = 0; r.ok && t < tuCount; ++t)
-        tus.push_back(r.lenStr());
-      if (!r.ok || refs == 0) {
-        r.ok = false;
-        break;
-      }
-      site.tuPath = tus.empty() ? std::string() : tus.front();
-
-      size_t idx = ch.sites_.size();
-      ChannelIndex::SiteKey key{site.channelId, site.callSite,
-                                site.siteFunctionUsr, site.op};
-      std::string channelId = site.channelId;
-      std::string funcUsr = site.siteFunctionUsr;
-      std::string funcDisplay = site.siteFunctionDisplay;
-      bool differentDisplay = funcDisplay != funcUsr;
-      ch.sites_.push_back(
-          ChannelIndex::StoredSite{std::move(site), refs, true});
-      ch.index_.emplace(key, idx);
-      ch.byChannel_[channelId].push_back(idx);
-      ch.byFunctionUsr_[funcUsr].push_back(idx);
-      if (differentDisplay)
-        ch.byFunctionDisplay_[funcDisplay].push_back(idx);
+      // Edges: direct install (indices are the new deque positions),
+      // rebuilding edgeIndex_/outEdges_/inEdges_/tuEdges_ as we go. Saved
+      // edges are all live, so refs == 0 marks a corrupt record.
+      uint32_t edgeCount = r.count();
       if (mutableLoad)
-        for (const auto &tu : tus)
-          ch.byTu_[tu].push_back(idx);
-      ++ch.liveCount_;
+        g.edgeIndex_.reserve(edgeCount);
+      for (uint32_t i = 0; r.ok && i < edgeCount; ++i) {
+        CallGraph::StoredEdge se;
+        se.caller = gid(r.u32());
+        se.callee = gid(r.u32());
+        se.callSite = gid(r.u32());
+        se.kind = static_cast<EdgeKind>(r.u8());
+        se.confidence = static_cast<Confidence>(r.u8());
+        se.execContext = static_cast<ExecutionContext>(r.u8());
+        se.indirectionDepth = r.u32();
+        se.refs = r.u32();
+        uint32_t contribCount = r.count();
+        if (se.refs == 0)
+          r.ok = false;
+        if (!r.ok)
+          break;
+        size_t idx = g.edges_.size();
+        g.outEdges_[se.caller].push_back(idx);
+        g.inEdges_[se.callee].push_back(idx);
+        if (mutableLoad)
+          g.edgeIndex_.emplace(CallGraph::keyOf(se), idx);
+        g.edges_.push_back(se);
+        ++g.liveEdgeCount_;
+        for (uint32_t c = 0; r.ok && c < contribCount; ++c) {
+          SId tuId = gid(r.u32());
+          if (r.ok && mutableLoad)
+            g.tuEdges_[tuId].push_back(idx);
+        }
+      }
+
+      mark("edges");
+
+      // Relationship pairs: direct install into the forward AND reverse maps.
+      // Saved data is already deduped (it came out of these same maps), so the
+      // linear dedup find the public mutators do is skipped.
+      auto readVecPairs =
+          [&](std::unordered_map<SId, std::vector<SId>> &fwd,
+              std::unordered_map<SId, std::vector<SId>> *rev) {
+            uint32_t n = r.count();
+            for (uint32_t i = 0; r.ok && i < n; ++i) {
+              SId a = gid(r.u32());
+              SId b = gid(r.u32());
+              if (!r.ok)
+                break;
+              fwd[a].push_back(b);
+              if (rev)
+                (*rev)[b].push_back(a);
+            }
+          };
+      readVecPairs(g.derivedClasses_, nullptr);
+      readVecPairs(g.methodOverrides_, &g.overrideBases_);
+      uint32_t n = r.count();
+      for (uint32_t i = 0; r.ok && i < n; ++i) {
+        SId impl = gid(r.u32());
+        SId cls = gid(r.u32());
+        if (r.ok)
+          g.effectiveImplClasses_[impl].insert(cls);
+      }
+      n = r.count();
+      for (uint32_t i = 0; r.ok && i < n; ++i) {
+        SId fn = gid(r.u32());
+        SId ret = gid(r.u32());
+        if (!r.ok)
+          break;
+        g.functionReturns_[fn].insert(ret);
+        g.returnedBy_[ret].push_back(fn);
+      }
+      mark("graph_relations");
     }
-    mark("channels");
+    sectionDone();
+    if (!r.ok) {
+      finish();
+      return std::nullopt;
+    }
+    out.loaded |= kSectionGraph;
+  } else {
+    skipSection("graph", kGraphKind);
+  }
+
+  if (needs & kSectionControlFlow) {
+    beginSection(kControlFlowKind);
+    // Control flow: interner, set tables (positions preserved verbatim), then
+    // the direct-install context loop — no interning, no key building per
+    // context.
+    if (!readInternerTable(r, out.cfIndex.interner_)) {
+      finish();
+      return std::nullopt;
+    }
+    mark("cf_interner");
+
+    {
+      ControlFlowIndex &cf = out.cfIndex;
+      const uint32_t internedCount = static_cast<uint32_t>(cf.interner_.size());
+      auto cid = [&](uint32_t id) {
+        if (id >= internedCount)
+          r.ok = false;
+        return id;
+      };
+
+      std::lock_guard<std::mutex> lock(cf.mutex_);
+
+      // Set tables were saved in full table order (entry 0 = the seeded empty
+      // set), so clear the constructor's seed and refill: stored indices need
+      // no remap.
+      cf.scopeSets_.clear();
+      uint32_t setCount = r.count();
+      for (uint32_t i = 0; r.ok && i < setCount; ++i) {
+        std::vector<TryCatchScope> set;
+        uint32_t tryCount = r.count();
+        set.reserve(tryCount);
+        for (uint32_t t = 0; r.ok && t < tryCount; ++t) {
+          TryCatchScope scope;
+          scope.tryLocation = r.lenStr();
+          scope.enclosingFunction = r.lenStr();
+          scope.nestingDepth = r.u32();
+          uint32_t handlerCount = r.count();
+          for (uint32_t h = 0; r.ok && h < handlerCount; ++h) {
+            CatchHandlerInfo info;
+            info.caughtType = r.lenStr();
+            info.isCatchAll = r.u8() != 0;
+            info.location = r.lenStr();
+            info.bodySummary = r.lenStr();
+            scope.handlers.push_back(std::move(info));
+          }
+          set.push_back(std::move(scope));
+        }
+        cf.scopeSets_.push_back(std::move(set));
+      }
+
+      cf.guardSets_.clear();
+      setCount = r.count();
+      for (uint32_t i = 0; r.ok && i < setCount; ++i) {
+        std::vector<ConditionalGuard> set;
+        uint32_t guardCount = r.count();
+        set.reserve(guardCount);
+        for (uint32_t gi = 0; r.ok && gi < guardCount; ++gi) {
+          ConditionalGuard guard;
+          guard.conditionText = r.lenStr();
+          guard.location = r.lenStr();
+          guard.inTrueBranch = r.u8() != 0;
+          guard.isAssertion = r.u8() != 0;
+          set.push_back(std::move(guard));
+        }
+        cf.guardSets_.push_back(std::move(set));
+      }
+
+      cf.raiiSets_.clear();
+      setCount = r.count();
+      for (uint32_t i = 0; r.ok && i < setCount; ++i) {
+        std::vector<ControlFlowIndex::StoredRaiiLocal> set;
+        uint32_t raiiCount = r.count();
+        set.reserve(raiiCount);
+        for (uint32_t l = 0; r.ok && l < raiiCount; ++l) {
+          ControlFlowIndex::StoredRaiiLocal local;
+          local.typeName = cid(r.u32());
+          local.varName = cid(r.u32());
+          local.declLocation = cid(r.u32());
+          local.kind = static_cast<RaiiKind>(r.u8());
+          set.push_back(local);
+        }
+        cf.raiiSets_.push_back(std::move(set));
+      }
+
+      // The empty set must live at index 0 of each table (addCallSiteContext
+      // maps empty sets to 0 without a lookup); a snapshot violating that is
+      // corrupt.
+      if (cf.scopeSets_.empty() || !cf.scopeSets_[0].empty() ||
+          cf.guardSets_.empty() || !cf.guardSets_[0].empty() ||
+          cf.raiiSets_.empty() || !cf.raiiSets_[0].empty())
+        r.ok = false;
+
+      // Rebuild the dedup key maps so post-load addCallSiteContext dedups
+      // against the loaded tables (tables are small; the empty entry 0 is
+      // never keyed — intern*Set returns 0 for empty sets structurally).
+      if (r.ok && mutableLoad) {
+        for (uint32_t i = 1; i < cf.scopeSets_.size(); ++i)
+          cf.scopeSetIds_.emplace(
+              ControlFlowIndex::scopeSetKey(cf.scopeSets_[i]), i);
+        for (uint32_t i = 1; i < cf.guardSets_.size(); ++i)
+          cf.guardSetIds_.emplace(
+              ControlFlowIndex::guardSetKey(cf.guardSets_[i]), i);
+        for (uint32_t i = 1; i < cf.raiiSets_.size(); ++i)
+          cf.raiiSetIds_.emplace(ControlFlowIndex::raiiSetKey(cf.raiiSets_[i]),
+                                 i);
+      }
+
+      mark("cf_set_tables");
+
+      uint32_t ctxCount = r.count();
+      // Same pre-sizing reserveContexts does (it locks mutex_, held here).
+      cf.byCallee_.reserve(ctxCount);
+      cf.byCaller_.reserve(ctxCount);
+      cf.bySite_.reserve(ctxCount);
+      for (uint32_t i = 0; r.ok && i < ctxCount; ++i) {
+        SId caller = cid(r.u32());
+        SId callee = cid(r.u32());
+        SId callerDisplay = cid(r.u32());
+        SId calleeDisplay = cid(r.u32());
+        SId site = cid(r.u32());
+        SId tuPath = r.u32();
+        if (tuPath != ControlFlowIndex::kNoString)
+          cid(tuPath);
+        uint32_t scopeSet = r.u32();
+        uint32_t guardSet = r.u32();
+        uint32_t raiiSet = r.u32();
+        auto noexceptSpec = static_cast<NoexceptSpec>(r.u8());
+        bool insideCatch = r.u8() != 0;
+        if (scopeSet >= cf.scopeSets_.size() ||
+            guardSet >= cf.guardSets_.size() || raiiSet >= cf.raiiSets_.size())
+          r.ok = false;
+        if (!r.ok)
+          break;
+        cf.insertStored(caller, callee, callerDisplay, calleeDisplay, site,
+                        tuPath, scopeSet, guardSet, raiiSet, noexceptSpec,
+                        insideCatch, /*trackTu=*/mutableLoad);
+      }
+      mark("cf_contexts");
+    }
+    sectionDone();
+    if (!r.ok) {
+      finish();
+      return std::nullopt;
+    }
+    out.loaded |= kSectionControlFlow;
+  } else {
+    skipSection("control_flow", kControlFlowKind);
+  }
+
+  if (needs & kSectionChannels) {
+    beginSection(kChannelsKind);
+    {
+      ChannelIndex &ch = out.channels;
+      std::lock_guard<std::mutex> lock(ch.mutex_);
+      uint32_t count = r.count();
+      for (uint32_t i = 0; r.ok && i < count; ++i) {
+        ChannelSite site;
+        site.channelId = r.lenStr();
+        site.channelTypeName = r.lenStr();
+        site.category = r.lenStr();
+        site.op = static_cast<ChannelOperation>(r.u8());
+        site.siteFunctionUsr = r.lenStr();
+        site.siteFunctionDisplay = r.lenStr();
+        site.callSite = r.lenStr();
+        uint32_t refs = r.u32();
+        uint32_t guardCount = r.count();
+        for (uint32_t g = 0; r.ok && g < guardCount; ++g) {
+          ConditionalGuard guard;
+          guard.conditionText = r.lenStr();
+          guard.location = r.lenStr();
+          guard.inTrueBranch = r.u8() != 0;
+          guard.isAssertion = r.u8() != 0;
+          site.enclosingGuards.push_back(std::move(guard));
+        }
+        uint32_t tuCount = r.count();
+        std::vector<std::string> tus;
+        tus.reserve(tuCount);
+        for (uint32_t t = 0; r.ok && t < tuCount; ++t)
+          tus.push_back(r.lenStr());
+        if (!r.ok || refs == 0) {
+          r.ok = false;
+          break;
+        }
+        site.tuPath = tus.empty() ? std::string() : tus.front();
+
+        size_t idx = ch.sites_.size();
+        ChannelIndex::SiteKey key{site.channelId, site.callSite,
+                                  site.siteFunctionUsr, site.op};
+        std::string channelId = site.channelId;
+        std::string funcUsr = site.siteFunctionUsr;
+        std::string funcDisplay = site.siteFunctionDisplay;
+        bool differentDisplay = funcDisplay != funcUsr;
+        ch.sites_.push_back(
+            ChannelIndex::StoredSite{std::move(site), refs, true});
+        ch.index_.emplace(key, idx);
+        ch.byChannel_[channelId].push_back(idx);
+        ch.byFunctionUsr_[funcUsr].push_back(idx);
+        if (differentDisplay)
+          ch.byFunctionDisplay_[funcDisplay].push_back(idx);
+        if (mutableLoad)
+          for (const auto &tu : tus)
+            ch.byTu_[tu].push_back(idx);
+        ++ch.liveCount_;
+      }
+      mark("channels");
+    }
+    sectionDone();
+    out.loaded |= kSectionChannels;
+  } else {
+    skipSection("channels", kChannelsKind);
   }
 
   finish();

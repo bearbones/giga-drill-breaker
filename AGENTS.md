@@ -159,7 +159,7 @@ handlers directly.
 
 | File | Purpose |
 |---|---|
-| `Tools.h` | `ToolContext`, `ToolEntry` (name, description, JSON Schema, handler, `recordsKey` — the payload's list member, which drives the CLI's ndjson/tsv output and empty-result exit code), `QueryCache`, `getRegisteredTools()`, and the result contract: success = payload object; error = `{"error": msg}` (`errorResult`/`isErrorResult`); ambiguity = `{"ambiguous": true, candidates...}` (`isAmbiguousResult`) |
+| `Tools.h` | `ToolContext`, `ToolEntry` (name, description, JSON Schema, handler, `recordsKey` — the payload's list member, which drives the CLI's ndjson/tsv output and empty-result exit code — and `needs`, the index sections the handler reads), `QueryCache`, `getRegisteredTools()`, and the result contract: success = payload object; error = `{"error": msg}` (`errorResult`/`isErrorResult`); ambiguity = `{"ambiguous": true, candidates...}` (`isAmbiguousResult`) |
 | `Identity.h/.cpp` | F8 identity resolution: `resolveIdentity` (name/usr/site/filter → USR), the disambiguation payload, `attachUsr` |
 | `Serialize.h/.cpp` | Enum spellings (`EdgeKind`, `Confidence`, `ExecutionContext`, `ChannelOperation`) and JSON serializers for edges, guards, channel sites — part of the output contract |
 | `GraphTools.cpp` | lookup, search, callers, callees, call chain, class hierarchy, entry points, graph summary, callback/concurrency sites |
@@ -183,8 +183,16 @@ The query verbs load the index with `LoadMode::ReadOnly`
 (`callgraph/Snapshot.h`): the edge dedup map and per-TU provenance that
 only `removeTU`/`absorb` read are skipped (halves the load on the 938-TU
 testbed), the graph asserts on any later mutation, and the loaded
-indexes are deliberately leaked at exit. `index`/`serve` and worker
-shards load `Mutable`.
+indexes are deliberately leaked at exit. They also decode only the
+sections the tool declares (`ToolEntry::needs`, set in
+`query/Registry.cpp`): the snapshot is sectioned (format v8: header with
+`IndexSummary` counts and a `{kind, offset, length}` table for meta /
+graph / control flow / channels), so a graph-only tool never decodes the
+call-site contexts, `info` reads the meta section alone, and
+`graph_summary` reports the header counts (`ToolContext::summary`).
+`index`/`serve` and worker shards load `Mutable` and everything. The
+bake's `--entry-point` list is recorded in the meta and is the default
+for queries and `serve` runs that pass none.
 
 `main.cpp` peels the verb off argv before `llvm::cl` runs: query verbs
 never touch `llvm::cl`; `index` and `serve` share the bake option block

@@ -18,6 +18,7 @@
 #include "vycor/callgraph/ChannelIndex.h"
 #include "vycor/callgraph/ControlFlowIndex.h"
 #include "vycor/callgraph/ControlFlowOracle.h"
+#include "vycor/callgraph/Snapshot.h"
 
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/JSON.h"
@@ -71,6 +72,11 @@ struct ToolContext {
   /// Optional whole-graph result cache; null in contexts that do not want
   /// caching (handlers must treat it as best-effort).
   QueryCache *cache = nullptr;
+  /// Counts from the index header (v8). Set by the one-shot query verbs,
+  /// which may not have decoded the control-flow or channel sections;
+  /// graph_summary reports these instead of the live index sizes when
+  /// present. Null under serve, where the live sizes are authoritative.
+  const IndexSummary *summary = nullptr;
 };
 
 /// Signature for a tool handler function.
@@ -101,7 +107,15 @@ struct ToolEntry {
   /// Drives the CLI's ndjson/tsv output and its empty-result exit code
   /// (vycor/cli/MegascopeCli.h); the MCP adapter ignores it.
   std::string recordsKey;
+  /// IndexSection bits this tool reads. The query verbs decode only these
+  /// sections (docs/megascope-cli-review.md §3.1.1); serve and batch load
+  /// everything. Graph-only unless Registry.cpp says otherwise.
+  unsigned needs = kSectionGraph;
 };
+
+/// Human names for IndexSection bits, in bit order ("graph",
+/// "control_flow", "channels"); for `tools --format json` and -v.
+std::vector<std::string> sectionNames(unsigned needs);
 
 /// Returns the list of all registered tools, in tools/list order.
 std::vector<ToolEntry> getRegisteredTools();

@@ -628,6 +628,7 @@ int runTools(const std::vector<ToolEntry> &tools, const CommonOpts &common,
     o["description"] = t.description;
     o["inputSchema"] = t.inputSchema;
     o["records"] = t.recordsKey;
+    o["needs"] = llvm::json::Array(sectionNames(t.needs));
     o["cli"] = t.handler != nullptr;
     arr.push_back(llvm::json::Value(std::move(o)));
   }
@@ -648,10 +649,12 @@ int runInfo(const SnapshotData &snap, llvm::StringRef indexPath,
   if (!llvm::sys::fs::file_size(indexPath, bytes))
     o["index_bytes"] = static_cast<int64_t>(bytes);
   o["file_count"] = static_cast<int64_t>(snap.meta.files.size());
-  o["nodes"] = static_cast<int64_t>(snap.graph.nodeCount());
-  o["edges"] = static_cast<int64_t>(snap.graph.edgeCount());
-  o["call_sites"] = static_cast<int64_t>(snap.cfIndex.size());
-  o["channel_sites"] = static_cast<int64_t>(snap.channels.size());
+  // From the header: info decodes the meta section only.
+  o["nodes"] = static_cast<int64_t>(snap.summary.nodes);
+  o["edges"] = static_cast<int64_t>(snap.summary.edges);
+  o["call_sites"] = static_cast<int64_t>(snap.summary.callSites);
+  o["channel_sites"] = static_cast<int64_t>(snap.summary.channelSites);
+  o["entry_points"] = llvm::json::Array(snap.meta.entryPoints);
 
   llvm::json::Object cfg;
   cfg["collapse_paths"] = llvm::json::Array(snap.meta.collapsePaths);
@@ -862,13 +865,20 @@ int runMegascopeQueryVerb(llvm::ArrayRef<std::string> args,
            "or pass --index)\n";
     return kExitIndex;
   }
+  // Decode only what the verb reads: info wants the meta section, batch
+  // may run any tool, a single tool declares its needs (§3.1.1).
+  unsigned needs = kSectionAll;
+  if (verb == "info")
+    needs = 0;
+  else if (verb != "batch")
+    needs = tool->needs;
   SnapshotLoadStats loadStats;
   // Deliberately leaked: a one-shot process never frees the indexes.
   // Destroying maps holding millions of entries costs seconds at exit
   // (measured 2-3.5 s against a 5 s load on the 938-TU testbed) and buys
   // nothing — the OS reclaims the pages.
   auto *snapHolder = new std::optional<SnapshotData>(
-      SnapshotIO::load(indexPath, &loadStats, LoadMode::ReadOnly));
+      SnapshotIO::load(indexPath, &loadStats, LoadMode::ReadOnly, needs));
   auto &snap = *snapHolder;
   if (!snap) {
     err << "megascope: cannot load index " << indexPath
@@ -878,12 +888,17 @@ int runMegascopeQueryVerb(llvm::ArrayRef<std::string> args,
   }
   if (common->verbose) {
     err << "megascope: loaded " << indexPath << " ("
-        << snap->graph.nodeCount() << " nodes, " << snap->graph.edgeCount()
-        << " edges, " << snap->cfIndex.size() << " call sites) in "
+        << snap->summary.nodes << " nodes, " << snap->summary.edges
+        << " edges, " << snap->summary.callSites << " call sites) in "
         << llvm::format("%.1f", loadStats.totalMs) << " ms:";
-    for (const auto &sec : loadStats.sections)
-      err << " " << sec.name << " " << llvm::format("%.1f", sec.ms) << " ms/"
-          << (sec.bytes >> 10) << " KiB";
+    for (const auto &sec : loadStats.sections) {
+      err << " " << sec.name << " ";
+      if (sec.skipped)
+        err << "skipped/";
+      else
+        err << llvm::format("%.1f", sec.ms) << " ms/";
+      err << (sec.bytes >> 10) << " KiB";
+    }
     err << "\n";
   }
 
@@ -892,11 +907,16 @@ int runMegascopeQueryVerb(llvm::ArrayRef<std::string> args,
 
   ControlFlowOracle oracle(snap->graph, snap->cfIndex);
   QueryCache cache;
+  // --entry-point on the query, else what the index was baked with (v8
+  // meta), else main.
   std::vector<std::string> entryPoints = common->entryPoints;
+  if (entryPoints.empty())
+    entryPoints = snap->meta.entryPoints;
   if (entryPoints.empty())
     entryPoints.push_back("main");
   ToolContext ctx{snap->graph,  oracle,          snap->cfIndex,
-                  entryPoints, &snap->channels, &cache};
+                  entryPoints, &snap->channels, &cache,
+                  &snap->summary};
 
   if (verb == "batch")
     return runBatch(tools, ctx, in, out);

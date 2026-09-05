@@ -260,6 +260,23 @@ edges, hierarchy/returns, CF interner, CF contexts, channels. Then:
   total 5.1–5.6 → 2.9–3.0 s, one-shot wall 6.2–6.9 → 3.9–4.1 s, RSS 2.1
   → 1.5 GB. The remaining load is 75% `cf_contexts`; a graph-only tool
   under a sectioned layout (3.1.1) would load in about 0.65 s.
+
+  **3.1.1 measured** (same testbed re-baked as v8, 404 MB; read-only,
+  sections per `ToolEntry::needs`):
+
+  | verb | sections decoded | load | one-shot wall | RSS |
+  |---|---|---|---|---|
+  | `info` | meta | 0.1 ms | 0.01 s | 19 MB |
+  | `get-callers` | graph | 520 ms | 0.87 s | 326 MB |
+  | `graph-summary` | graph (header counts) | 540–700 ms | 1.6 s | 326 MB |
+  | `list-channels` | graph + channels | 420 ms | 0.67 s | 326 MB |
+  | `query-call-site-context` | graph + control flow | 2.75–2.93 s | 3.3–3.5 s | 1.5 GB |
+
+  A graph query's wall time went from 7.4–9.1 s (v7, mutable load,
+  destructors at exit) to 0.87 s across #59, #60, and the v8 layout. The
+  control-flow tools still pay for `cf_contexts` (2.2–2.4 s of decode
+  for 6.37M contexts); that is the case for 3.1.5 if it matters, and it
+  is now isolated to the five tools that read contexts.
 - Declare per-tool needs in `McpToolEntry` (a small `Needs` bitmask) so
   the CLI dispatcher knows what to load, and `batch`/`serve` load
   everything.
@@ -452,10 +469,10 @@ bake when more than half the selection is dirty. Item 6's measurement
 landed next (`SnapshotLoadStats`: `--stats-json` `snapshot.load_sections`
 and the query verbs' `-v`; numbers under 3.1.1) together with the
 leak-at-exit for one-shot verbs (#59), then the read-only load mode
-(3.1.2, numbers under 3.1.1 too). The sectioned v8 layout with per-tool
-`Needs` is the remaining half of item 6. Entry points are still a query-time flag
-(`--entry-point`) because the index does not record them; fold that into
-the v8 meta with item 6.
+(3.1.2, numbers under 3.1.1 too), then the sectioned v8 layout with
+per-tool `ToolEntry::needs`, `info` on the meta section alone, and the
+bake's entry points recorded in the v8 meta (measurements under 3.1.1),
+which closes item 6.
 
 Items 1–5 make the CLI real and can land in one or two PRs. Item 6 is the
 one performance change the CLI model actually needs, and it is gated on a

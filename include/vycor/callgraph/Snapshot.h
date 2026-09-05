@@ -65,6 +65,28 @@ struct SnapshotMeta {
 
   // Stamps of every TU baked into the snapshot.
   std::vector<FileStamp> files;
+  // v8: the bake's --entry-point list, so query verbs and serve default
+  // to the same roots the index was built for (empty = "main").
+  std::vector<std::string> entryPoints;
+};
+
+/// Counts recorded in the v8 header so `info` and graph_summary can
+/// describe an index without decoding it.
+struct IndexSummary {
+  uint64_t nodes = 0;
+  uint64_t edges = 0;
+  uint64_t callSites = 0;
+  uint64_t channelSites = 0;
+};
+
+/// Sections a load may ask for (bitmask). Meta and the summary are always
+/// read. Each query tool declares what it reads (ToolEntry::needs) and the
+/// query verbs load only that; index/serve/batch load everything.
+enum IndexSection : unsigned {
+  kSectionGraph = 1,
+  kSectionControlFlow = 2,
+  kSectionChannels = 4,
+  kSectionAll = 7,
 };
 
 struct SnapshotData {
@@ -72,6 +94,8 @@ struct SnapshotData {
   ControlFlowIndex cfIndex;
   ChannelIndex channels;
   SnapshotMeta meta;
+  IndexSummary summary;
+  unsigned loaded = 0; // IndexSection bits actually decoded
 };
 
 /// Where the load time goes, section by section in file order. Decode,
@@ -84,6 +108,7 @@ struct SnapshotLoadSection {
   const char *name;
   uint64_t bytes = 0;
   double ms = 0;
+  bool skipped = false; // not requested by the load's IndexSection mask
 };
 
 struct SnapshotLoadStats {
@@ -124,7 +149,14 @@ public:
   ///     alongside graph/cfIndex. Not interner-backed (ChannelIndex has no
   ///     StringInterner by design — see ChannelIndex.h); records are plain
   ///     length-prefixed strings.
-  static constexpr uint32_t kFormatVersion = 7;
+  /// v8: sectioned — a fixed header (magic, version, IndexSummary, then a
+  ///     table of {kind, offset, length} for meta / graph / control flow /
+  ///     channels) lets a load decode only the sections a query needs;
+  ///     meta carries the bake's entry points.
+  static constexpr uint32_t kFormatVersion = 8;
+  /// Bytes before the first section: magic(4) + version(4) + summary(32) +
+  /// table count(4) + 4 entries of kind(1) + offset(8) + length(8).
+  static constexpr uint64_t kHeaderBytes = 4 + 4 + 32 + 4 + 4 * 17;
 
   /// Serialize graph + cfIndex + channels + meta to `path` (atomically, via
   /// a temp file and rename). `channels` defaults to empty so callers that
@@ -137,10 +169,12 @@ public:
   /// Load a snapshot. Returns nullopt if the file is missing, has a
   /// different format version, or fails to decode. `stats`, when given,
   /// receives the per-section decode timing (filled even on failure, up
-  /// to the section that failed).
+  /// to the section that failed). `needs` selects the sections to decode
+  /// (meta and the summary always are); a section left out stays empty
+  /// and is absent from SnapshotData::loaded.
   static std::optional<SnapshotData>
   load(const std::string &path, SnapshotLoadStats *stats = nullptr,
-       LoadMode mode = LoadMode::Mutable);
+       LoadMode mode = LoadMode::Mutable, unsigned needs = kSectionAll);
 
   /// Stat the given files into stamps. Files that cannot be stat'ed get
   /// mtimeNs = 0 and size = 0 (which never matches a real stamp, forcing a
