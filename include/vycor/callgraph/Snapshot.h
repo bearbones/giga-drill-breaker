@@ -74,6 +74,24 @@ struct SnapshotData {
   SnapshotMeta meta;
 };
 
+/// Where the load time goes, section by section in file order. Decode,
+/// not I/O, is the cost (the file is mmapped), so `ms` is the time spent
+/// walking that section's records and installing them; `bytes` is the
+/// section's on-disk size. Reported by `--stats-json` and the query
+/// verbs' `-v` (docs/megascope-cli-review.md §3.1.1: the measurement that
+/// gates a sectioned v8 layout).
+struct SnapshotLoadSection {
+  const char *name;
+  uint64_t bytes = 0;
+  double ms = 0;
+};
+
+struct SnapshotLoadStats {
+  std::vector<SnapshotLoadSection> sections;
+  uint64_t fileBytes = 0;
+  double totalMs = 0;
+};
+
 class SnapshotIO {
 public:
   /// Current on-disk format version. Bump on any layout change.
@@ -108,8 +126,11 @@ public:
                    const ChannelIndex &channels = ChannelIndex());
 
   /// Load a snapshot. Returns nullopt if the file is missing, has a
-  /// different format version, or fails to decode.
-  static std::optional<SnapshotData> load(const std::string &path);
+  /// different format version, or fails to decode. `stats`, when given,
+  /// receives the per-section decode timing (filled even on failure, up
+  /// to the section that failed).
+  static std::optional<SnapshotData>
+  load(const std::string &path, SnapshotLoadStats *stats = nullptr);
 
   /// Stat the given files into stamps. Files that cannot be stat'ed get
   /// mtimeNs = 0 and size = 0 (which never matches a real stamp, forcing a

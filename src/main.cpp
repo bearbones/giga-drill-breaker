@@ -57,6 +57,21 @@
 #include <sys/resource.h>
 #endif
 
+/// Per-section decode timing of a snapshot load, for --stats-json and the
+/// query verbs' -v (docs/megascope-cli-review.md §3.1.1).
+static llvm::json::Array
+loadSectionsJson(const vycor::SnapshotLoadStats &stats) {
+  llvm::json::Array out;
+  for (const auto &sec : stats.sections) {
+    llvm::json::Object o;
+    o["name"] = sec.name;
+    o["bytes"] = static_cast<int64_t>(sec.bytes);
+    o["ms"] = sec.ms;
+    out.push_back(std::move(o));
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // --channel-types-json parsing
 // ---------------------------------------------------------------------------
@@ -1389,10 +1404,11 @@ int main(int argc, const char **argv) {
     // so a bare `serve` never silently widens a narrow index to the whole
     // database (and re-saves the result). Workers never carry an index.
     std::optional<vycor::SnapshotData> snap;
+    vycor::SnapshotLoadStats snapLoadStats;
     double snapLoadMs = 0;
     if (!indexPath.empty() && !McpBakeWorker) {
       auto t0 = StatsClock::now();
-      snap = vycor::SnapshotIO::load(indexPath);
+      snap = vycor::SnapshotIO::load(indexPath, &snapLoadStats);
       if (snap)
         snapLoadMs = msSince(t0);
     }
@@ -1684,6 +1700,7 @@ int main(int argc, const char **argv) {
       snap["warm_refresh_ms"] = warmRefreshMs;
       snap["refreshed_tus"] = static_cast<int64_t>(warmRefreshed);
       snap["dropped_tus"] = static_cast<int64_t>(warmDropped);
+      snap["load_sections"] = loadSectionsJson(snapLoadStats);
       root["snapshot"] = std::move(snap);
 
       llvm::json::Object g;

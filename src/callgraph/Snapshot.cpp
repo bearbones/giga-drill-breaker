@@ -473,9 +473,12 @@ bool SnapshotIO::save(const std::string &path, const CallGraph &graph,
   return true;
 }
 
-std::optional<SnapshotData> SnapshotIO::load(const std::string &path) {
+std::optional<SnapshotData> SnapshotIO::load(const std::string &path,
+                                             SnapshotLoadStats *stats) {
   using SId = StringInterner::Id;
+  using Clock = std::chrono::steady_clock;
 
+  const auto loadStart = Clock::now();
   auto bufOrErr = llvm::MemoryBuffer::getFile(path, /*IsText=*/false,
                                               /*RequiresNullTerminator=*/false);
   if (!bufOrErr)
@@ -484,20 +487,57 @@ std::optional<SnapshotData> SnapshotIO::load(const std::string &path) {
 
   Reader r{buf->getBufferStart(), buf->getBufferEnd()};
 
+  // Section accounting: `mark(name)` closes the section that began at the
+  // previous mark. Cheap enough to run unconditionally (nine calls).
+  const char *sectionStart = r.p;
+  auto sectionClock = loadStart;
+  auto mark = [&](const char *name) {
+    auto now = Clock::now();
+    if (stats) {
+      SnapshotLoadSection sec;
+      sec.name = name;
+      sec.bytes = static_cast<uint64_t>(r.p - sectionStart);
+      sec.ms = std::chrono::duration<double, std::milli>(now - sectionClock)
+                   .count();
+      stats->sections.push_back(sec);
+    }
+    sectionStart = r.p;
+    sectionClock = now;
+  };
+  auto finish = [&]() {
+    if (stats) {
+      stats->fileBytes = static_cast<uint64_t>(buf->getBufferSize());
+      stats->totalMs =
+          std::chrono::duration<double, std::milli>(Clock::now() - loadStart)
+              .count();
+    }
+  };
+
   std::string magic = r.bytes(4);
-  if (!r.ok || magic != std::string(kMagic, 4))
+  if (!r.ok || magic != std::string(kMagic, 4)) {
+    finish();
     return std::nullopt;
-  if (r.u32() != kFormatVersion)
+  }
+  if (r.u32() != kFormatVersion) {
+    finish();
     return std::nullopt;
+  }
+  sectionStart = r.p; // the 8-byte magic + version header is no section
 
   SnapshotData out;
-  if (!readMeta(r, out.meta))
+  if (!readMeta(r, out.meta)) {
+    finish();
     return std::nullopt;
+  }
+  mark("meta");
 
   // Graph interner table: installed ids match the saved ids by position, so
   // every raw id below is valid verbatim — no interning per record.
-  if (!readInternerTable(r, out.graph.interner_))
+  if (!readInternerTable(r, out.graph.interner_)) {
+    finish();
     return std::nullopt;
+  }
+  mark("graph_interner");
 
   {
     CallGraph &g = out.graph;
@@ -550,6 +590,8 @@ std::optional<SnapshotData> SnapshotIO::load(const std::string &path) {
       }
     }
 
+    mark("nodes");
+
     // Edges: direct install (indices are the new deque positions),
     // rebuilding edgeIndex_/outEdges_/inEdges_/tuEdges_ as we go. Saved
     // edges are all live, so refs == 0 marks a corrupt record.
@@ -582,6 +624,8 @@ std::optional<SnapshotData> SnapshotIO::load(const std::string &path) {
           g.tuEdges_[tuId].push_back(idx);
       }
     }
+
+    mark("edges");
 
     // Relationship pairs: direct install into the forward AND reverse maps.
     // Saved data is already deduped (it came out of these same maps), so the
@@ -618,15 +662,21 @@ std::optional<SnapshotData> SnapshotIO::load(const std::string &path) {
       g.functionReturns_[fn].insert(ret);
       g.returnedBy_[ret].push_back(fn);
     }
+    mark("graph_relations");
   }
-  if (!r.ok)
+  if (!r.ok) {
+    finish();
     return std::nullopt;
+  }
 
   // Control flow: interner, set tables (positions preserved verbatim), then
   // the direct-install context loop — no interning, no key building per
   // context.
-  if (!readInternerTable(r, out.cfIndex.interner_))
+  if (!readInternerTable(r, out.cfIndex.interner_)) {
+    finish();
     return std::nullopt;
+  }
+  mark("cf_interner");
 
   {
     ControlFlowIndex &cf = out.cfIndex;
@@ -724,6 +774,8 @@ std::optional<SnapshotData> SnapshotIO::load(const std::string &path) {
                                i);
     }
 
+    mark("cf_set_tables");
+
     uint32_t ctxCount = r.count();
     // Same pre-sizing reserveContexts does (it locks mutex_, held here).
     cf.byCallee_.reserve(ctxCount);
@@ -752,10 +804,13 @@ std::optional<SnapshotData> SnapshotIO::load(const std::string &path) {
                       tuPath, scopeSet, guardSet, raiiSet, noexceptSpec,
                       insideCatch);
     }
+    mark("cf_contexts");
   }
 
-  if (!r.ok)
+  if (!r.ok) {
+    finish();
     return std::nullopt;
+  }
 
   {
     ChannelIndex &ch = out.channels;
@@ -809,8 +864,10 @@ std::optional<SnapshotData> SnapshotIO::load(const std::string &path) {
         ch.byTu_[tu].push_back(idx);
       ++ch.liveCount_;
     }
+    mark("channels");
   }
 
+  finish();
   if (!r.ok)
     return std::nullopt;
 

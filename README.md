@@ -349,7 +349,9 @@ index, else the whole compilation database),
 `--index` (warm starts — only changed TUs
 are re-indexed; `--snapshot` is the old spelling), `--threads`,
 `--pch-dir`, `--isolate-workers`/`--workers` (subprocess baking: a
-crashing TU costs only that TU), `--stats-json`, `-v`.
+crashing TU costs only that TU), `--stats-json` (bake timings plus the
+per-section index load split), `-v`. Query verbs also take `-v`, which
+reports the load time section by section.
 
 **Key difference from prism**: `megascope` indexes all specified sources
 into a unified cross-TU call graph held in memory. `prism` parses per

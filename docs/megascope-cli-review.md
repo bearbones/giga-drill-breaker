@@ -224,6 +224,34 @@ edges, hierarchy/returns, CF interner, CF contexts, channels. Then:
   bulk; expect graph-only queries to load in well under a second at this
   scale. Record the per-section split with `--stats-json` first so the
   estimate is replaced by a number.
+
+  **Measured 2026-09-05** (938-TU llvm testbed, format v7, 404 MB, 94,788
+  nodes, 352,639 edges, 6.37M call sites; `megascope graph-summary -v`,
+  five runs, Release build, 12-core box):
+
+  | section | ms | MB |
+  |---|---|---|
+  | meta | 0.1 | 0.1 |
+  | graph_interner | 285–370 | 41.5 |
+  | nodes | 1180–1280 | 47.3 |
+  | edges | 290–360 | 28.5 |
+  | graph_relations | 2 | 0.2 |
+  | cf_interner | 230–250 | 34.0 |
+  | cf_set_tables | 43–49 | 10.0 |
+  | cf_contexts | 2950–3530 | 242.2 |
+  | **load total** | **5100–5600** | **404** |
+  | one-shot wall | 6200–6900 | (RSS 2.1 GB) |
+
+  So the three control-flow sections are 3.3–3.8 s of a 5.1–5.6 s load:
+  a graph-only tool would load in about 1.8 s with a sectioned layout,
+  which confirms 3.1.1. The nodes section is the surprise — 1.2 s for
+  95k records is ~12 µs per node, almost all of it the per-node
+  `nodeContributors_` set and `tuNodes_` rebuild (mutation-only state,
+  3.1.2), so a read-only load should bring graph-only loads under a
+  second. Wall exceeded load by 2–3.5 s before the one-shot verbs
+  stopped destroying the indexes at exit (now leaked deliberately; the
+  remaining ~1 s is kernel time faulting in and unmapping 2 GB of heap,
+  which only a smaller working set — 3.1.2, 3.1.5 — reduces).
 - Declare per-tool needs in `McpToolEntry` (a small `Needs` bitmask) so
   the CLI dispatcher knows what to load, and `batch`/`serve` load
   everything.
@@ -412,7 +440,11 @@ contract, exit codes, `batch`. Item 4 (default-all, `--source-re`,
 day, with the rule that a bare `index`/`serve` refreshes the TU set the
 index already records rather than widening it to the database. Item 7's
 parallel warm refresh is still open; #58 only falls back to the cold
-bake when more than half the selection is dirty. Entry points are still a query-time flag
+bake when more than half the selection is dirty. Item 6's measurement
+landed next (`SnapshotLoadStats`: `--stats-json` `snapshot.load_sections`
+and the query verbs' `-v`; numbers under 3.1.1) together with the
+leak-at-exit for one-shot verbs; the sectioned v8 layout and read-only
+load mode follow it as separate PRs. Entry points are still a query-time flag
 (`--entry-point`) because the index does not record them; fold that into
 the v8 meta with item 6.
 
