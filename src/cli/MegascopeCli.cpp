@@ -649,6 +649,7 @@ int runInfo(const SnapshotData &snap, llvm::StringRef indexPath,
   if (!llvm::sys::fs::file_size(indexPath, bytes))
     o["index_bytes"] = static_cast<int64_t>(bytes);
   o["file_count"] = static_cast<int64_t>(snap.meta.files.size());
+  o["dependency_count"] = static_cast<int64_t>(snap.meta.deps.size());
   // From the header: info decodes the meta section only.
   o["nodes"] = static_cast<int64_t>(snap.summary.nodes);
   o["edges"] = static_cast<int64_t>(snap.summary.edges);

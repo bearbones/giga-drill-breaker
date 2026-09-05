@@ -23,6 +23,8 @@
 #include "vycor/compat/PchCache.h"
 #include "vycor/compat/ToolAdjusters.h"
 
+#include "llvm/ADT/SmallString.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Support/ThreadPool.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -31,6 +33,7 @@
 #include <csignal>
 #include <csetjmp>
 #include <functional>
+#include <mutex>
 
 // Crash guard — same mechanism as CallGraphBuilder.cpp.
 // These are defined there and shared via the signal handler table.
@@ -896,6 +899,47 @@ namespace {
 // fan-out and the function-pointer-through-return join are both deferred to
 // query time) and the CF visitor never reads the graph during traversal.
 // The indexer runs first so same-TU state precedes the edge walk.
+// Every file the frontend opened for this TU, as absolute dot-free paths
+// (the spelling TU stamps use), with the stamp the FileManager recorded
+// when it opened the file — whole-second mtime and size — and the TU
+// itself left out. This is the warm start's dependency list.
+std::vector<FileStamp> openedFiles(clang::SourceManager &sm,
+                                   const std::string &tuPath) {
+  std::vector<FileStamp> out;
+  auto &fm = sm.getFileManager();
+  for (auto it = sm.fileinfo_begin(), e = sm.fileinfo_end(); it != e; ++it) {
+    clang::FileEntryRef entry = it->first;
+    llvm::SmallString<256> path(entry.getName());
+    fm.makeAbsolutePath(path);
+    llvm::sys::path::remove_dots(path, /*remove_dot_dot=*/true);
+    if (path == tuPath)
+      continue;
+    FileStamp fs;
+    fs.path = std::string(path);
+    fs.mtimeNs = static_cast<uint64_t>(entry.getModificationTime()) *
+                 1000000000ull;
+    fs.size = static_cast<uint64_t>(entry.getSize());
+    out.push_back(std::move(fs));
+  }
+  std::sort(out.begin(), out.end(),
+            [](const FileStamp &a, const FileStamp &b) {
+              return a.path < b.path;
+            });
+  out.erase(std::unique(out.begin(), out.end(),
+                        [](const FileStamp &a, const FileStamp &b) {
+                          return a.path == b.path;
+                        }),
+            out.end());
+  return out;
+}
+
+// Sink for openedFiles across a parallel bake: null when the caller does
+// not record dependencies (bakeTU under serve).
+struct DependencySink {
+  TuDependencies *deps = nullptr;
+  std::mutex mutex;
+};
+
 class BakeEdgeAndContextConsumer : public clang::ASTConsumer {
 public:
   BakeEdgeAndContextConsumer(CallGraph &graph, ControlFlowIndex &index,
@@ -904,10 +948,12 @@ public:
                              const LockTypeConfig *lockCfg,
                              const ChannelTypeConfig *channelCfg,
                              ChannelIndex *channelIndex,
-                             const std::string &tuPath)
+                             const std::string &tuPath,
+                             DependencySink *depSink)
       : indexerVisitor_(graph, sm, tuPath),
         edgeVisitor_(graph, sm, tuPath),
-        cfVisitor_(index, graph, sm, tuPath) {
+        cfVisitor_(index, graph, sm, tuPath), sm_(sm), tuPath_(tuPath),
+        depSink_(depSink) {
     edgeVisitor_.setCollapseFilter(collapse);
     cfVisitor_.setCollapseFilter(collapse);
     cfVisitor_.setLockConfig(lockCfg);
@@ -921,12 +967,20 @@ public:
     edgeVisitor_.TraverseDecl(ctx.getTranslationUnitDecl());
     cfVisitor_.setASTContext(&ctx);
     cfVisitor_.TraverseDecl(ctx.getTranslationUnitDecl());
+    if (depSink_ && depSink_->deps) {
+      auto opened = openedFiles(sm_, tuPath_);
+      std::lock_guard<std::mutex> lock(depSink_->mutex);
+      (*depSink_->deps)[tuPath_] = std::move(opened);
+    }
   }
 
 private:
   CallGraphIndexerVisitor indexerVisitor_;
   CallGraphEdgeVisitor edgeVisitor_;
   ControlFlowContextVisitor cfVisitor_;
+  clang::SourceManager &sm_;
+  std::string tuPath_;
+  DependencySink *depSink_;
 };
 
 class BakeEdgeAndContextAction : public clang::ASTFrontendAction {
@@ -936,16 +990,17 @@ public:
                            const LockTypeConfig *lockCfg,
                            const ChannelTypeConfig *channelCfg,
                            ChannelIndex *channelIndex,
-                           const std::string &tuPath)
+                           const std::string &tuPath,
+                           DependencySink *depSink)
       : graph_(graph), index_(index), collapse_(collapse), lockCfg_(lockCfg),
         channelCfg_(channelCfg), channelIndex_(channelIndex),
-        tuPath_(tuPath) {}
+        tuPath_(tuPath), depSink_(depSink) {}
 
   std::unique_ptr<clang::ASTConsumer>
   CreateASTConsumer(clang::CompilerInstance &ci, llvm::StringRef) override {
     return std::make_unique<BakeEdgeAndContextConsumer>(
         graph_, index_, ci.getSourceManager(), collapse_, lockCfg_,
-        channelCfg_, channelIndex_, tuPath_);
+        channelCfg_, channelIndex_, tuPath_, depSink_);
   }
 
 private:
@@ -956,6 +1011,7 @@ private:
   const ChannelTypeConfig *channelCfg_;
   ChannelIndex *channelIndex_;
   std::string tuPath_;
+  DependencySink *depSink_;
 };
 
 class BakeEdgeAndContextFactory : public clang::tooling::FrontendActionFactory {
@@ -965,15 +1021,16 @@ public:
                             const LockTypeConfig *lockCfg,
                             const ChannelTypeConfig *channelCfg,
                             ChannelIndex *channelIndex,
-                            const std::string &tuPath)
+                            const std::string &tuPath,
+                            DependencySink *depSink = nullptr)
       : graph_(graph), index_(index), collapse_(collapse), lockCfg_(lockCfg),
         channelCfg_(channelCfg), channelIndex_(channelIndex),
-        tuPath_(tuPath) {}
+        tuPath_(tuPath), depSink_(depSink) {}
 
   std::unique_ptr<clang::FrontendAction> create() override {
     return std::make_unique<BakeEdgeAndContextAction>(
         graph_, index_, collapse_, lockCfg_, channelCfg_, channelIndex_,
-        tuPath_);
+        tuPath_, depSink_);
   }
 
 private:
@@ -984,6 +1041,7 @@ private:
   const ChannelTypeConfig *channelCfg_;
   ChannelIndex *channelIndex_;
   std::string tuPath_;
+  DependencySink *depSink_;
 };
 
 } // anonymous namespace
@@ -1014,6 +1072,8 @@ BakedIndexes bakeIndexes(const clang::tooling::CompilationDatabase &compDb,
 
   bool parallel = threadCount != 1 && files.size() > 1;
   auto bakeStart = std::chrono::steady_clock::now();
+  DependencySink depSink;
+  depSink.deps = &out.deps;
 
   // Single pass: all three visitor phases share one frontend parse per TU
   // (no phase barrier — edge building has no cross-TU reads).
@@ -1026,10 +1086,10 @@ BakedIndexes bakeIndexes(const clang::tooling::CompilationDatabase &compDb,
 
     for (const auto &file : files) {
       pool.async([&compDb, &out, collapsePtr, &lockCfg, channelCfgPtr,
-                  pchCache, &sysroot, stats, &preTu, file]() {
+                  pchCache, &sysroot, stats, &preTu, &depSink, file]() {
         BakeEdgeAndContextFactory factory(out.graph, out.cfIndex, collapsePtr,
                                           &lockCfg, channelCfgPtr,
-                                          &out.channels, file);
+                                          &out.channels, file, &depSink);
         bakeRun(compDb, file, factory, pchCache, sysroot, 0, stats, preTu);
       });
     }
@@ -1038,7 +1098,7 @@ BakedIndexes bakeIndexes(const clang::tooling::CompilationDatabase &compDb,
     for (const auto &file : files) {
       BakeEdgeAndContextFactory factory(out.graph, out.cfIndex, collapsePtr,
                                         &lockCfg, channelCfgPtr,
-                                        &out.channels, file);
+                                        &out.channels, file, &depSink);
       bakeRun(compDb, file, factory, pchCache, sysroot, 0, stats, preTu);
     }
   }

@@ -702,22 +702,29 @@ void CallGraph::absorb(const CallGraph &shard) {
 // --- Per-TU removal ---
 
 size_t CallGraph::removeTU(const std::string &tuPath) {
+  return removeTUs({tuPath});
+}
+
+size_t CallGraph::removeTUs(const std::vector<std::string> &tuPaths) {
   std::lock_guard<std::mutex> lock(mutex_);
   assert(!readOnly_ && "mutating a read-only snapshot load");
-  auto tuIdOpt = interner_.find(tuPath);
-  if (!tuIdOpt)
-    return 0;
-  SId tuId = *tuIdOpt;
+  std::vector<SId> tuIds;
+  for (const auto &tuPath : tuPaths)
+    if (auto tuId = interner_.find(tuPath))
+      tuIds.push_back(*tuId);
   size_t removed = 0;
 
-  auto eit = tuEdges_.find(tuId);
-  if (eit != tuEdges_.end()) {
-    // Two passes: mark dead edges first, then scrub each affected
-    // adjacency vector ONCE. The old per-edge std::remove was
-    // O(degree) per removed edge — quadratic when a removed TU touches a
-    // high-fan-in hub.
-    std::unordered_set<size_t> dead;
-    std::unordered_set<SId> affectedCallers, affectedCallees;
+  // Two passes: release every TU's registrations and mark dead edges
+  // first, then scrub each affected adjacency vector ONCE. The old
+  // per-edge std::remove was O(degree) per removed edge — quadratic when
+  // a removed TU touches a high-fan-in hub — and a warm refresh of many
+  // TUs would otherwise scrub the same hub vectors once per TU.
+  std::unordered_set<size_t> dead;
+  std::unordered_set<SId> affectedCallers, affectedCallees;
+  for (SId tuId : tuIds) {
+    auto eit = tuEdges_.find(tuId);
+    if (eit == tuEdges_.end())
+      continue;
     for (size_t idx : eit->second) {
       auto &edge = edges_[idx];
       if (edge.refs == 0)
@@ -733,25 +740,27 @@ size_t CallGraph::removeTU(const std::string &tuPath) {
       --liveEdgeCount_;
       ++removed;
     }
-    for (SId c : affectedCallers) {
-      auto &ov = outEdges_[c];
-      ov.erase(std::remove_if(ov.begin(), ov.end(),
-                              [&](size_t i) { return dead.count(i) > 0; }),
-               ov.end());
-    }
-    for (SId c : affectedCallees) {
-      auto &iv = inEdges_[c];
-      iv.erase(std::remove_if(iv.begin(), iv.end(),
-                              [&](size_t i) { return dead.count(i) > 0; }),
-               iv.end());
-    }
     tuEdges_.erase(eit);
   }
+  for (SId c : affectedCallers) {
+    auto &ov = outEdges_[c];
+    ov.erase(std::remove_if(ov.begin(), ov.end(),
+                            [&](size_t i) { return dead.count(i) > 0; }),
+             ov.end());
+  }
+  for (SId c : affectedCallees) {
+    auto &iv = inEdges_[c];
+    iv.erase(std::remove_if(iv.begin(), iv.end(),
+                            [&](size_t i) { return dead.count(i) > 0; }),
+             iv.end());
+  }
 
-  // Visit exactly the nodes this TU contributed (reverse list) instead of
+  // Visit exactly the nodes each TU contributed (reverse list) instead of
   // scanning every node in the graph.
-  auto nit = tuNodes_.find(tuId);
-  if (nit != tuNodes_.end()) {
+  for (SId tuId : tuIds) {
+    auto nit = tuNodes_.find(tuId);
+    if (nit == tuNodes_.end())
+      continue;
     for (SId nodeId : nit->second) {
       auto cit = nodeContributors_.find(nodeId);
       if (cit == nodeContributors_.end())

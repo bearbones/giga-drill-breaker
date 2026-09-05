@@ -258,6 +258,9 @@ public:
   // code registers the same edge from many TUs). Nodes contributed only by
   // this TU are removed. Returns the number of edges fully removed.
   size_t removeTU(const std::string &tuPath);
+  // The same for several TUs at once, scrubbing each affected adjacency
+  // vector once for the whole set (the warm refresh's drop + dirty set).
+  size_t removeTUs(const std::vector<std::string> &tuPaths);
 
   // Compact the edge storage, eliminating tombstones.
   void compact();

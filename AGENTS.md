@@ -185,7 +185,8 @@ only `removeTU`/`absorb` read are skipped (halves the load on the 938-TU
 testbed), the graph asserts on any later mutation, and the loaded
 indexes are deliberately leaked at exit. They also decode only the
 sections the tool declares (`ToolEntry::needs`, set in
-`query/Registry.cpp`): the snapshot is sectioned (format v8: header with
+`query/Registry.cpp`): the snapshot is sectioned (format v8; v9 adds the
+per-TU dependency tables to the meta: header with
 `IndexSummary` counts and a `{kind, offset, length}` table for meta /
 graph / control flow / channels), so a graph-only tool never decodes the
 call-site contexts, `info` reads the meta section alone, and
@@ -206,8 +207,20 @@ TU set recorded in the existing index (so a bare `serve` refreshes what
 was indexed instead of widening it), or every C/C++ entry of the
 compilation database when there is no index yet (`--source-re .`
 re-selects the whole database). Paths are canonicalized (absolute,
-dots removed) before dedupe and filtering. A warm start whose dirty set
-exceeds half the selection falls back to the parallel cold bake.
+dots removed) before dedupe and filtering.
+
+Warm start: a TU is dirty when its own stamp changed or any file its
+parse opened did — the bake records each TU's opened files with the
+frontend's own stat (`BakedIndexes::deps`, `SnapshotMeta::deps`/`tuDeps`,
+v9) and `SnapshotIO::dirtyTUs` compares them. The dirty set goes through
+the same parallel bake as a cold build (`bakeIndexes`, or `bakeIsolated`
+under `--isolate-workers`) and is merged with the shard `absorb`; past
+half the selection the cold bake runs instead. `--force` rebuilds
+regardless of stamps. `index`/`serve` first load the meta section only
+(selection + dirty check); an `index` with nothing to refresh reports the
+header counts and never decodes the graph, otherwise the full mutable
+load follows and the drop + dirty set is removed in one `removeTUs` call
+per index (one scrub per affected adjacency vector for the whole set).
 
 ### `mcp` — MCP Server (adapter)
 

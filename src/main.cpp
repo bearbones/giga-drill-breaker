@@ -44,6 +44,7 @@
 #include <set>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Format.h"
 #include "llvm/Support/Program.h"
@@ -681,6 +682,14 @@ static llvm::cl::opt<bool>
     McpIsolateWorkers("isolate-workers",
         llvm::cl::desc("Bake the indexes in subprocess workers (a crashing "
                        "TU costs only that TU; parent RSS stays bounded)"),
+        llvm::cl::init(false),
+        llvm::cl::sub(MegascopeCmd));
+
+static llvm::cl::opt<bool>
+    McpForce("force",
+        llvm::cl::desc("Rebuild the index from scratch instead of "
+                       "refreshing the TUs whose sources or headers "
+                       "changed"),
         llvm::cl::init(false),
         llvm::cl::sub(MegascopeCmd));
 
@@ -1409,7 +1418,12 @@ int main(int argc, const char **argv) {
     double snapLoadMs = 0;
     if (!indexPath.empty() && !McpBakeWorker) {
       auto t0 = StatsClock::now();
-      snap = vycor::SnapshotIO::load(indexPath, &snapLoadStats);
+      // Meta and header counts only: enough for TU selection and the
+      // dirty check. The graph is decoded further down only when a warm
+      // refresh or serve needs it, so an unchanged `index` never pays
+      // for it (5 s on a 938-TU index).
+      snap = vycor::SnapshotIO::load(indexPath, &snapLoadStats,
+                                     vycor::LoadMode::ReadOnly, 0);
       if (snap)
         snapLoadMs = msSince(t0);
     }
@@ -1508,8 +1522,10 @@ int main(int argc, const char **argv) {
       meta.lockAllowlist = lockCfg.userAllowlist;
       meta.lockBuiltins = lockCfg.useBuiltins;
       meta.channelTypes = channelCfg.registeredTypes;
-      // meta.files stays empty: the parent ignores shard meta except as a
-      // config sanity check.
+      // The parent takes the batch's dependency lists from the shard meta
+      // (bakeIsolatedWithRunner) and re-stamps the TUs itself.
+      meta.files = vycor::SnapshotIO::stampFiles(files);
+      vycor::SnapshotIO::recordDependencies(meta, baked.deps);
       if (!vycor::SnapshotIO::save(McpWorkerOut, baked.graph, baked.cfIndex,
                                    meta, baked.channels)) {
         llvm::errs() << "megascope: worker: cannot write shard to "
@@ -1532,12 +1548,47 @@ int main(int argc, const char **argv) {
     // 301 MB / 6.37M-call-site snapshot.
     bool indexesChanged = true;
     double snapSaveMs = 0, warmRefreshMs = 0, bakeMs = 0;
+    double warmRemoveMs = 0, warmBakeMs = 0, warmAbsorbMs = 0;
     bool snapLoaded = false;
-    size_t warmRefreshed = 0, warmDropped = 0;
+    // An unchanged `index` reports the header counts and never decodes
+    // the graph.
+    bool graphSkipped = false;
+    size_t warmRefreshed = 0, warmDropped = 0, warmViaDeps = 0;
 
     // Stamps are taken before any parsing: a file modified mid-build gets a
     // stale stamp and is conservatively re-indexed on the next warm start.
+    // Dependency stamps (the files each parse opened) come from the
+    // frontend itself and are recorded in the meta at save time.
     auto currentStamps = vycor::SnapshotIO::stampFiles(files);
+    vycor::TuDependencies deps;
+
+    // One bake for the cold build and the warm refresh alike: the
+    // in-process parallel pipeline, or subprocess workers under
+    // --isolate-workers.
+    auto runBake = [&](const std::vector<std::string> &toBake) {
+      if (McpIsolateWorkers) {
+        unsigned workerCount =
+            McpWorkers ? McpWorkers.getValue() : McpThreads.getValue();
+        if (workerCount == 0)
+          workerCount = std::thread::hardware_concurrency();
+        static int selfExeAnchor; // address anchors getMainExecutable
+        std::string selfExe =
+            llvm::sys::fs::getMainExecutable(argv[0], &selfExeAnchor);
+        vycor::McpBakeConfig bakeCfg;
+        bakeCfg.buildPath = McpBuildPath;
+        bakeCfg.collapsePaths = collapsePaths;
+        bakeCfg.extraArgs = vycor::globalExtraArgs();
+        bakeCfg.sysroot = sysroot;
+        bakeCfg.lockTypes = lockCfg.userAllowlist;
+        bakeCfg.channelTypesJson = McpChannelTypesJson;
+        bakeCfg.orgConfig = McpOrgConfig;
+        return vycor::bakeIsolated(selfExe, bakeCfg, toBake, workerCount,
+                                   &buildStats);
+      }
+      return vycor::bakeIndexes(*compDb, toBake, collapsePaths, McpThreads,
+                                pchPtr, sysroot, lockCfg, &buildStats,
+                                nullptr, channelCfg);
+    };
 
     if (!indexPath.empty()) {
       if (snap) {
@@ -1546,69 +1597,114 @@ int main(int argc, const char **argv) {
             snap->meta.lockAllowlist == lockCfg.userAllowlist &&
             snap->meta.lockBuiltins == lockCfg.useBuiltins &&
             snap->meta.channelTypes == channelCfg.registeredTypes;
-        std::unordered_map<std::string, const vycor::FileStamp *> baked;
+        std::unordered_set<std::string> recorded;
         for (const auto &fs : snap->meta.files)
-          baked[fs.path] = &fs;
-        // The warm refresh re-bakes dirty TUs one at a time in-process
-        // (bakeTU), ignoring --threads/--isolate-workers. Past half the
-        // selection the parallel cold path wins, so a widened selection
-        // does not crawl through it serially.
-        size_t dirty = 0;
-        for (const auto &stamp : currentStamps) {
-          auto it = baked.find(stamp.path);
-          if (it == baked.end() || !(*it->second == stamp))
-            ++dirty;
-        }
-        if (!configMatch) {
+          recorded.insert(fs.path);
+        // Dirty = own stamp changed, or any file its parse opened did
+        // (header dependency stamps). Past half the selection the cold
+        // bake wins: it skips the mutable load and the per-TU removals.
+        size_t dirtyViaDeps = 0;
+        auto dirtyFlags = vycor::SnapshotIO::dirtyTUs(
+            snap->meta, currentStamps, &dirtyViaDeps);
+        size_t dirty = static_cast<size_t>(
+            std::count(dirtyFlags.begin(), dirtyFlags.end(), true));
+        if (McpForce) {
+          llvm::errs() << "megascope: --force — full rebuild\n";
+        } else if (!configMatch) {
           llvm::errs() << "megascope: snapshot build configuration differs "
                           "— full rebuild\n";
         } else if (dirty * 2 > files.size()) {
           llvm::errs() << "megascope: " << dirty << " of " << files.size()
                        << " selected TUs are new or changed — full "
-                          "rebuild instead of a serial warm refresh\n";
+                          "rebuild instead of a warm refresh\n";
         } else {
-          graph = std::move(snap->graph);
-          cfIndex = std::move(snap->cfIndex);
-          channels = std::move(snap->channels);
+          std::set<std::string> current(files.begin(), files.end());
+          std::vector<std::string> toDrop, toBake;
+          for (const auto &fs : snap->meta.files)
+            if (!current.count(fs.path))
+              toDrop.push_back(fs.path);
+          for (size_t i = 0; i < currentStamps.size(); ++i)
+            if (dirtyFlags[i])
+              toBake.push_back(currentStamps[i].path);
           needFullBuild = false;
           snapLoaded = true;
-          auto refreshStart = StatsClock::now();
 
-          std::set<std::string> current(files.begin(), files.end());
+          if (toDrop.empty() && toBake.empty() &&
+              megascopeVerb == MegascopeVerb::Index &&
+              McpDumpNodes.empty()) {
+            // Nothing to refresh and nobody to hand the graph to: report
+            // the header counts and leave the sections undecoded.
+            graphSkipped = true;
+            indexesChanged = false;
+            llvm::errs() << "megascope: warm start from " << indexPath
+                         << " (0 TU(s) re-indexed, 0 dropped, "
+                         << snap->summary.nodes << " nodes, "
+                         << snap->summary.edges << " edges, "
+                         << snap->summary.callSites << " call sites)\n";
+          } else {
+            auto t0 = StatsClock::now();
+            snapLoadStats = vycor::SnapshotLoadStats();
+            auto full = vycor::SnapshotIO::load(indexPath, &snapLoadStats,
+                                                vycor::LoadMode::Mutable);
+            snapLoadMs = msSince(t0);
+            if (!full) {
+              llvm::errs() << "megascope: cannot decode index " << indexPath
+                           << " — full build\n";
+              needFullBuild = true;
+              snapLoaded = false;
+            } else {
+              graph = std::move(full->graph);
+              cfIndex = std::move(full->cfIndex);
+              channels = std::move(full->channels);
+              deps = vycor::SnapshotIO::dependenciesOf(snap->meta);
+              auto refreshStart = StatsClock::now();
 
-          size_t dropped = 0, refreshed = 0;
-          for (const auto &fs : snap->meta.files) {
-            if (!current.count(fs.path)) {
-              graph.removeTU(fs.path);
-              cfIndex.removeTU(fs.path);
-              channels.removeTU(fs.path);
-              ++dropped;
+              // One batched removal: each hub's adjacency vector is
+              // scrubbed once for the whole set (74 TUs on the 938-TU
+              // testbed: 17.7 s one at a time).
+              std::vector<std::string> toRemove = toDrop;
+              for (const auto &path : toBake)
+                if (recorded.count(path))
+                  toRemove.push_back(path);
+              graph.removeTUs(toRemove);
+              cfIndex.removeTUs(toRemove);
+              channels.removeTUs(toRemove);
+              for (const auto &path : toDrop)
+                deps.erase(path);
+              for (const auto &path : toBake)
+                deps.erase(path);
+              warmRemoveMs = msSince(refreshStart);
+              if (!toBake.empty()) {
+                // The dirty set takes the same parallel (or isolated)
+                // bake as a cold build and is merged with the
+                // worker-shard absorb.
+                llvm::errs() << "megascope: re-indexing " << toBake.size()
+                             << " TU(s), " << dirtyViaDeps
+                             << " for changed headers...\n";
+                auto bakeStart = StatsClock::now();
+                auto fresh = runBake(toBake);
+                warmBakeMs = msSince(bakeStart);
+                auto absorbStart = StatsClock::now();
+                graph.absorb(fresh.graph);
+                cfIndex.absorb(fresh.cfIndex);
+                channels.absorb(fresh.channels);
+                for (auto &kv : fresh.deps)
+                  deps[kv.first] = std::move(kv.second);
+                warmAbsorbMs = msSince(absorbStart);
+              }
+              warmRefreshMs = msSince(refreshStart);
+              warmRefreshed = toBake.size();
+              warmViaDeps = dirtyViaDeps;
+              warmDropped = toDrop.size();
+              indexesChanged = !toBake.empty() || !toDrop.empty();
+              llvm::errs() << "megascope: warm start from " << indexPath
+                           << " (" << toBake.size() << " TU(s) re-indexed, "
+                           << toDrop.size() << " dropped, "
+                           << graph.nodeCount() << " nodes, "
+                           << graph.edgeCount() << " edges, "
+                           << cfIndex.size() << " call sites)\n";
             }
           }
-          for (const auto &stamp : currentStamps) {
-            auto it = baked.find(stamp.path);
-            if (it != baked.end() && *it->second == stamp)
-              continue; // Unchanged since the snapshot was taken.
-            if (it != baked.end()) {
-              graph.removeTU(stamp.path);
-              cfIndex.removeTU(stamp.path);
-              channels.removeTU(stamp.path);
-            }
-            vycor::bakeTU(graph, cfIndex, *compDb, stamp.path,
-                          collapsePaths, pchPtr, sysroot, lockCfg,
-                          channelCfg, &channels);
-            ++refreshed;
-          }
-          warmRefreshMs = msSince(refreshStart);
-          warmRefreshed = refreshed;
-          warmDropped = dropped;
-          indexesChanged = refreshed > 0 || dropped > 0;
-          llvm::errs() << "megascope: warm start from " << indexPath
-                       << " (" << refreshed << " TU(s) re-indexed, "
-                       << dropped << " dropped, "
-                       << graph.nodeCount() << " nodes, "
-                       << graph.edgeCount() << " edges, "
-                       << cfIndex.size() << " call sites)\n";
         }
       } else if (llvm::sys::fs::exists(indexPath)) {
         llvm::errs() << "megascope: cannot load index " << indexPath
@@ -1625,41 +1721,28 @@ int main(int argc, const char **argv) {
                    << files.size() << " files, "
                    << McpThreads << " threads)...\n";
       auto bakeStart = StatsClock::now();
-      vycor::BakedIndexes baked;
-      if (McpIsolateWorkers) {
-        // Full builds run in subprocess workers; the warm-start dirty-TU
-        // refresh above stays in-process (bakeTU) regardless of the flag.
-        unsigned workerCount =
-            McpWorkers ? McpWorkers.getValue() : McpThreads.getValue();
-        if (workerCount == 0)
-          workerCount = std::thread::hardware_concurrency();
-        static int selfExeAnchor; // address anchors getMainExecutable
-        std::string selfExe =
-            llvm::sys::fs::getMainExecutable(argv[0], &selfExeAnchor);
-        vycor::McpBakeConfig bakeCfg;
-        bakeCfg.buildPath = McpBuildPath;
-        bakeCfg.collapsePaths = collapsePaths;
-        bakeCfg.extraArgs = vycor::globalExtraArgs();
-        bakeCfg.sysroot = sysroot;
-        bakeCfg.lockTypes = lockCfg.userAllowlist;
-        bakeCfg.channelTypesJson = McpChannelTypesJson;
-        bakeCfg.orgConfig = McpOrgConfig;
-        baked = vycor::bakeIsolated(selfExe, bakeCfg, files, workerCount,
-                                    &buildStats);
-      } else {
-        baked = vycor::bakeIndexes(*compDb, files, collapsePaths, McpThreads,
-                                   pchPtr, sysroot, lockCfg, &buildStats,
-                                   nullptr, channelCfg);
-      }
+      vycor::BakedIndexes baked = runBake(files);
       bakeMs = msSince(bakeStart);
       graph = std::move(baked.graph);
       cfIndex = std::move(baked.cfIndex);
       channels = std::move(baked.channels);
+      deps = std::move(baked.deps);
       llvm::errs() << "megascope: indexes built ("
                    << graph.nodeCount() << " nodes, "
                    << graph.edgeCount() << " edges, "
                    << cfIndex.size() << " call sites)\n";
     }
+
+    // Counts for the reports below: the header's when the graph was never
+    // decoded, else the live indexes'.
+    uint64_t liveNodes = graphSkipped ? snap->summary.nodes
+                                      : graph.nodeCount();
+    uint64_t liveEdges = graphSkipped ? snap->summary.edges
+                                      : graph.edgeCount();
+    uint64_t liveCallSites = graphSkipped ? snap->summary.callSites
+                                          : cfIndex.size();
+    uint64_t liveChannelSites = graphSkipped ? snap->summary.channelSites
+                                             : channels.size();
 
     bool saveFailed = false;
     if (!indexPath.empty() && !indexesChanged) {
@@ -1671,6 +1754,7 @@ int main(int argc, const char **argv) {
       meta.lockBuiltins = lockCfg.useBuiltins;
       meta.channelTypes = channelCfg.registeredTypes;
       meta.files = std::move(currentStamps);
+      vycor::SnapshotIO::recordDependencies(meta, deps);
       meta.entryPoints.assign(McpEntryPoints.begin(), McpEntryPoints.end());
       auto snapSaveStart = StatsClock::now();
       if (vycor::SnapshotIO::save(indexPath, graph, cfIndex, meta,
@@ -1701,17 +1785,25 @@ int main(int argc, const char **argv) {
       snap["save_ms"] = snapSaveMs;
       snap["warm_refresh_ms"] = warmRefreshMs;
       snap["refreshed_tus"] = static_cast<int64_t>(warmRefreshed);
+      snap["refreshed_for_headers"] = static_cast<int64_t>(warmViaDeps);
       snap["dropped_tus"] = static_cast<int64_t>(warmDropped);
+      snap["warm_remove_ms"] = warmRemoveMs;
+      snap["warm_bake_ms"] = warmBakeMs;
+      snap["warm_absorb_ms"] = warmAbsorbMs;
+      snap["graph_skipped"] = graphSkipped;
       snap["load_sections"] = loadSectionsJson(snapLoadStats);
       root["snapshot"] = std::move(snap);
 
       llvm::json::Object g;
-      g["nodes"] = static_cast<int64_t>(graph.nodeCount());
-      g["edges"] = static_cast<int64_t>(graph.edgeCount());
-      g["call_sites"] = static_cast<int64_t>(cfIndex.size());
-      g["interner_strings"] = static_cast<int64_t>(graph.interner().size());
-      g["interner_payload_bytes"] =
-          static_cast<int64_t>(graph.interner().payloadBytes());
+      g["nodes"] = static_cast<int64_t>(liveNodes);
+      g["edges"] = static_cast<int64_t>(liveEdges);
+      g["call_sites"] = static_cast<int64_t>(liveCallSites);
+      if (!graphSkipped) {
+        g["interner_strings"] =
+            static_cast<int64_t>(graph.interner().size());
+        g["interner_payload_bytes"] =
+            static_cast<int64_t>(graph.interner().payloadBytes());
+      }
       root["graph"] = std::move(g);
 
 #if defined(__unix__) || defined(__APPLE__)
@@ -1787,11 +1879,12 @@ int main(int argc, const char **argv) {
       summary["mode"] = needFullBuild ? "cold" : "warm";
       summary["files"] = static_cast<int64_t>(files.size());
       summary["refreshed"] = static_cast<int64_t>(warmRefreshed);
+      summary["refreshed_for_headers"] = static_cast<int64_t>(warmViaDeps);
       summary["dropped"] = static_cast<int64_t>(warmDropped);
-      summary["nodes"] = static_cast<int64_t>(graph.nodeCount());
-      summary["edges"] = static_cast<int64_t>(graph.edgeCount());
-      summary["call_sites"] = static_cast<int64_t>(cfIndex.size());
-      summary["channel_sites"] = static_cast<int64_t>(channels.size());
+      summary["nodes"] = static_cast<int64_t>(liveNodes);
+      summary["edges"] = static_cast<int64_t>(liveEdges);
+      summary["call_sites"] = static_cast<int64_t>(liveCallSites);
+      summary["channel_sites"] = static_cast<int64_t>(liveChannelSites);
       llvm::outs() << llvm::json::Value(std::move(summary)) << "\n";
       return 0;
     }

@@ -55,10 +55,20 @@ megascope: index saved to /path/to/build/.vycor/megascope.vycs
 ```
 
 Re-running `index` is a warm start: it loads the file, compares per-file
-mtime+size stamps, re-parses **only the TUs that changed** (and drops TUs
-removed from the selection), and skips the re-save when nothing changed.
-When more than half of the selection is new or changed it falls back to
-the parallel cold bake instead of refreshing TU by TU. The index is rebuilt from scratch when `--collapse-paths`,
+mtime+size stamps of every TU **and of every header each TU's parse
+opened**, re-parses only the dirty TUs (in parallel, through the same
+bake as a cold build; drops TUs removed from the selection), and skips
+the re-save when nothing changed:
+
+```
+megascope: re-indexing 4 TU(s), 4 for changed headers...
+megascope: warm start from /path/to/build/.vycor/megascope.vycs (4 TU(s) re-indexed, 0 dropped, ...)
+```
+
+When nothing is dirty, `index` reads only the meta section and exits
+without decoding the graph (0.03 s on a 938-TU index). When more than
+half of the selection is dirty it runs the cold bake instead; `--force`
+rebuilds regardless. The index is rebuilt from scratch when `--collapse-paths`,
 `--lock-types`, or the channel-type registrations differ from the run
 that produced it, when the format version changes, or when the file fails
 to decode. Deleting it is always safe.
