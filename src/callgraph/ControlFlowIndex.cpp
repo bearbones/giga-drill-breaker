@@ -180,7 +180,7 @@ void ControlFlowIndex::insertStored(SId caller, SId callee, SId callerDisplay,
                                     uint32_t scopeSet, uint32_t guardSet,
                                     uint32_t raiiSet,
                                     NoexceptSpec callerNoexcept,
-                                    bool insideCatchBlock) {
+                                    bool insideCatchBlock, bool trackTu) {
   size_t idx = contexts_.size();
   byCallee_[callee].push_back(idx);
   byCaller_[caller].push_back(idx);
@@ -191,10 +191,13 @@ void ControlFlowIndex::insertStored(SId caller, SId callee, SId callerDisplay,
   if (callerDisplay != caller)
     byCallerDisplay_[callerDisplay].push_back(idx);
   bySite_[site].push_back(idx);
-  if (tuPath != kNoString)
+  if (!trackTu) {
+    // Read-only load: nothing will ever removeTU/compact this index.
+  } else if (tuPath != kNoString) {
     byTu_[tuPath].push_back(idx);
-  else
+  } else {
     noProvenance_.push_back(idx);
+  }
   contexts_.push_back(StoredContext{caller, callee, callerDisplay,
                                     calleeDisplay, site, tuPath, scopeSet,
                                     guardSet, raiiSet, callerNoexcept,

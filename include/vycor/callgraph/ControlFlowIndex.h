@@ -278,10 +278,13 @@ private:
 
   // Core insert shared by addCallSiteContext and snapshot load; callers
   // must hold mutex_ and pass already-interned ids / set indices.
+  // trackTu=false skips the per-TU provenance (byTu_/noProvenance_) that
+  // only removeTU/compact read — a read-only snapshot load.
   void insertStored(SId caller, SId callee, SId callerDisplay,
                     SId calleeDisplay, SId site, SId tuPath,
                     uint32_t scopeSet, uint32_t guardSet, uint32_t raiiSet,
-                    NoexceptSpec callerNoexcept, bool insideCatchBlock);
+                    NoexceptSpec callerNoexcept, bool insideCatchBlock,
+                    bool trackTu = true);
 
   // usr-map lookup with display-map fallback: by-name queries accept either
   // form; the usr key wins when both exist (they coincide for name-only

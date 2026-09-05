@@ -371,6 +371,10 @@ private:
   // nodes instead of scanning every node in the graph.
   std::unordered_map<SId, std::vector<SId>> tuNodes_;
   size_t liveEdgeCount_ = 0;
+  // Set by a LoadMode::ReadOnly snapshot load: the provenance maps above
+  // were skipped, so mutation would corrupt the graph. The mutators
+  // assert on it.
+  bool readOnly_ = false;
 
   // Transitive closure helpers over the override relation (callers must
   // not hold mutex_; these only read maps written during Phase 1).

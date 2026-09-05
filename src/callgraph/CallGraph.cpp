@@ -16,6 +16,7 @@
 #include "vycor/callgraph/CallGraph.h"
 
 #include <algorithm>
+#include <cassert>
 #include <unordered_set>
 
 namespace vycor {
@@ -37,7 +38,7 @@ CallGraph::CallGraph(CallGraph &&other) noexcept
       tuEdges_(std::move(other.tuEdges_)),
       nodeContributors_(std::move(other.nodeContributors_)),
       tuNodes_(std::move(other.tuNodes_)),
-      liveEdgeCount_(other.liveEdgeCount_) {}
+      liveEdgeCount_(other.liveEdgeCount_), readOnly_(other.readOnly_) {}
 
 CallGraph &CallGraph::operator=(CallGraph &&other) noexcept {
   interner_ = std::move(other.interner_);
@@ -57,6 +58,7 @@ CallGraph &CallGraph::operator=(CallGraph &&other) noexcept {
   nodeContributors_ = std::move(other.nodeContributors_);
   tuNodes_ = std::move(other.tuNodes_);
   liveEdgeCount_ = other.liveEdgeCount_;
+  readOnly_ = other.readOnly_;
   return *this;
 }
 
@@ -75,6 +77,7 @@ void CallGraph::reserveEdges(size_t n) {
 
 void CallGraph::addNode(CallGraphNode node, const std::string &tuPath) {
   std::lock_guard<std::mutex> lock(mutex_);
+  assert(!readOnly_ && "mutating a read-only snapshot load");
   // Name-only callers (hand-built graphs, tests) get usr == display, which
   // keeps their edges — also name-keyed — consistent with the node key.
   if (node.usr.empty())
@@ -152,6 +155,7 @@ CallGraphEdge CallGraph::materialize(const EdgeRef &r) const {
 
 void CallGraph::addEdge(CallGraphEdge edge, const std::string &tuPath) {
   std::lock_guard<std::mutex> lock(mutex_);
+  assert(!readOnly_ && "mutating a read-only snapshot load");
   StoredEdge se;
   se.caller = interner_.intern(edge.callerName);
   se.callee = interner_.intern(edge.calleeName);
@@ -576,6 +580,7 @@ void CallGraph::absorb(const CallGraph &shard) {
   if (&shard == this)
     return;
   std::lock_guard<std::mutex> lockThis(mutex_);
+  assert(!readOnly_ && "mutating a read-only snapshot load");
   std::lock_guard<std::mutex> lockShard(shard.mutex_);
 
   // Shard string id -> master string id, by position (the shard interner is
@@ -698,6 +703,7 @@ void CallGraph::absorb(const CallGraph &shard) {
 
 size_t CallGraph::removeTU(const std::string &tuPath) {
   std::lock_guard<std::mutex> lock(mutex_);
+  assert(!readOnly_ && "mutating a read-only snapshot load");
   auto tuIdOpt = interner_.find(tuPath);
   if (!tuIdOpt)
     return 0;
@@ -778,6 +784,7 @@ size_t CallGraph::removeTU(const std::string &tuPath) {
 
 void CallGraph::compact() {
   std::lock_guard<std::mutex> lock(mutex_);
+  assert(!readOnly_ && "mutating a read-only snapshot load");
   std::deque<StoredEdge> newEdges;
   std::unordered_map<EdgeKey, size_t, EdgeKeyHash> newIndex;
   std::unordered_map<SId, std::vector<size_t>> newOut;

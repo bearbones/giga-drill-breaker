@@ -288,6 +288,44 @@ TEST_CASE("snapshot round-trips graph, CF index, and meta",
   }
 }
 
+TEST_CASE("a read-only load answers the same queries as a mutable one",
+          "[snapshot]") {
+  auto path = tempSnapshotPath("readonly");
+  CallGraph g = makeGraph();
+  ControlFlowIndex cf = makeCfIndex();
+  REQUIRE(SnapshotIO::save(path, g, cf, makeMeta()));
+
+  auto full = SnapshotIO::load(path);
+  auto ro = SnapshotIO::load(path, nullptr, LoadMode::ReadOnly);
+  std::remove(path.c_str());
+  REQUIRE(full.has_value());
+  REQUIRE(ro.has_value());
+
+  CHECK(ro->graph.nodeCount() == full->graph.nodeCount());
+  CHECK(ro->graph.edgeCount() == full->graph.edgeCount());
+  for (const char *name : {"main", "helper", "Base::run", "Derived::run"}) {
+    auto a = full->graph.calleesOf(name), b = ro->graph.calleesOf(name);
+    REQUIRE(a.size() == b.size());
+    for (size_t i = 0; i < a.size(); ++i) {
+      CHECK(a[i].calleeName == b[i].calleeName);
+      CHECK(a[i].callSite == b[i].callSite);
+    }
+    CHECK(full->graph.callersOf(name).size() ==
+          ro->graph.callersOf(name).size());
+  }
+  CHECK(ro->graph.getOverrides("Base::run") ==
+        full->graph.getOverrides("Base::run"));
+
+  CHECK(ro->cfIndex.size() == full->cfIndex.size());
+  const auto ctx = ro->cfIndex.contextAtSite("/src/a.cpp:11:3");
+  REQUIRE(ctx.has_value());
+  CHECK(ctx->callerName == "main");
+  CHECK(ctx->tuPath == "/src/a.cpp");
+  REQUIRE(ctx->enclosingTryCatches.size() == 1);
+  CHECK(ro->cfIndex.contextsForCallee("helper").size() ==
+        full->cfIndex.contextsForCallee("helper").size());
+}
+
 TEST_CASE("snapshot preserves TU provenance for incremental reindex",
           "[snapshot]") {
   auto path = tempSnapshotPath("provenance");
