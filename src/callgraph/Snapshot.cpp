@@ -514,15 +514,21 @@ std::optional<SnapshotData> SnapshotIO::load(const std::string &path,
   };
 
   std::string magic = r.bytes(4);
-  if (!r.ok || magic != std::string(kMagic, 4))
+  if (!r.ok || magic != std::string(kMagic, 4)) {
+    finish();
     return std::nullopt;
-  if (r.u32() != kFormatVersion)
+  }
+  if (r.u32() != kFormatVersion) {
+    finish();
     return std::nullopt;
+  }
   sectionStart = r.p; // the 8-byte magic + version header is no section
 
   SnapshotData out;
-  if (!readMeta(r, out.meta))
+  if (!readMeta(r, out.meta)) {
+    finish();
     return std::nullopt;
+  }
   mark("meta");
 
   // Graph interner table: installed ids match the saved ids by position, so

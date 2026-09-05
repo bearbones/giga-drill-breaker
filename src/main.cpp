@@ -57,17 +57,6 @@
 #include <sys/resource.h>
 #endif
 
-// ---------------------------------------------------------------------------
-// --channel-types-json parsing
-// ---------------------------------------------------------------------------
-
-// Parses a JSON array of channel type registrations:
-//   [{"type": "Queue", "produce": ["push"], "consume": ["pop"],
-//     "category": "queue"}, ...]
-// "type" must be the canonical type name WITHOUT the struct/class keyword
-// (see ChannelIndex.h). Returns false (and prints a diagnostic) on any
-// malformed entry; the caller should treat that as a fatal CLI error, same
-// as a bad --rules-json would be for morph.
 /// Per-section decode timing of a snapshot load, for --stats-json and the
 /// query verbs' -v (docs/megascope-cli-review.md §3.1.1).
 static llvm::json::Array
@@ -83,6 +72,17 @@ loadSectionsJson(const vycor::SnapshotLoadStats &stats) {
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// --channel-types-json parsing
+// ---------------------------------------------------------------------------
+
+// Parses a JSON array of channel type registrations:
+//   [{"type": "Queue", "produce": ["push"], "consume": ["pop"],
+//     "category": "queue"}, ...]
+// "type" must be the canonical type name WITHOUT the struct/class keyword
+// (see ChannelIndex.h). Returns false (and prints a diagnostic) on any
+// malformed entry; the caller should treat that as a fatal CLI error, same
+// as a bad --rules-json would be for morph.
 static bool parseChannelTypesJson(const std::string &path,
                                   vycor::ChannelTypeConfig &outCfg) {
   auto bufOrErr = llvm::MemoryBuffer::getFile(path);
