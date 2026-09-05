@@ -17,6 +17,7 @@
 #include "vycor/callgraph/CallGraph.h"
 #include "vycor/callgraph/ChannelIndex.h"
 #include "vycor/callgraph/ConditionalGuard.h"
+#include "vycor/callgraph/ControlFlowIndex.h"
 
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/JSON.h"
@@ -42,6 +43,16 @@ llvm::json::Value edgeToJson(const CallGraphEdge &e);
 
 const char *channelOperationToString(ChannelOperation op);
 llvm::json::Value serializeGuard(const ConditionalGuard &g);
+/// {tryLocation, enclosingFunction, nestingDepth, handlers: [{caughtType,
+/// isCatchAll, location, body}]} — the shape query_call_site_context has
+/// always emitted for enclosingScopes; shared by the path tools and dump.
+llvm::json::Value serializeTryCatchScope(const TryCatchScope &scope);
+/// "none" | "noexcept" | "noexcept(false)" | "throw()" | "unknown".
+const char *noexceptSpecToString(NoexceptSpec spec);
+/// "lock" | "smart_ptr" | "other".
+const char *raiiKindToString(RaiiKind k);
+/// {typeName, varName, declLocation, kind}.
+llvm::json::Value serializeRaiiLocal(const RaiiLocal &l);
 llvm::json::Value serializeChannelSite(const ChannelSite &s);
 
 } // namespace vycor

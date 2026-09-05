@@ -101,15 +101,6 @@ public:
   std::vector<NearestCatchInfo>
   queryNearestCatches(const std::string &functionName) const;
 
-  // Serialize an ExceptionPathResult to JSON.
-  static std::string toJson(const ExceptionPathResult &result,
-                            const std::string &queryType,
-                            const std::string &functionName,
-                            const std::string &exceptionType = "");
-
-  // Serialize the entire ControlFlowIndex as JSON (dump mode).
-  static std::string dumpIndexToJson(const ControlFlowIndex &index);
-
 private:
   const CallGraph &graph_;
   const ControlFlowIndex &cfIndex_;

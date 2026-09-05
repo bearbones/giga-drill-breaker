@@ -484,6 +484,20 @@ the 938-TU testbed (12 threads; cold bake 150–205 s): unchanged `index`
 wall (load 2.6–3.8, bake 2.7–4.2, save 1.1–1.4); a header with 74
 includers 44–49 s wall (remove 3.9 s after batching, from 17.7 s; bake
 25–31 s; absorb 0.6–1.0 s).
+Item 8 (4.1, D3, D4) and the ephemeral mode of 2.1 landed next: the
+query verbs given `--source`/`--source-list`/`--source-re` (with
+`--build-path`) bake the selected TUs in memory and answer from that
+(`src/cli/MegascopeCli.cpp` `bakeEphemeral`; the bake-config helpers
+moved out of `main.cpp` into `src/cli/BakeConfig.cpp`); the three
+oracle queries prism alone exposed are tools (`query_throw_propagation`,
+`query_all_path_contexts`, `query_nearest_catches`, all with per-path
+scopes and guards through the shared `serializeTryCatchScope`); `megascope
+dump` streams every call-site context and channel site as ndjson (or one
+json document through `llvm::json::OStream`) via the new
+`ControlFlowIndex::forEachContext`, never holding the materialized index;
+and the `prism` subcommand, its hand-built JSON, `toJson`, and
+`dumpIndexToJson` are gone (`vycor-cpp prism` prints the megascope
+equivalents and exits 2).
 
 Items 1–5 make the CLI real and can land in one or two PRs. Item 6 is the
 one performance change the CLI model actually needs, and it is gated on a

@@ -398,9 +398,9 @@ TEST_CASE("readRequest parses newline-delimited messages (MCP stdio framing)",
 // Tool registration tests
 // ============================================================================
 
-TEST_CASE("getRegisteredTools returns all 21 tools", "[mcp][tools]") {
+TEST_CASE("getRegisteredTools returns all 24 tools", "[mcp][tools]") {
   auto tools = getRegisteredTools();
-  CHECK(tools.size() == 21);
+  CHECK(tools.size() == 24);
 
   // Verify tool names.
   std::set<std::string> names;
@@ -1703,4 +1703,161 @@ TEST_CASE("query_same_lock returns empty intersection when locks differ",
   auto shared = obj.getInteger("shared");
   REQUIRE(shared.has_value());
   CHECK(*shared == 0);
+}
+
+// ============================================================================
+// The path-level oracle tools (formerly prism --mode query)
+// ============================================================================
+
+TEST_CASE("query_throw_propagation reports the verdict with per-path detail",
+          "[mcp][tools][prism]") {
+  auto graph = buildTestGraph();
+  auto cfIndex = buildTestCfIndex();
+  ControlFlowOracle oracle(graph, cfIndex);
+  std::vector<std::string> eps = {"main"};
+  ToolContext ctx{graph, oracle, cfIndex, eps};
+  auto handler = findHandler("query_throw_propagation");
+  REQUIRE(handler);
+
+  SECTION("readData throwing std::exception is caught in processFile") {
+    llvm::json::Object args;
+    args["function"] = "readData";
+    args["exception_type"] = "std::exception";
+    auto result = handler(args, ctx);
+    REQUIRE_FALSE(isErrorResult(result));
+    auto obj = parseToolResult(result);
+    CHECK(obj.getString("function") == "readData");
+    CHECK(obj.getString("exceptionType") == "std::exception");
+    CHECK(obj.getString("protection") == "always_caught");
+    CHECK(obj.getInteger("totalPaths") == 1);
+    auto *paths = obj.getArray("paths");
+    REQUIRE(paths != nullptr);
+    REQUIRE(paths->size() == 1);
+    auto *path = (*paths)[0].getAsObject();
+    REQUIRE(path != nullptr);
+    CHECK(path->getBoolean("isCaught") == true);
+    CHECK(path->getString("caughtAt") == "process.cpp:20:3");
+    auto *chain = path->getArray("callChain");
+    REQUIRE(chain != nullptr);
+    REQUIRE(chain->size() == 3);
+    CHECK((*chain)[0].getAsString() == "main");
+    CHECK((*chain)[2].getAsString() == "readData");
+    auto *scopes = path->getArray("tryCatchesOnPath");
+    REQUIRE(scopes != nullptr);
+    REQUIRE(scopes->size() == 1);
+    auto *scope = (*scopes)[0].getAsObject();
+    CHECK(scope->getString("enclosingFunction") == "processFile");
+    auto *handlers = scope->getArray("handlers");
+    REQUIRE(handlers != nullptr);
+    REQUIRE(handlers->size() == 1);
+    CHECK((*handlers)[0].getAsObject()->getString("caughtType") ==
+          "std::exception");
+    CHECK((*handlers)[0].getAsObject()->getString("location") ==
+          "process.cpp:25:3");
+    REQUIRE(path->getArray("guardsOnPath") != nullptr);
+  }
+
+  SECTION("a type no handler matches is never caught") {
+    llvm::json::Object args;
+    args["function"] = "readData";
+    args["exception_type"] = "int";
+    auto obj = parseToolResult(handler(args, ctx));
+    CHECK(obj.getString("protection") == "never_caught");
+    auto *paths = obj.getArray("paths");
+    REQUIRE(paths != nullptr);
+    REQUIRE(paths->size() == 1);
+    auto *path = (*paths)[0].getAsObject();
+    CHECK(path->getBoolean("isCaught") == false);
+    CHECK(path->find("caughtAt") == path->end());
+  }
+
+  SECTION("missing function is an argument error") {
+    llvm::json::Object args;
+    auto result = handler(args, ctx);
+    REQUIRE(isErrorResult(result));
+    CHECK(llvm::StringRef(*errorMessage(result)).starts_with("Missing"));
+  }
+}
+
+TEST_CASE("query_all_path_contexts enumerates paths with their context",
+          "[mcp][tools][prism]") {
+  auto graph = buildTestGraph();
+  auto cfIndex = buildTestCfIndex();
+  ControlFlowOracle oracle(graph, cfIndex);
+  std::vector<std::string> eps = {"main"};
+  ToolContext ctx{graph, oracle, cfIndex, eps};
+  auto handler = findHandler("query_all_path_contexts");
+  REQUIRE(handler);
+
+  SECTION("one path from main to readData") {
+    llvm::json::Object args;
+    args["function"] = "readData";
+    auto result = handler(args, ctx);
+    REQUIRE_FALSE(isErrorResult(result));
+    auto obj = parseToolResult(result);
+    CHECK(obj.getInteger("totalPaths") == 1);
+    CHECK(obj.getInteger("maxPaths") == 100);
+    auto *paths = obj.getArray("paths");
+    REQUIRE(paths != nullptr);
+    REQUIRE(paths->size() == 1);
+    auto *path = (*paths)[0].getAsObject();
+    auto *chain = path->getArray("callChain");
+    REQUIRE(chain != nullptr);
+    REQUIRE(chain->size() == 3);
+    CHECK((*chain)[1].getAsString() == "processFile");
+    REQUIRE(path->getArray("tryCatchesOnPath") != nullptr);
+    CHECK(path->getArray("tryCatchesOnPath")->size() == 1);
+  }
+
+  SECTION("max_paths is honored and must be positive") {
+    llvm::json::Object args;
+    args["function"] = "readData";
+    args["max_paths"] = 1;
+    auto obj = parseToolResult(handler(args, ctx));
+    CHECK(obj.getInteger("maxPaths") == 1);
+    args["max_paths"] = 0;
+    auto bad = handler(args, ctx);
+    REQUIRE(isErrorResult(bad));
+    CHECK(llvm::StringRef(*errorMessage(bad)).starts_with("Invalid"));
+  }
+}
+
+TEST_CASE("query_nearest_catches finds the handler up the call path",
+          "[mcp][tools][prism]") {
+  auto graph = buildTestGraph();
+  auto cfIndex = buildTestCfIndex();
+  ControlFlowOracle oracle(graph, cfIndex);
+  std::vector<std::string> eps = {"main"};
+  ToolContext ctx{graph, oracle, cfIndex, eps};
+  auto handler = findHandler("query_nearest_catches");
+  REQUIRE(handler);
+
+  SECTION("readData is covered by processFile's try") {
+    llvm::json::Object args;
+    args["function"] = "readData";
+    auto result = handler(args, ctx);
+    REQUIRE_FALSE(isErrorResult(result));
+    auto obj = parseToolResult(result);
+    CHECK(obj.getString("function") == "readData");
+    auto *catches = obj.getArray("catches");
+    REQUIRE(catches != nullptr);
+    REQUIRE(catches->size() >= 1);
+    auto *c = (*catches)[0].getAsObject();
+    REQUIRE(c != nullptr);
+    REQUIRE(c->getInteger("framesFromTarget").has_value());
+    auto *scope = c->getObject("scope");
+    REQUIRE(scope != nullptr);
+    CHECK(scope->getString("enclosingFunction") == "processFile");
+    CHECK(scope->getString("tryLocation") == "process.cpp:20:3");
+    REQUIRE(c->getArray("pathSegment") != nullptr);
+  }
+
+  SECTION("nothing catches on the way to cleanup") {
+    llvm::json::Object args;
+    args["function"] = "cleanup";
+    auto obj = parseToolResult(handler(args, ctx));
+    auto *catches = obj.getArray("catches");
+    REQUIRE(catches != nullptr);
+    CHECK(catches->empty());
+  }
 }

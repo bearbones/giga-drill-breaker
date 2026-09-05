@@ -260,16 +260,6 @@ TEST_CASE("Oracle determines exception protection across paths",
     CHECK(foundProcessFile);
   }
 
-  SECTION("JSON output is valid") {
-    auto result = oracle.queryExceptionProtection(
-        "allocateBuffer", "std::bad_alloc", {"main"});
-    auto json = ControlFlowOracle::toJson(result, "exception-protection",
-                                          "allocateBuffer", "std::bad_alloc");
-    CHECK(json.find("\"protection\"") != std::string::npos);
-    CHECK(json.find("\"sometimes_caught\"") != std::string::npos);
-    CHECK(json.find("\"summary\"") != std::string::npos);
-    CHECK(json.find("\"paths\"") != std::string::npos);
-  }
 }
 
 TEST_CASE("Oracle handles always-caught and never-caught cases",
@@ -403,15 +393,18 @@ TEST_CASE("CallGraph integration for exception context scenarios",
 // JSON dump tests
 // ============================================================================
 
-TEST_CASE("JSON dump serialization", "[prism][json]") {
+TEST_CASE("forEachContext streams every live context in insertion order",
+          "[prism][index]") {
   ControlFlowIndex index;
 
   CallSiteContext ctx;
   ctx.callerName = "caller";
   ctx.calleeName = "callee";
   ctx.callSite = "test.cpp:10:5";
+  ctx.callerNoexcept = NoexceptSpec::Noexcept;
+
   TryCatchScope scope;
-  scope.tryLocation = "test.cpp:8:3";
+  scope.tryLocation = "test.cpp:5:3";
   scope.enclosingFunction = "caller";
   CatchHandlerInfo handler;
   handler.caughtType = "std::exception";
@@ -426,15 +419,32 @@ TEST_CASE("JSON dump serialization", "[prism][json]") {
   ctx.enclosingGuards.push_back(std::move(guard));
 
   index.addCallSiteContext(std::move(ctx));
+  CallSiteContext second;
+  second.callerName = "caller";
+  second.calleeName = "other";
+  second.callSite = "test.cpp:20:5";
+  index.addCallSiteContext(std::move(second));
 
-  auto json = ControlFlowOracle::dumpIndexToJson(index);
+  std::vector<CallSiteContext> seen;
+  index.forEachContext(
+      [&](const CallSiteContext &c) { seen.push_back(c); });
 
-  CHECK(json.find("\"totalCallSites\": 1") != std::string::npos);
-  CHECK(json.find("\"callerName\": \"caller\"") != std::string::npos);
-  CHECK(json.find("\"calleeName\": \"callee\"") != std::string::npos);
-  CHECK(json.find("\"std::exception\"") != std::string::npos);
-  CHECK(json.find("\"size > 0\"") != std::string::npos);
-  CHECK(json.find("\"inTrueBranch\": true") != std::string::npos);
+  REQUIRE(seen.size() == 2);
+  CHECK(seen[0].callerName == "caller");
+  CHECK(seen[0].calleeName == "callee");
+  CHECK(seen[0].callerNoexcept == NoexceptSpec::Noexcept);
+  REQUIRE(seen[0].enclosingTryCatches.size() == 1);
+  CHECK(seen[0].enclosingTryCatches[0].handlers[0].caughtType ==
+        "std::exception");
+  REQUIRE(seen[0].enclosingGuards.size() == 1);
+  CHECK(seen[0].enclosingGuards[0].conditionText == "size > 0");
+  CHECK(seen[0].enclosingGuards[0].inTrueBranch);
+  CHECK(seen[1].calleeName == "other");
+
+  // allContexts is the same walk, collected.
+  auto all = index.allContexts();
+  REQUIRE(all.size() == 2);
+  CHECK(all[1].callSite == seen[1].callSite);
 }
 
 // ============================================================================

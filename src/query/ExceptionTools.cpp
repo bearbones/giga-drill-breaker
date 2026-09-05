@@ -51,6 +51,22 @@ static const char *protectionToStr(Protection p) {
   return "unknown";
 }
 
+// `entry_points` from the arguments, else the context's configured list
+// (the bake's --entry-point list, or main).
+static std::vector<std::string> entryPointsArg(const llvm::json::Object &args,
+                                               const ToolContext &ctx) {
+  std::vector<std::string> entryPoints;
+  if (auto *epsArr = args.getArray("entry_points")) {
+    for (auto &v : *epsArr) {
+      if (auto s = v.getAsString())
+        entryPoints.push_back(s->str());
+    }
+  }
+  if (entryPoints.empty())
+    entryPoints = ctx.entryPoints;
+  return entryPoints;
+}
+
 static llvm::json::Value
 handleQueryExceptionSafety(const llvm::json::Object &args,
                            const ToolContext &ctx) {
@@ -65,18 +81,8 @@ handleQueryExceptionSafety(const llvm::json::Object &args,
   if (auto et = args.getString("exception_type"))
     exceptionType = et->str();
 
-  std::vector<std::string> entryPoints;
-  if (auto *epsArr = args.getArray("entry_points")) {
-    for (auto &v : *epsArr) {
-      if (auto s = v.getAsString())
-        entryPoints.push_back(s->str());
-    }
-  }
-  if (entryPoints.empty())
-    entryPoints = ctx.entryPoints;
-
-  auto result =
-      ctx.oracle.queryExceptionProtection(*ident, exceptionType, entryPoints);
+  auto result = ctx.oracle.queryExceptionProtection(
+      *ident, exceptionType, entryPointsArg(args, ctx));
 
   llvm::json::Object obj;
   auto function = args.getString("function");
@@ -223,22 +229,8 @@ handleQueryCallSiteContext(const llvm::json::Object &args,
 
   // Include scope details.
   llvm::json::Array scopes;
-  for (auto &scope : rawCtx->enclosingTryCatches) {
-    llvm::json::Object s;
-    s["tryLocation"] = scope.tryLocation;
-    s["enclosingFunction"] = scope.enclosingFunction;
-    s["nestingDepth"] = static_cast<int64_t>(scope.nestingDepth);
-    llvm::json::Array handlers;
-    for (auto &h : scope.handlers) {
-      llvm::json::Object ho;
-      ho["caughtType"] = h.caughtType;
-      ho["isCatchAll"] = h.isCatchAll;
-      ho["body"] = h.bodySummary;
-      handlers.push_back(llvm::json::Value(std::move(ho)));
-    }
-    s["handlers"] = std::move(handlers);
-    scopes.push_back(llvm::json::Value(std::move(s)));
-  }
+  for (auto &scope : rawCtx->enclosingTryCatches)
+    scopes.push_back(serializeTryCatchScope(scope));
   obj["enclosingScopes"] = std::move(scopes);
 
   // Guard details (innermost first), including any organization annotation
@@ -254,15 +246,6 @@ handleQueryCallSiteContext(const llvm::json::Object &args,
 // ============================================================================
 // Tool 6a: query_raii_scopes_at_callsite
 // ============================================================================
-
-static const char *raiiKindToString(RaiiKind k) {
-  switch (k) {
-  case RaiiKind::Lock: return "lock";
-  case RaiiKind::SmartPtr: return "smart_ptr";
-  case RaiiKind::Other: return "other";
-  }
-  return "other";
-}
 
 static std::optional<RaiiKind> parseRaiiKind(llvm::StringRef s) {
   if (s == "lock") return RaiiKind::Lock;
@@ -314,12 +297,7 @@ handleQueryRaiiScopesAtCallsite(const llvm::json::Object &args,
   for (const auto &l : csCtx->liveRaiiLocals) {
     if (filterByKind && !allowed.count(l.kind))
       continue;
-    llvm::json::Object obj;
-    obj["typeName"] = l.typeName;
-    obj["varName"] = l.varName;
-    obj["declLocation"] = l.declLocation;
-    obj["kind"] = raiiKindToString(l.kind);
-    locals.push_back(llvm::json::Value(std::move(obj)));
+    locals.push_back(serializeRaiiLocal(l));
   }
 
   llvm::json::Object out;
@@ -329,6 +307,130 @@ handleQueryRaiiScopesAtCallsite(const llvm::json::Object &args,
   out["callee"] = csCtx->calleeName;
   out["locals"] = std::move(locals);
   return llvm::json::Value(std::move(out));
+}
+
+// ============================================================================
+// Tools 6b-6d: the path-level oracle queries (Q3-Q5), formerly `prism
+// --mode query`. Each answers with full per-path detail where
+// query_exception_safety keeps to the counts.
+// ============================================================================
+
+static llvm::json::Value serializePathInfo(const PathInfo &p) {
+  llvm::json::Object obj;
+  llvm::json::Array chain;
+  for (const auto &fn : p.callChain)
+    chain.push_back(fn);
+  obj["callChain"] = std::move(chain);
+  obj["isCaught"] = p.isCaught;
+  if (p.isCaught) {
+    obj["caughtAt"] = p.caughtAt;
+    obj["caughtBy"] = p.caughtBy;
+  }
+  llvm::json::Array scopes;
+  for (const auto &scope : p.tryCatchesOnPath)
+    scopes.push_back(serializeTryCatchScope(scope));
+  obj["tryCatchesOnPath"] = std::move(scopes);
+  llvm::json::Array guards;
+  for (const auto &g : p.guardsOnPath)
+    guards.push_back(serializeGuard(g));
+  obj["guardsOnPath"] = std::move(guards);
+  return llvm::json::Value(std::move(obj));
+}
+
+static llvm::json::Value serializePaths(const std::vector<PathInfo> &paths) {
+  llvm::json::Array arr;
+  for (const auto &p : paths)
+    arr.push_back(serializePathInfo(p));
+  return llvm::json::Value(std::move(arr));
+}
+
+static llvm::json::Value
+handleQueryThrowPropagation(const llvm::json::Object &args,
+                            const ToolContext &ctx) {
+  std::optional<llvm::json::Value> ambiguous;
+  auto ident = resolveIdentity(args, ctx, "function", "usr", ambiguous);
+  if (ambiguous)
+    return std::move(*ambiguous);
+  if (!ident)
+    return errorResult("Missing required parameter 'function' (or 'usr')");
+  std::string exceptionType;
+  if (auto et = args.getString("exception_type"))
+    exceptionType = et->str();
+
+  auto result = ctx.oracle.queryThrowPropagation(*ident, exceptionType,
+                                                 entryPointsArg(args, ctx));
+
+  llvm::json::Object obj;
+  auto function = args.getString("function");
+  obj["function"] = function ? function->str() : *ident;
+  attachUsr(obj, ctx, *ident);
+  obj["exceptionType"] = exceptionType;
+  obj["protection"] = protectionToStr(result.protection);
+  obj["totalPaths"] = static_cast<int64_t>(result.paths.size());
+  obj["summary"] = result.summary;
+  obj["paths"] = serializePaths(result.paths);
+  return llvm::json::Value(std::move(obj));
+}
+
+static llvm::json::Value
+handleQueryAllPathContexts(const llvm::json::Object &args,
+                           const ToolContext &ctx) {
+  std::optional<llvm::json::Value> ambiguous;
+  auto ident = resolveIdentity(args, ctx, "function", "usr", ambiguous);
+  if (ambiguous)
+    return std::move(*ambiguous);
+  if (!ident)
+    return errorResult("Missing required parameter 'function' (or 'usr')");
+  unsigned maxPaths = 100;
+  if (auto mp = args.getInteger("max_paths")) {
+    if (*mp <= 0)
+      return errorResult("Invalid max_paths: must be positive");
+    maxPaths = static_cast<unsigned>(*mp);
+  }
+
+  auto paths = ctx.oracle.queryAllPathContexts(*ident,
+                                               entryPointsArg(args, ctx),
+                                               maxPaths);
+
+  llvm::json::Object obj;
+  auto function = args.getString("function");
+  obj["function"] = function ? function->str() : *ident;
+  attachUsr(obj, ctx, *ident);
+  obj["totalPaths"] = static_cast<int64_t>(paths.size());
+  obj["maxPaths"] = static_cast<int64_t>(maxPaths);
+  obj["paths"] = serializePaths(paths);
+  return llvm::json::Value(std::move(obj));
+}
+
+static llvm::json::Value
+handleQueryNearestCatches(const llvm::json::Object &args,
+                          const ToolContext &ctx) {
+  std::optional<llvm::json::Value> ambiguous;
+  auto ident = resolveIdentity(args, ctx, "function", "usr", ambiguous);
+  if (ambiguous)
+    return std::move(*ambiguous);
+  if (!ident)
+    return errorResult("Missing required parameter 'function' (or 'usr')");
+
+  auto catches = ctx.oracle.queryNearestCatches(*ident);
+
+  llvm::json::Object obj;
+  auto function = args.getString("function");
+  obj["function"] = function ? function->str() : *ident;
+  attachUsr(obj, ctx, *ident);
+  llvm::json::Array arr;
+  for (const auto &c : catches) {
+    llvm::json::Object o;
+    o["framesFromTarget"] = static_cast<int64_t>(c.framesFromTarget);
+    llvm::json::Array segment;
+    for (const auto &fn : c.pathSegment)
+      segment.push_back(fn);
+    o["pathSegment"] = std::move(segment);
+    o["scope"] = serializeTryCatchScope(c.scope);
+    arr.push_back(llvm::json::Value(std::move(o)));
+  }
+  obj["catches"] = std::move(arr);
+  return llvm::json::Value(std::move(obj));
 }
 
 void registerExceptionTools(std::vector<ToolEntry> &tools) {
@@ -421,6 +523,80 @@ void registerExceptionTools(std::vector<ToolEntry> &tools) {
                      "candidates:[...]} — re-query with 'caller'.",
                      llvm::json::Value(std::move(schema)),
                      handleQueryRaiiScopesAtCallsite});
+  }
+
+  // Shared identity props for the path tools (function/usr + refinements).
+  auto functionProps = [] {
+    llvm::json::Object props;
+    props["function"] = stringProp(
+        "Target function qualified name. Provide 'function' or 'usr' (usr "
+        "wins when both are present).");
+    props["usr"] = stringProp(
+        "Exact USR of the target function. Bypasses name resolution — use "
+        "it to pick one overload/specialization when the name is "
+        "ambiguous.");
+    addIdentityRefinementProps(props, "");
+    return props;
+  };
+
+  // 6b. query_throw_propagation
+  {
+    llvm::json::Object props = functionProps();
+    props["exception_type"] = stringProp(
+        "Exception type the function throws (e.g. 'std::runtime_error'); "
+        "empty matches any handler");
+    props["entry_points"] = stringArrayProp(
+        "Entry point function names (default: configured entry points)");
+    llvm::json::Object schema;
+    schema["type"] = "object";
+    schema["properties"] = std::move(props);
+    tools.push_back({"query_throw_propagation",
+                     "If a function throws the given exception type, is it "
+                     "caught before unwinding to an entry point? Reports "
+                     "the protection verdict plus every call path with its "
+                     "try/catch scopes, guards, and where the throw would be "
+                     "caught. An ambiguous name returns {ambiguous:true, "
+                     "candidates:[...]} — re-query with 'usr'.",
+                     llvm::json::Value(std::move(schema)),
+                     handleQueryThrowPropagation});
+  }
+
+  // 6c. query_all_path_contexts
+  {
+    llvm::json::Object props = functionProps();
+    props["entry_points"] = stringArrayProp(
+        "Entry point function names (default: configured entry points)");
+    props["max_paths"] = intProp(
+        "Maximum number of paths to enumerate (default 100)");
+    llvm::json::Object schema;
+    schema["type"] = "object";
+    schema["properties"] = std::move(props);
+    tools.push_back({"query_all_path_contexts",
+                     "Enumerate the call paths from the entry points to a "
+                     "function, each with the try/catch scopes and "
+                     "conditional guards along it. The exception-context "
+                     "counterpart of find_call_chain. An ambiguous name "
+                     "returns {ambiguous:true, candidates:[...]} — re-query "
+                     "with 'usr'.",
+                     llvm::json::Value(std::move(schema)),
+                     handleQueryAllPathContexts});
+  }
+
+  // 6d. query_nearest_catches
+  {
+    llvm::json::Object props = functionProps();
+    llvm::json::Object schema;
+    schema["type"] = "object";
+    schema["properties"] = std::move(props);
+    tools.push_back({"query_nearest_catches",
+                     "For each call path into a function, the nearest "
+                     "enclosing try/catch walking up the callers: the "
+                     "handler scope, how many frames up it sits, and the "
+                     "path segment between. Empty when nothing on any path "
+                     "catches. An ambiguous name returns {ambiguous:true, "
+                     "candidates:[...]} — re-query with 'usr'.",
+                     llvm::json::Value(std::move(schema)),
+                     handleQueryNearestCatches});
   }
 }
 

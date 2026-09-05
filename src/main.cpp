@@ -21,7 +21,6 @@
 #include "vycor/callgraph/BuildStats.h"
 #include "vycor/callgraph/CallGraphBuilder.h"
 #include "vycor/callgraph/ControlFlowIndex.h"
-#include "vycor/callgraph/ControlFlowOracle.h"
 #include "vycor/ext/Extensions.h"
 #include "vycor/ext/OrgConfig.h"
 #include "vycor/morph/RulesParser.h"
@@ -29,6 +28,7 @@
 #include "vycor/callgraph/CollapseFilter.h"
 #include "vycor/callgraph/Snapshot.h"
 #include "vycor/callgraph/WorkerPool.h"
+#include "vycor/cli/BakeConfig.h"
 #include "vycor/cli/MegascopeCli.h"
 #include "vycor/cli/SourceSelection.h"
 #include "vycor/compat/PchCache.h"
@@ -74,112 +74,6 @@ loadSectionsJson(const vycor::SnapshotLoadStats &stats) {
   return out;
 }
 
-// ---------------------------------------------------------------------------
-// --channel-types-json parsing
-// ---------------------------------------------------------------------------
-
-// Parses a JSON array of channel type registrations:
-//   [{"type": "Queue", "produce": ["push"], "consume": ["pop"],
-//     "category": "queue"}, ...]
-// "type" must be the canonical type name WITHOUT the struct/class keyword
-// (see ChannelIndex.h). Returns false (and prints a diagnostic) on any
-// malformed entry; the caller should treat that as a fatal CLI error, same
-// as a bad --rules-json would be for morph.
-static bool parseChannelTypesJson(const std::string &path,
-                                  vycor::ChannelTypeConfig &outCfg) {
-  auto bufOrErr = llvm::MemoryBuffer::getFile(path);
-  if (!bufOrErr) {
-    llvm::errs() << "channel-types-json: cannot read " << path << ": "
-                 << bufOrErr.getError().message() << "\n";
-    return false;
-  }
-  auto jsonOrErr = llvm::json::parse(bufOrErr.get()->getBuffer());
-  if (!jsonOrErr) {
-    llvm::errs() << "channel-types-json: parse error in " << path << ": "
-                 << llvm::toString(jsonOrErr.takeError()) << "\n";
-    return false;
-  }
-  auto *arr = jsonOrErr->getAsArray();
-  if (!arr) {
-    llvm::errs() << "channel-types-json: " << path
-                 << " must contain a top-level JSON array\n";
-    return false;
-  }
-  for (const auto &entry : *arr) {
-    auto *obj = entry.getAsObject();
-    if (!obj) {
-      llvm::errs() << "channel-types-json: each entry must be an object\n";
-      return false;
-    }
-    vycor::ChannelTypeSpec spec;
-    if (auto type = obj->getString("type")) {
-      spec.qualifiedTypeName = type->str();
-    } else {
-      llvm::errs() << "channel-types-json: entry missing required 'type'\n";
-      return false;
-    }
-    if (auto *produce = obj->getArray("produce"))
-      for (const auto &m : *produce)
-        if (auto s = m.getAsString())
-          spec.produceMethods.push_back(s->str());
-    if (auto *consume = obj->getArray("consume"))
-      for (const auto &m : *consume)
-        if (auto s = m.getAsString())
-          spec.consumeMethods.push_back(s->str());
-    if (auto category = obj->getString("category"))
-      spec.category = category->str();
-    outCfg.registeredTypes.push_back(std::move(spec));
-  }
-  return true;
-}
-
-// ---------------------------------------------------------------------------
-// --org-config loading and merging (see docs/EXTENDING.md)
-// ---------------------------------------------------------------------------
-
-// Loads --org-config when set and installs its hook-shaped parts (feature
-// flag patterns, lock/channel types) into ExtensionRegistry. Compiled ext/
-// registrars have already run by this point (static init), so after this
-// call the registry holds both sources. Returns false (with a diagnostic)
-// on unreadable/malformed config.
-static bool loadOrgConfigIfSet(const std::string &path,
-                               vycor::OrgConfig &out) {
-  if (path.empty())
-    return true;
-  std::string err;
-  if (!vycor::loadOrgConfigFile(path, out, err) ||
-      !vycor::applyOrgConfig(out, err)) {
-    llvm::errs() << "org-config: " << err << "\n";
-    return false;
-  }
-  return true;
-}
-
-// Merges registry-held lock/channel types (compiled ext/ registrars plus
-// --org-config) into the CLI-built configs, and org collapse paths into
-// collapsePaths. CLI entries keep their position and duplicates are
-// dropped: the merged lists land in snapshot meta (config-match check), so
-// the result must be deterministic and must equal the plain CLI lists when
-// no extensions are registered.
-static void mergeExtensionConfig(const vycor::OrgConfig &orgCfg,
-                                 vycor::LockTypeConfig &lockCfg,
-                                 vycor::ChannelTypeConfig &channelCfg,
-                                 std::vector<std::string> &collapsePaths) {
-  const auto &registry = vycor::ExtensionRegistry::instance();
-  for (const auto &name : registry.lockTypes())
-    if (std::find(lockCfg.userAllowlist.begin(), lockCfg.userAllowlist.end(),
-                  name) == lockCfg.userAllowlist.end())
-      lockCfg.userAllowlist.push_back(name);
-  for (const auto &spec : registry.channelTypes())
-    if (std::find(channelCfg.registeredTypes.begin(),
-                  channelCfg.registeredTypes.end(),
-                  spec) == channelCfg.registeredTypes.end())
-      channelCfg.registeredTypes.push_back(spec);
-  for (const auto &pattern : orgCfg.collapsePaths)
-    if (std::find(collapsePaths.begin(), collapsePaths.end(), pattern) ==
-        collapsePaths.end())
-      collapsePaths.push_back(pattern);
-}
 
 // ---------------------------------------------------------------------------
 // Subcommands
@@ -192,10 +86,6 @@ static llvm::cl::SubCommand
 static llvm::cl::SubCommand
     MorphCmd("morph",
               "Apply AST-based source transformations");
-
-static llvm::cl::SubCommand
-    PrismCmd("prism",
-               "Query control flow and exception handling context");
 
 static llvm::cl::SubCommand
     MegascopeCmd("megascope",
@@ -404,155 +294,6 @@ static llvm::cl::opt<bool>
                  llvm::cl::sub(MorphCmd));
 
 // ---------------------------------------------------------------------------
-// prism options
-// ---------------------------------------------------------------------------
-
-static llvm::cl::opt<std::string>
-    PrismBuildPath("build-path",
-                     llvm::cl::desc("Directory containing compile_commands.json"),
-                     llvm::cl::value_desc("dir"),
-                     llvm::cl::sub(PrismCmd));
-
-static llvm::cl::list<std::string>
-    PrismSourceFiles("source",
-                       llvm::cl::desc("Source files to analyze"),
-                       llvm::cl::value_desc("file"),
-                       llvm::cl::OneOrMore,
-                       llvm::cl::sub(PrismCmd));
-
-static llvm::cl::list<std::string>
-    PrismEntryPoints("entry-point",
-                       llvm::cl::desc("Entry point function names (default: main)"),
-                       llvm::cl::value_desc("name"),
-                       llvm::cl::sub(PrismCmd));
-
-enum PrismMode { PrismDump, PrismQuery };
-static llvm::cl::opt<PrismMode>
-    PrismModeOpt("mode",
-                   llvm::cl::desc("Output mode"),
-                   llvm::cl::values(
-                       clEnumValN(PrismDump, "dump",
-                                  "Dump full control flow index as JSON"),
-                       clEnumValN(PrismQuery, "query",
-                                  "Run a targeted query")),
-                   llvm::cl::init(PrismDump),
-                   llvm::cl::sub(PrismCmd));
-
-enum PrismType {
-  CfqExceptionProtection,
-  CfqCallSiteContext,
-  CfqAllPathContexts,
-  CfqThrowPropagation,
-  CfqNearestCatches
-};
-static llvm::cl::opt<PrismType>
-    PrismQueryType("query-type",
-                     llvm::cl::desc("Type of query to run (requires --mode query)"),
-                     llvm::cl::values(
-                         clEnumValN(CfqExceptionProtection,
-                                    "exception-protection",
-                                    "Is function always/sometimes/never under try/catch?"),
-                         clEnumValN(CfqCallSiteContext,
-                                    "call-site-context",
-                                    "Exception context at a specific call site"),
-                         clEnumValN(CfqAllPathContexts,
-                                    "all-path-contexts",
-                                    "All paths to function with exception context"),
-                         clEnumValN(CfqThrowPropagation,
-                                    "throw-propagation",
-                                    "Is a thrown exception caught before unwinding?"),
-                         clEnumValN(CfqNearestCatches,
-                                    "nearest-catches",
-                                    "Nearest try/catch on each path to function")),
-                     llvm::cl::init(CfqExceptionProtection),
-                     llvm::cl::sub(PrismCmd));
-
-static llvm::cl::opt<std::string>
-    PrismFunction("function",
-                    llvm::cl::desc("Target function (qualified name)"),
-                    llvm::cl::value_desc("name"),
-                    llvm::cl::sub(PrismCmd));
-
-static llvm::cl::opt<std::string>
-    PrismCallSite("call-site",
-                    llvm::cl::desc("Call site location (file:line:col)"),
-                    llvm::cl::value_desc("location"),
-                    llvm::cl::sub(PrismCmd));
-
-static llvm::cl::opt<std::string>
-    PrismExceptionType("exception-type",
-                         llvm::cl::desc("Exception type for protection queries"),
-                         llvm::cl::value_desc("type"),
-                         llvm::cl::sub(PrismCmd));
-
-static llvm::cl::opt<unsigned>
-    PrismMaxPaths("max-paths",
-                    llvm::cl::desc("Maximum number of paths to enumerate (default: 100)"),
-                    llvm::cl::init(100),
-                    llvm::cl::sub(PrismCmd));
-
-static llvm::cl::list<std::string>
-    PrismCollapsePaths("collapse-paths",
-        llvm::cl::desc("Path patterns to collapse (internal edges skipped)"),
-        llvm::cl::value_desc("pattern"),
-        llvm::cl::sub(PrismCmd));
-
-static llvm::cl::list<std::string>
-    PrismSkipPaths("skip-paths",
-        llvm::cl::desc("Path patterns to skip entirely (TUs matching are not processed)"),
-        llvm::cl::value_desc("pattern"),
-        llvm::cl::sub(PrismCmd));
-
-static llvm::cl::opt<unsigned>
-    PrismThreads("threads",
-        llvm::cl::desc("Number of threads (0 = hardware_concurrency, 1 = serial)"),
-        llvm::cl::init(0),
-        llvm::cl::sub(PrismCmd));
-
-static llvm::cl::opt<std::string>
-    PrismPchDir("pch-dir",
-        llvm::cl::desc("Directory for compiled PCH cache (enables PCH reuse)"),
-        llvm::cl::value_desc("dir"),
-        llvm::cl::sub(PrismCmd));
-
-static llvm::cl::opt<std::string>
-    PrismClang("clang",
-        llvm::cl::desc("Path to clang++ binary for PCH compilation"),
-        llvm::cl::value_desc("path"),
-        llvm::cl::init(VYCOR_DEFAULT_CLANG),
-        llvm::cl::sub(PrismCmd));
-
-static llvm::cl::list<std::string>
-    PrismLockTypes("lock-types",
-        llvm::cl::desc("Qualified names of additional lock types (repeatable)"),
-        llvm::cl::value_desc("qualified-name"),
-        llvm::cl::sub(PrismCmd));
-
-static llvm::cl::opt<std::string>
-    PrismSysroot("sysroot",
-        llvm::cl::desc("macOS SDK sysroot path (default: auto-detect via xcrun)"),
-        llvm::cl::value_desc("dir"),
-        llvm::cl::sub(PrismCmd));
-
-static llvm::cl::opt<std::string>
-    PrismChannelTypesJson("channel-types-json",
-        llvm::cl::desc("JSON file registering channel/queue types to trace "
-                       "producer/consumer call sites for (see "
-                       "ChannelIndex.h for the schema). --mode dump "
-                       "includes channel records when set."),
-        llvm::cl::value_desc("file"),
-        llvm::cl::sub(PrismCmd));
-
-static llvm::cl::opt<std::string>
-    PrismOrgConfig("org-config",
-        llvm::cl::desc("Organization config JSON (lock/channel types, "
-                       "feature-flag patterns, collapse paths — see "
-                       "docs/EXTENDING.md). Merged with the equivalent "
-                       "CLI flags."),
-        llvm::cl::value_desc("file"),
-        llvm::cl::sub(PrismCmd));
-
-// ---------------------------------------------------------------------------
 // megascope options
 // ---------------------------------------------------------------------------
 
@@ -748,6 +489,23 @@ int main(int argc, const char **argv) {
   enum class MegascopeVerb { Legacy, Index, Serve };
   MegascopeVerb megascopeVerb = MegascopeVerb::Legacy;
   std::vector<const char *> peeledArgv;
+  if (argc >= 2 && llvm::StringRef(argv[1]) == "prism") {
+    // Folded into megascope (docs/megascope-cli-review.md §4.1): the query
+    // verbs bake in memory when given the selection flags, and `dump`
+    // streams what `--mode dump` printed.
+    llvm::errs()
+        << "vycor-cpp prism has been folded into megascope:\n"
+           "  --mode dump   -> megascope dump --build-path <dir> "
+           "--source <file>...\n"
+           "  --mode query  -> megascope query-exception-safety | "
+           "query-call-site-context |\n"
+           "                   query-all-path-contexts | "
+           "query-throw-propagation |\n"
+           "                   query-nearest-catches, with the same "
+           "--build-path/--source\n"
+           "Run `vycor-cpp megascope help`.\n";
+    return vycor::kExitUsage;
+  }
   if (argc >= 2 && llvm::StringRef(argv[1]) == "megascope") {
     if (argc == 2)
       return vycor::runMegascopeQueryVerb({}, llvm::outs(), llvm::errs(),
@@ -780,7 +538,6 @@ int main(int argc, const char **argv) {
       "\nSubcommands:\n"
       "  anneal     Detect fragile ADL/CTAD resolution across translation units\n"
       "  morph     Apply rule-driven AST matcher transformations\n"
-      "  prism    Query control flow and exception handling context\n"
       "  megascope  Index a project's call graph and query it "
       "(`megascope help`)\n");
 
@@ -1130,232 +887,6 @@ int main(int argc, const char **argv) {
     std::vector<std::string> files(MorphSourceFiles.begin(),
                                    MorphSourceFiles.end());
     return pipeline.execute(buildPaths, files, MorphDryRun);
-  }
-
-  // ---- prism --------------------------------------------------------------
-  if (PrismCmd) {
-    if (PrismBuildPath.empty()) {
-      llvm::errs() << "prism: --build-path is required\n";
-      return 1;
-    }
-    if (PrismSourceFiles.empty()) {
-      llvm::errs() << "prism: at least one --source file is required\n";
-      return 1;
-    }
-
-    std::string dbError;
-    auto compDb = clang::tooling::CompilationDatabase::loadFromDirectory(
-        PrismBuildPath, dbError);
-    if (!compDb) {
-      llvm::errs() << "prism: error loading compilation database from "
-                   << PrismBuildPath << ": " << dbError << "\n";
-      return 1;
-    }
-
-    std::vector<std::string> files(PrismSourceFiles.begin(),
-                                   PrismSourceFiles.end());
-    std::vector<std::string> collapsePaths(PrismCollapsePaths.begin(),
-                                           PrismCollapsePaths.end());
-
-    // Filter out TUs matching --skip-paths.
-    if (!PrismSkipPaths.empty()) {
-      vycor::CollapseFilter skipFilter(
-          {PrismSkipPaths.begin(), PrismSkipPaths.end()});
-      size_t before = files.size();
-      files.erase(std::remove_if(files.begin(), files.end(),
-                                  [&](const std::string &f) {
-                                    return skipFilter.isCollapsed(f);
-                                  }),
-                  files.end());
-      llvm::errs() << "skip-paths: " << (before - files.size())
-                   << " of " << before << " TUs skipped\n";
-    }
-
-    // Pre-compile PCH headers if --pch-dir is set.
-    std::unique_ptr<vycor::PchCache> pchCache;
-    if (!PrismPchDir.empty()) {
-      pchCache = std::make_unique<vycor::PchCache>(
-          PrismPchDir.getValue(), PrismClang.getValue());
-      pchCache->buildFromCompileCommands(*compDb, files);
-    }
-    const vycor::PchCache *pchPtr = pchCache.get();
-
-    std::string sysroot = PrismSysroot.getValue();
-
-    // Phases 1-3: bake call graph and control flow index (Phase 2+3 share
-    // one parse per TU).
-    vycor::LockTypeConfig lockCfg;
-    lockCfg.userAllowlist.assign(PrismLockTypes.begin(),
-                                 PrismLockTypes.end());
-    vycor::ChannelTypeConfig channelCfg;
-    if (!PrismChannelTypesJson.empty() &&
-        !parseChannelTypesJson(PrismChannelTypesJson, channelCfg)) {
-      return 1;
-    }
-    vycor::OrgConfig orgCfg;
-    if (!loadOrgConfigIfSet(PrismOrgConfig, orgCfg))
-      return 1;
-    mergeExtensionConfig(orgCfg, lockCfg, channelCfg, collapsePaths);
-    auto baked = vycor::bakeIndexes(*compDb, files, collapsePaths,
-                                    PrismThreads, pchPtr, sysroot, lockCfg,
-                                    nullptr, nullptr, channelCfg);
-    auto graph = std::move(baked.graph);
-    auto cfIndex = std::move(baked.cfIndex);
-    auto channels = std::move(baked.channels);
-
-    // Dump mode: serialize the full index as JSON.
-    if (PrismModeOpt == PrismDump) {
-      llvm::outs() << vycor::ControlFlowOracle::dumpIndexToJson(cfIndex);
-      if (!channelCfg.registeredTypes.empty()) {
-        llvm::json::Array sites;
-        for (const auto &s : channels.allSites()) {
-          llvm::json::Array guards;
-          for (const auto &g : s.enclosingGuards) {
-            llvm::json::Object guardObj{
-                {"conditionText", g.conditionText},
-                {"location", g.location},
-                {"inTrueBranch", g.inTrueBranch},
-                {"isAssertion", g.isAssertion}};
-            // Organization guard classifiers (feature flags etc.).
-            if (auto ann = vycor::classifyGuard(g))
-              guardObj["annotation"] = llvm::json::Object{
-                  {"kind", ann->kind}, {"name", ann->name}};
-            guards.push_back(std::move(guardObj));
-          }
-          sites.push_back(llvm::json::Object{
-              {"channelId", s.channelId},
-              {"channelType", s.channelTypeName},
-              {"category", s.category},
-              {"operation",
-               s.op == vycor::ChannelOperation::Produce ? "produce"
-                                                        : "consume"},
-              {"function", s.siteFunctionDisplay},
-              {"functionUsr", s.siteFunctionUsr},
-              {"callSite", s.callSite},
-              {"guards", std::move(guards)}});
-        }
-        llvm::outs() << llvm::json::Value(llvm::json::Object{
-            {"channelSiteCount", static_cast<int64_t>(sites.size())},
-            {"channelSites", std::move(sites)}})
-                     << "\n";
-      }
-      return 0;
-    }
-
-    // Query mode: run a specific query.
-    vycor::ControlFlowOracle oracle(graph, cfIndex);
-
-    std::vector<std::string> entryPoints(PrismEntryPoints.begin(),
-                                         PrismEntryPoints.end());
-    if (entryPoints.empty())
-      entryPoints.push_back("main");
-
-    switch (PrismQueryType) {
-    case CfqCallSiteContext: {
-      if (PrismCallSite.empty()) {
-        llvm::errs() << "prism: --call-site is required for "
-                        "call-site-context query\n";
-        return 1;
-      }
-      auto info = oracle.queryCallSite(PrismCallSite);
-      // Simple JSON output for call site info.
-      llvm::outs() << "{\n"
-                   << "  \"callSite\": \"" << info.callSite << "\",\n"
-                   << "  \"caller\": \"" << info.caller << "\",\n"
-                   << "  \"callee\": \"" << info.callee << "\",\n"
-                   << "  \"isUnderTryCatch\": "
-                   << (info.isUnderTryCatch ? "true" : "false") << ",\n"
-                   << "  \"wouldTerminateIfThrows\": "
-                   << (info.wouldTerminateIfThrows ? "true" : "false") << ",\n"
-                   << "  \"enclosingScopeCount\": "
-                   << info.enclosingScopes.size() << ",\n"
-                   << "  \"enclosingGuardCount\": "
-                   << info.enclosingGuards.size() << "\n"
-                   << "}\n";
-      return 0;
-    }
-
-    case CfqExceptionProtection: {
-      if (PrismFunction.empty()) {
-        llvm::errs() << "prism: --function is required for "
-                        "exception-protection query\n";
-        return 1;
-      }
-      auto result = oracle.queryExceptionProtection(
-          PrismFunction, PrismExceptionType, entryPoints);
-      llvm::outs() << vycor::ControlFlowOracle::toJson(
-          result, "exception-protection", PrismFunction,
-          PrismExceptionType);
-      return 0;
-    }
-
-    case CfqAllPathContexts: {
-      if (PrismFunction.empty()) {
-        llvm::errs() << "prism: --function is required for "
-                        "all-path-contexts query\n";
-        return 1;
-      }
-      auto result = oracle.queryExceptionProtection(
-          PrismFunction, PrismExceptionType, entryPoints);
-      llvm::outs() << vycor::ControlFlowOracle::toJson(
-          result, "all-path-contexts", PrismFunction,
-          PrismExceptionType);
-      return 0;
-    }
-
-    case CfqThrowPropagation: {
-      if (PrismFunction.empty()) {
-        llvm::errs() << "prism: --function is required for "
-                        "throw-propagation query\n";
-        return 1;
-      }
-      auto result = oracle.queryThrowPropagation(
-          PrismFunction, PrismExceptionType, entryPoints);
-      llvm::outs() << vycor::ControlFlowOracle::toJson(
-          result, "throw-propagation", PrismFunction,
-          PrismExceptionType);
-      return 0;
-    }
-
-    case CfqNearestCatches: {
-      if (PrismFunction.empty()) {
-        llvm::errs() << "prism: --function is required for "
-                        "nearest-catches query\n";
-        return 1;
-      }
-      auto catches = oracle.queryNearestCatches(PrismFunction);
-      llvm::outs() << "{\n"
-                   << "  \"query\": \"nearest-catches\",\n"
-                   << "  \"function\": \"" << PrismFunction.getValue()
-                   << "\",\n"
-                   << "  \"results\": [\n";
-      for (size_t i = 0; i < catches.size(); ++i) {
-        const auto &c = catches[i];
-        llvm::outs() << "    {\n"
-                     << "      \"framesFromTarget\": " << c.framesFromTarget
-                     << ",\n"
-                     << "      \"tryLocation\": \""
-                     << c.scope.tryLocation << "\",\n"
-                     << "      \"enclosingFunction\": \""
-                     << c.scope.enclosingFunction << "\",\n"
-                     << "      \"pathSegment\": [";
-        for (size_t j = 0; j < c.pathSegment.size(); ++j) {
-          llvm::outs() << "\"" << c.pathSegment[j] << "\"";
-          if (j + 1 < c.pathSegment.size())
-            llvm::outs() << ", ";
-        }
-        llvm::outs() << "]\n"
-                     << "    }";
-        if (i + 1 < catches.size())
-          llvm::outs() << ",";
-        llvm::outs() << "\n";
-      }
-      llvm::outs() << "  ]\n}\n";
-      return 0;
-    }
-    }
-
-    return 0;
   }
 
   // ---- megascope -------------------------------------------------------------
@@ -1915,7 +1446,7 @@ int main(int argc, const char **argv) {
   }
 
   llvm::errs() << "No subcommand specified. Use 'anneal', 'morph', "
-                  "'prism', or 'megascope'.\n"
+                  "or 'megascope'.\n"
                << "Run with --help for usage information.\n";
   return 1;
 }

@@ -16,13 +16,13 @@ Tree) infrastructure to:
    what is included.
 2. **Apply AST matcher transformations** (`morph`) — rule-driven rewrites of
    C++ source code using Clang's dynamic matcher DSL.
-3. **Query control flow and exception context** (`prism`) — one-shot CLI
-   queries for call site guards, try/catch scopes, and exception safety.
-4. **Cross-TU call graph index and query tools** (`megascope`) — bakes a
+3. **Cross-TU call graph index and query tools** (`megascope`) — bakes a
    multi-TU call graph and control flow index into a file, then answers
-   queries from the shell (`megascope <tool>`, `batch`) or over MCP
-   (`serve`) for LLM-assisted code analysis (security audits, dead code,
-   etc.).
+   queries from the shell (`megascope <tool>`, `batch`, `dump`) or over
+   MCP (`serve`) for LLM-assisted code analysis (security audits, dead
+   code, etc.). Given source selection flags instead of an index, the
+   query verbs bake the selected TUs in memory and answer (ephemeral
+   mode — the former `prism` subcommand).
 
 It is designed to be called by external tooling (e.g. a Python orchestrator,
 or an LLM agent using the megascope verbs or MCP server for security
@@ -36,9 +36,9 @@ Glass and optics. **vycor** is the Corning glass family the C++ tool draws
 its name from (sibling to Pyrex, more demanding spec); the `-cpp` suffix
 leaves the bare `vycor` for a future Python sibling. **anneal** relieves
 latent stress — ADL/CTAD fragility. **morph** reshapes amorphous structure —
-AST transforms. **prism** decomposes one point into its components — call-site
-control flow. **megascope** is the persistent far-seeing instrument — the
-cross-TU index and its query verbs.
+AST transforms. **megascope** is the persistent far-seeing instrument — the
+cross-TU index and its query verbs (its ephemeral mode absorbed **prism**,
+which decomposed one point into its components — call-site control flow).
 
 ---
 
@@ -125,7 +125,7 @@ The main entry point is `vycor::TransformPipeline::execute(buildPath, files, dry
 | `ControlFlowContextVisitor.cpp` | Phase 3 AST visitor: snapshots exception/guard context at each call site |
 | `ControlFlowOracle.h/.cpp` | Query engine: exception safety, path analysis, call site context |
 
-**Single-parse build** (used by both `prism` and `megascope`):
+**Single-parse build** (`megascope index` and the ephemeral query mode):
 `bakeIndexes(compDb, files, ...)` runs all three visitor phases —
 declaration/hierarchy index, edge building, CF context — over ONE frontend
 parse per TU. No phase barrier is needed because edge building has no
@@ -163,7 +163,7 @@ handlers directly.
 | `Identity.h/.cpp` | F8 identity resolution: `resolveIdentity` (name/usr/site/filter → USR), the disambiguation payload, `attachUsr` |
 | `Serialize.h/.cpp` | Enum spellings (`EdgeKind`, `Confidence`, `ExecutionContext`, `ChannelOperation`) and JSON serializers for edges, guards, channel sites — part of the output contract |
 | `GraphTools.cpp` | lookup, search, callers, callees, call chain, class hierarchy, entry points, graph summary, callback/concurrency sites |
-| `ExceptionTools.cpp` | exception safety, call-site context, RAII scopes |
+| `ExceptionTools.cpp` | exception safety, call-site context, RAII scopes, throw propagation, all-path contexts, nearest catches |
 | `LockTools.cpp` | locks held, same-lock path search |
 | `DeadCodeTools.cpp` | dead-code analysis (cached liveness) |
 | `ChannelTools.cpp` | channel listing/query, channels-for-function, explain-ordering |
@@ -177,7 +177,8 @@ handlers directly.
 
 | File | Purpose |
 |---|---|
-| `MegascopeCli.h/.cpp` | The query verbs (`<tool>`, `call`, `tools`, `info`, `batch`): `parseToolArgs` derives `--flags` from each tool's JSON Schema (strings take a value, integers parse, booleans are bare, arrays repeat; hyphens and underscores interchangeable; `--args '<json>'` seeds), `emitToolResult` implements the output contract (compact JSON / `--pretty` / `--format ndjson` with a leading `{"_summary":...}` line / `--format tsv` with sorted columns) and `exitCodeFor` the exit codes (0 results, 1 empty, 2 usage, 3 index, 4 ambiguous); `resolveIndexPath` is the `--index` → `$VYCOR_INDEX` → `<build-path>/.vycor/megascope.vycs` → `./.vycor/megascope.vycs` chain |
+| `BakeConfig.h/.cpp` | `parseChannelTypesJson`, `loadOrgConfigIfSet`, `mergeExtensionConfig` — the bake configuration shared by `main.cpp`'s verbs and the ephemeral query mode |
+| `MegascopeCli.h/.cpp` | The query verbs (`<tool>`, `call`, `tools`, `info`, `batch`, `dump`): `parseToolArgs` derives `--flags` from each tool's JSON Schema (strings take a value, integers parse, booleans are bare, arrays repeat; hyphens and underscores interchangeable; `--args '<json>'` seeds), `emitToolResult` implements the output contract (compact JSON / `--pretty` / `--format ndjson` with a leading `{"_summary":...}` line / `--format tsv` with sorted columns) and `exitCodeFor` the exit codes (0 results, 1 empty, 2 usage, 3 index, 4 ambiguous); `resolveIndexPath` is the `--index` → `$VYCOR_INDEX` → `<build-path>/.vycor/megascope.vycs` → `./.vycor/megascope.vycs` chain; `dump` streams every call-site context and channel site through `ControlFlowIndex::forEachContext` (ndjson default, or one json document via `llvm::json::OStream`); ephemeral mode (`--source`/`--source-list`/`--source-re` with `--build-path`) runs `selectSources` + `bakeIndexes` in memory and answers from that, no index read or written |
 
 The query verbs load the index with `LoadMode::ReadOnly`
 (`callgraph/Snapshot.h`): the edge dedup map and per-TU provenance that
@@ -232,9 +233,11 @@ per index (one scrub per affected adjacency vector for the whole set).
 | `McpServer.h/.cpp` | JSON-RPC dispatch loop; owns the indexes and `QueryCache`; `wrapToolResult` turns a query payload into a `content[0].text` block (error payload → `isError`); implements `reindex_tu` (needs mutable indexes) |
 | `McpProtocol.h/.cpp` | MCP stdio framing: newline-delimited JSON, with Content-Length autodetect for legacy clients |
 
-**21 tools** (CLI verbs and MCP): `search_functions`, `lookup_function`, `get_callees`,
+**24 tools** (CLI verbs and MCP): `search_functions`, `lookup_function`, `get_callees`,
 `get_callers`, `find_call_chain`, `query_exception_safety`,
 `query_call_site_context`, `query_raii_scopes_at_callsite`,
+`query_throw_propagation`, `query_all_path_contexts`,
+`query_nearest_catches`,
 `query_locks_held`, `query_same_lock`, `analyze_dead_code`,
 `get_class_hierarchy`, `list_entry_points`, `graph_summary`,
 `list_callback_sites`, `list_concurrency_entry_points`, `list_channels`,
@@ -276,7 +279,7 @@ Key semantics:
   (`mergeExtensionConfig`, CLI-first order, deduped) — so they participate
   in snapshot config-match/invalidation automatically.
 - Guard classification (feature flags) happens at **query/serialization
-  time** (`classifyGuard` in prism dump, `query_call_site_context`,
+  time** (`classifyGuard` in `megascope dump`, `query_call_site_context`,
   channel-site listings) — never at index time, so changing patterns does
   not invalidate snapshots. Annotation shape:
   `{"annotation": {"kind": "feature-flag", "name": "<flag>"}}` plus the
@@ -286,21 +289,23 @@ Key semantics:
 
 ## CLI Entry Point
 
-`src/main.cpp` uses LLVM's `CommandLine` library with four `cl::SubCommand`
-objects:
+`src/main.cpp` uses LLVM's `CommandLine` library with three `cl::SubCommand`
+objects (`prism` is gone; `vycor-cpp prism ...` prints the megascope
+equivalents and exits 2):
 
 ```
 vycor-cpp anneal     --build-path <dir> --source <files...> [--list-checks] [--checks <spec>] [--checks-config <file>] [--threads <n>] [--checkpoint <file>] [--isolate-workers [--workers <n>]] [--org-config <file>]
 vycor-cpp morph     --rules-json <file> --build-path <dir> --source <files...> [--dry-run]
-vycor-cpp prism    --build-path <dir> --source <files...> --mode <dump|query> [--collapse-paths <pattern>...] [--org-config <file>]
 vycor-cpp megascope index   --build-path <dir> [--source <file>...] [--source-list <file|->] [--source-re <regex>] [--skip-paths <pattern>...] [--index <file>] [--collapse-paths <pattern>...] [--org-config <file>] [--threads <n>] [--isolate-workers]
 vycor-cpp megascope <tool>  [--index <file> | --build-path <dir>] [tool flags from its schema...] [--format json|ndjson|tsv] [--pretty]
+vycor-cpp megascope <tool>  --build-path <dir> --source <file>... | --source-list <file|-> | --source-re <regex> [--skip-paths ...] [--collapse-paths ...] [--threads <n>] [--org-config <file>] [tool flags...]   # ephemeral: bake in memory, no index
 vycor-cpp megascope batch   [--index <file>]      # NDJSON {"tool":..,"args":{..}} on stdin
+vycor-cpp megascope dump    [--index <file> | --build-path <dir>] [--format ndjson|json] [--pretty]   # stream every call-site context and channel site
 vycor-cpp megascope serve   --build-path <dir> [same selection flags as index] [--index <file>] [--entry-point <name>...] [-v]
 vycor-cpp megascope tools | info [--files] | help
 ```
 
-`--org-config` (anneal/prism/megascope) loads the organization config JSON
+`--org-config` (anneal/megascope) loads the organization config JSON
 (see `include/vycor/ext/OrgConfig.h` and `docs/EXTENDING.md`); its
 lock/channel types and collapse paths merge with the equivalent CLI flags.
 
@@ -324,15 +329,15 @@ To add a new subcommand, follow the pattern in `main.cpp`:
 2. Declare option variables with `llvm::cl::sub(MyCmd)`.
 3. Add an `if (MyCmd) { ... }` branch in `main()`.
 
-### prism vs megascope
+### Indexed vs ephemeral
 
-- **prism**: One-shot CLI tool. Parses AST per invocation, outputs JSON to stdout. Best for quick single-file investigations.
-- **megascope**: Cross-TU. `megascope index` bakes a unified call graph + control-flow index into a file once; every tool verb (`megascope get-callers --name f`, `megascope batch`) loads it and answers, and `megascope serve` exposes the same tools over MCP stdio. **Always use megascope for security audits or multi-file analysis** — prism is single-TU and cannot see cross-file callers.
+- **Indexed**: `megascope index` bakes a unified call graph + control-flow index into a file once; every tool verb (`megascope get-callers --name f`, `megascope batch`, `megascope dump`) loads it and answers, and `megascope serve` exposes the same tools over MCP stdio. **Always index for security audits or multi-file analysis.**
+- **Ephemeral**: the same verbs given `--source`/`--source-list`/`--source-re` (with `--build-path`) bake those TUs in memory per invocation and answer — quick single-file investigations, the role the removed `prism` subcommand played. The bake sees only the selected TUs, so cross-file callers are invisible.
 
 ### Edge Collapse (--collapse-paths)
 
-Both `prism` and `megascope` accept `--collapse-paths` to reduce noise from
-header-inlined utility code. Patterns are path component substrings:
+`megascope` (`index`, `serve`, and the ephemeral query mode) accepts
+`--collapse-paths` to reduce noise from header-inlined utility code. Patterns are path component substrings:
 
 ```bash
 --collapse-paths Client/Math --collapse-paths Client/Core
