@@ -184,6 +184,16 @@ never touch `llvm::cl`; `index` and `serve` share the bake option block
 with the legacy verb-less form (which keeps `--snapshot`'s opt-in
 semantics). `megascope index` prints a one-line JSON summary on stdout.
 
+TU selection (`SourceSelection.h/.cpp`): `--source` and `--source-list`
+entries are unioned; `--source-re` and `--skip-paths` narrow the base
+set. With no `--source`/`--source-list`/`--source-re` the base set is the
+TU set recorded in the existing index (so a bare `serve` refreshes what
+was indexed instead of widening it), or every C/C++ entry of the
+compilation database when there is no index yet (`--source-re .`
+re-selects the whole database). Paths are canonicalized (absolute,
+dots removed) before dedupe and filtering. A warm start whose dirty set
+exceeds half the selection falls back to the parallel cold bake.
+
 ### `mcp` — MCP Server (adapter)
 
 **Headers:** `include/vycor/mcp/`
@@ -255,10 +265,10 @@ objects:
 vycor-cpp anneal     --build-path <dir> --source <files...> [--list-checks] [--checks <spec>] [--checks-config <file>] [--threads <n>] [--checkpoint <file>] [--isolate-workers [--workers <n>]] [--org-config <file>]
 vycor-cpp morph     --rules-json <file> --build-path <dir> --source <files...> [--dry-run]
 vycor-cpp prism    --build-path <dir> --source <files...> --mode <dump|query> [--collapse-paths <pattern>...] [--org-config <file>]
-vycor-cpp megascope index   --build-path <dir> [--source <file>... | --source-list <file|-> | --source-re <regex>] [--skip-paths <pattern>...] [--index <file>] [--collapse-paths <pattern>...] [--org-config <file>] [--threads <n>] [--isolate-workers]
+vycor-cpp megascope index   --build-path <dir> [--source <file>...] [--source-list <file|->] [--source-re <regex>] [--skip-paths <pattern>...] [--index <file>] [--collapse-paths <pattern>...] [--org-config <file>] [--threads <n>] [--isolate-workers]
 vycor-cpp megascope <tool>  [--index <file> | --build-path <dir>] [tool flags from its schema...] [--format json|ndjson|tsv] [--pretty]
 vycor-cpp megascope batch   [--index <file>]      # NDJSON {"tool":..,"args":{..}} on stdin
-vycor-cpp megascope serve   --build-path <dir> --source <files...> [--index <file>] [--entry-point <name>...] [-v]
+vycor-cpp megascope serve   --build-path <dir> [same selection flags as index] [--index <file>] [--entry-point <name>...] [-v]
 vycor-cpp megascope tools | info [--files] | help
 ```
 

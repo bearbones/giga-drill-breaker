@@ -16,13 +16,16 @@
 #include "vycor/cli/SourceSelection.h"
 #include "vycor/callgraph/CollapseFilter.h"
 
+#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/LineIterator.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Support/Regex.h"
 
 #include <algorithm>
-#include <fstream>
-#include <sstream>
+#include <optional>
 #include <unordered_set>
 
 namespace vycor {
@@ -33,23 +36,41 @@ llvm::Error selectionError(const llvm::Twine &msg) {
   return llvm::createStringError(llvm::inconvertibleErrorCode(), msg);
 }
 
+/// Absolute, `.`/`..` removed — the spelling the compilation database and
+/// the index stamps use, so dedupe and the filters see one name per TU.
+std::string canonical(llvm::StringRef path) {
+  llvm::SmallString<256> p(path);
+  llvm::sys::fs::make_absolute(p);
+  llvm::sys::path::remove_dots(p, /*remove_dot_dot=*/true);
+  return std::string(p.str());
+}
+
 void appendUnique(std::vector<std::string> &out,
-                  std::unordered_set<std::string> &seen, std::string path) {
-  if (seen.insert(path).second)
-    out.push_back(std::move(path));
+                  std::unordered_set<std::string> &seen,
+                  llvm::StringRef path) {
+  std::string c = canonical(path);
+  if (seen.insert(c).second)
+    out.push_back(std::move(c));
 }
 
 /// One path per line; blank lines and '#' comments ignored; surrounding
 /// whitespace trimmed.
-void appendListLines(std::istream &in, std::vector<std::string> &out,
-                     std::unordered_set<std::string> &seen) {
-  std::string line;
-  while (std::getline(in, line)) {
-    llvm::StringRef s = llvm::StringRef(line).trim();
-    if (s.empty() || s.starts_with("#"))
-      continue;
-    appendUnique(out, seen, s.str());
-  }
+void appendListLine(llvm::StringRef line, std::vector<std::string> &out,
+                    std::unordered_set<std::string> &seen) {
+  llvm::StringRef s = line.trim();
+  if (!s.empty() && !s.starts_with("#"))
+    appendUnique(out, seen, s);
+}
+
+/// A compilation database can carry assembly, resource, and since-deleted
+/// entries; the default-all base set keeps only what the bake can parse.
+bool isCppSourceOnDisk(llvm::StringRef path) {
+  static const char *const kExts[] = {".c",  ".cc", ".cp",  ".cpp", ".cxx",
+                                      ".c++", ".C", ".m",   ".mm",  ".cu"};
+  llvm::StringRef ext = llvm::sys::path::extension(path);
+  bool known = std::any_of(std::begin(kExts), std::end(kExts),
+                           [&](const char *e) { return ext == e; });
+  return known && llvm::sys::fs::is_regular_file(path);
 }
 
 } // namespace
@@ -58,47 +79,77 @@ llvm::Expected<std::vector<std::string>>
 selectSources(const clang::tooling::CompilationDatabase &db,
               const SourceSelection &sel, std::istream &stdinFor,
               SourceSelectionStats *stats) {
+  // Fail fast on a bad regex before reading any list or the database.
+  std::optional<llvm::Regex> re;
+  if (!sel.regex.empty()) {
+    re.emplace(sel.regex);
+    std::string reError;
+    if (!re->isValid(reError))
+      return selectionError("invalid --source-re '" + sel.regex + "': " +
+                            reError);
+  }
+
   std::vector<std::string> files;
   std::unordered_set<std::string> seen;
   const char *baseSource = "database";
+  size_t dbSkipped = 0;
 
   for (const auto &f : sel.explicitFiles)
     appendUnique(files, seen, f);
   if (!sel.listFile.empty()) {
     if (sel.listFile == "-") {
-      appendListLines(stdinFor, files, seen);
+      std::string line;
+      while (std::getline(stdinFor, line))
+        appendListLine(line, files, seen);
     } else {
-      std::ifstream in(sel.listFile);
-      if (!in)
-        return selectionError("cannot read --source-list " + sel.listFile);
-      appendListLines(in, files, seen);
+      auto buf = llvm::MemoryBuffer::getFile(sel.listFile);
+      if (!buf)
+        return selectionError("cannot read --source-list " + sel.listFile +
+                              ": " + buf.getError().message());
+      for (llvm::line_iterator it(**buf, /*SkipBlanks=*/true, '#');
+           !it.is_at_end(); ++it)
+        appendListLine(*it, files, seen);
     }
   }
-  if (!sel.explicitFiles.empty() && !sel.listFile.empty())
+
+  if (!sel.explicitFiles.empty() && !sel.listFile.empty()) {
     baseSource = "source + source-list";
-  else if (!sel.explicitFiles.empty())
+  } else if (!sel.explicitFiles.empty()) {
     baseSource = "source";
-  else if (!sel.listFile.empty())
+  } else if (!sel.listFile.empty()) {
     baseSource = "source-list";
-  else
-    for (const auto &f : db.getAllFiles())
+  } else if (!re && !sel.recordedFiles.empty()) {
+    baseSource = "index";
+    for (const auto &f : sel.recordedFiles)
       appendUnique(files, seen, f);
+  } else {
+    auto all = db.getAllFiles();
+    if (all.empty())
+      return selectionError(
+          "the compilation database lists no files (a compile_flags.txt "
+          "database cannot be enumerated); pass --source or --source-list");
+    for (const auto &f : all) {
+      if (isCppSourceOnDisk(f))
+        appendUnique(files, seen, f);
+      else
+        ++dbSkipped;
+    }
+    // getAllFiles() is hash order; the bake and the index should not
+    // depend on it.
+    std::sort(files.begin(), files.end());
+  }
 
   if (stats) {
     stats->base = files.size();
     stats->baseSource = baseSource;
+    stats->dbSkipped = dbSkipped;
   }
 
-  if (!sel.regex.empty()) {
-    llvm::Regex re(sel.regex);
-    std::string reError;
-    if (!re.isValid(reError))
-      return selectionError("invalid --source-re '" + sel.regex + "': " +
-                            reError);
+  if (re) {
     size_t before = files.size();
     files.erase(std::remove_if(files.begin(), files.end(),
                                [&](const std::string &f) {
-                                 return !re.match(f);
+                                 return !re->match(f);
                                }),
                 files.end());
     if (stats)

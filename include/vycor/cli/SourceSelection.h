@@ -26,16 +26,23 @@
 // TU selection for the bake (docs/megascope-cli-review.md §2.4). Replaces
 // the "write a Python snippet over compile_commands.json" step:
 //
-//   (no --source)        every entry of the compilation database
+//   (no selection flag)  the TU set recorded in the existing index, or
+//                        every C/C++ entry of the compilation database
+//                        when there is no index yet
 //   --source F ...       explicit files
 //   --source-list FILE   one path per line ("-" = stdin; '#' comments)
 //   --source-re REGEX    keep only paths matching (POSIX ERE, searched)
 //   --skip-paths P ...   drop paths under a directory component (the
 //                        existing CollapseFilter semantics)
 //
-// Explicit files and list entries are unioned (in order, deduplicated);
-// when neither is given the database is the base set. The regex and the
-// skip filter then narrow whatever the base set is.
+// Explicit files and list entries are unioned (in order, deduplicated).
+// Any of --source / --source-list / --source-re resolves against the
+// database (`--source-re .` re-selects everything); only a bare
+// invocation reuses the recorded set, so a narrow index is never widened
+// by accident. The regex and the skip filter narrow whatever the base
+// set is. Every path is made absolute with `.`/`..` removed before
+// deduplication and filtering, so a relative list entry, the database
+// spelling, and the stamps in the index agree.
 // ============================================================================
 
 namespace vycor {
@@ -45,18 +52,26 @@ struct SourceSelection {
   std::string listFile;                   // --source-list ("-" = stdin)
   std::string regex;                      // --source-re
   std::vector<std::string> skipPaths;     // --skip-paths
+  /// TU paths recorded in an existing index. Used as the base set only
+  /// when explicitFiles, listFile, and regex are all empty.
+  std::vector<std::string> recordedFiles;
 };
 
 struct SourceSelectionStats {
   size_t base = 0;        // candidates before filtering
   size_t regexDropped = 0;
   size_t skipDropped = 0;
-  const char *baseSource = ""; // "database", "source", "source-list", ...
+  /// Database entries dropped from the default-all base set: not a
+  /// C/C++ source by extension (assembly, resources) or no longer on disk.
+  size_t dbSkipped = 0;
+  const char *baseSource = ""; // "database", "index", "source", ...
 };
 
 /// Resolve `sel` against `db`. `stdinFor` backs `--source-list -`.
-/// Errors: unreadable list file, invalid regex. An empty result is not an
-/// error here (the caller decides what "nothing to index" means).
+/// Errors: unreadable list file, invalid regex, a database that cannot
+/// enumerate its files (compile_flags.txt) when nothing else names them.
+/// An empty result is not an error here (the caller decides what "nothing
+/// to index" means).
 llvm::Expected<std::vector<std::string>>
 selectSources(const clang::tooling::CompilationDatabase &db,
               const SourceSelection &sel, std::istream &stdinFor,

@@ -39,9 +39,11 @@ crash while parsing TUs that include them.
   --collapse-paths Client/ThirdParty
 ```
 
-`--source` is optional: with none, every entry of the compilation
-database is indexed (see [File selection](#file-selection) for
-`--source-re` and `--source-list`). Progress goes to stderr; when the bake finishes the index is written to
+`--source` is optional: with no selection flag, every C/C++ entry of the
+compilation database is indexed the first time, and the TUs recorded in
+the index on later runs (see [File selection](#file-selection) for
+`--source-re` and `--source-list`). Progress goes to stderr; when the
+bake finishes the index is written to
 `<build-path>/.vycor/megascope.vycs` (override with `--index <file>`) and
 one JSON summary line goes to stdout:
 
@@ -54,8 +56,9 @@ megascope: index saved to /path/to/build/.vycor/megascope.vycs
 
 Re-running `index` is a warm start: it loads the file, compares per-file
 mtime+size stamps, re-parses **only the TUs that changed** (and drops TUs
-removed from the `--source` set), and skips the re-save when nothing
-changed. The index is rebuilt from scratch when `--collapse-paths`,
+removed from the selection), and skips the re-save when nothing changed.
+When more than half of the selection is new or changed it falls back to
+the parallel cold bake instead of refreshing TU by TU. The index is rebuilt from scratch when `--collapse-paths`,
 `--lock-types`, or the channel-type registrations differ from the run
 that produced it, when the format version changes, or when the file fails
 to decode. Deleting it is always safe.
@@ -142,8 +145,13 @@ This is the most consequential decision. The index only covers functions
 **defined** in the TUs you select. Functions in headers are indexed only
 when their definition is compiled in a TU you include.
 
-With no `--source` at all, `megascope index` takes every entry of the
-compilation database. Narrow it with:
+With no `--source`, `--source-list`, or `--source-re`, `megascope index`
+and `megascope serve` take the TU set recorded in the existing index —
+a bare `serve` refreshes what was indexed and never widens a narrow
+index by accident — or, when there is no index yet, every C/C++ entry
+of the compilation database that still exists on disk (assembly and
+resource entries are skipped; `--source-re .` re-selects the whole
+database later). Narrow the database with:
 
 - `--source-re <regex>` — keep paths matching a POSIX extended regex
   (searched, not anchored), e.g. `--source-re '/Network/(src|tests)/'`;
@@ -159,8 +167,15 @@ jq -r '.[].file' build/compile_commands.json | grep /Network/ | sort -u |
 
 `--source <file>` (repeatable) still names TUs explicitly; explicit files
 and list entries are unioned, and `--source-re`/`--skip-paths` narrow
-whatever the base set is. `megascope index` reports how many TUs each
-filter dropped on stderr and refuses to bake an empty selection.
+whatever the base set is. Any of `--source`, `--source-list`, or
+`--source-re` resolves against the compilation database, not the index.
+Paths are made absolute with `.`/`..` removed before deduplication, so a
+relative list entry matches the database spelling and the index stamps.
+`megascope index` reports how many TUs each filter dropped on stderr and
+refuses to bake an empty selection. Under `serve`, `--source-list` must
+be a regular file (stdin, pipes, and devices would be drained before the
+first MCP request); a `compile_flags.txt` database cannot be enumerated,
+so it needs `--source` or `--source-list`.
 
 **Rule of thumb:** include both the implementation files you want to analyze
 and their test files. The test TUs often pull in the concrete class
@@ -451,7 +466,7 @@ appear multiple times with different `callSite` values. Deduplicate on
 `callerName`/`calleeName` in client code when you only need unique
 caller/callee relationships rather than site-level detail.
 
-**Graph scope is limited to `--source` files.** If `get_callers` returns
+**Graph scope is limited to the selected TUs.** If `get_callers` returns
 fewer callers than expected, the missing callers are in TUs you didn't
 include. The graph is not a lie — it's scoped.
 
