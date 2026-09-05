@@ -147,6 +147,8 @@ public:
   // there's no callSite-prefix reconstruction needed here they simply never
   // match a real tuPath).
   size_t removeTU(const std::string &tuPath);
+  // The same for several TUs at once (mirrors CallGraph::removeTUs).
+  size_t removeTUs(const std::vector<std::string> &tuPaths);
 
   // Compact storage, eliminating tombstones.
   void compact();

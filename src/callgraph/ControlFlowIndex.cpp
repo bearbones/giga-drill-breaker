@@ -461,25 +461,40 @@ void ControlFlowIndex::absorb(const ControlFlowIndex &shard) {
 }
 
 size_t ControlFlowIndex::removeTU(const std::string &tuPath) {
+  return removeTUs({tuPath});
+}
+
+size_t ControlFlowIndex::removeTUs(const std::vector<std::string> &tuPaths) {
   std::lock_guard<std::mutex> lock(mutex_);
-  std::string prefix = tuPath + ":";
   size_t removed = 0;
 
-  // Candidates: exactly this TU's contexts via the reverse index, plus the
+  // Candidates: exactly these TUs' contexts via the reverse index, plus the
   // no-provenance list (legacy fallback matches on a callSite prefix).
   // The old implementation scanned every stored context per removeTU and
   // scrubbed byCallee_/byCaller_ once per removed context (O(degree)
   // each); candidates are now O(TU size) and each affected adjacency
-  // vector is scrubbed once.
+  // vector is scrubbed once for the whole set of TUs.
+  std::vector<std::string> prefixes;
   std::vector<size_t> candidates;
-  if (auto tuId = interner_.find(tuPath)) {
-    auto it = byTu_.find(*tuId);
-    if (it != byTu_.end())
-      candidates = it->second;
+  for (const auto &tuPath : tuPaths) {
+    prefixes.push_back(tuPath + ":");
+    if (auto tuId = interner_.find(tuPath)) {
+      auto it = byTu_.find(*tuId);
+      if (it != byTu_.end())
+        candidates.insert(candidates.end(), it->second.begin(),
+                          it->second.end());
+    }
   }
   size_t provenanced = candidates.size();
   candidates.insert(candidates.end(), noProvenance_.begin(),
                     noProvenance_.end());
+  auto fromRemovedTu = [&](const StoredContext &se) {
+    const std::string &site = interner_.resolve(se.site);
+    for (const auto &prefix : prefixes)
+      if (site.compare(0, prefix.size(), prefix) == 0)
+        return true;
+    return false;
+  };
 
   std::unordered_set<size_t> dead;
   std::unordered_set<SId> affectedCallees, affectedCallers;
@@ -490,8 +505,7 @@ size_t ControlFlowIndex::removeTU(const std::string &tuPath) {
     StoredContext &se = contexts_[i];
     if (!se.live)
       continue; // tombstoned earlier
-    if (n >= provenanced &&
-        interner_.resolve(se.site).compare(0, prefix.size(), prefix) != 0)
+    if (n >= provenanced && !fromRemovedTu(se))
       continue; // no-provenance context from a different TU
 
     affectedCallees.insert(se.callee);
@@ -530,10 +544,12 @@ size_t ControlFlowIndex::removeTU(const std::string &tuPath) {
       bySite_.erase(it);
   }
   if (!dead.empty()) {
-    if (auto tuId = interner_.find(tuPath)) {
-      auto it = byTu_.find(*tuId);
-      if (it != byTu_.end())
-        byTu_.erase(it);
+    for (const auto &tuPath : tuPaths) {
+      if (auto tuId = interner_.find(tuPath)) {
+        auto it = byTu_.find(*tuId);
+        if (it != byTu_.end())
+          byTu_.erase(it);
+      }
     }
     scrub(noProvenance_);
   }

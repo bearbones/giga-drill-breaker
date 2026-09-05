@@ -19,6 +19,7 @@
 #include "vycor/callgraph/CallGraph.h"
 #include "vycor/callgraph/ChannelIndex.h"
 #include "vycor/callgraph/ConditionalGuard.h"
+#include "vycor/callgraph/FileStamp.h"
 #include "vycor/callgraph/StringInterner.h"
 
 #include <cstdint>
@@ -213,6 +214,9 @@ public:
   // pre-provenance snapshots) fall back to a callSite prefix match.
   // Returns the number of contexts removed.
   size_t removeTU(const std::string &tuPath);
+  // The same for several TUs at once; each affected index vector is
+  // scrubbed once for the whole set (mirrors CallGraph::removeTUs).
+  size_t removeTUs(const std::vector<std::string> &tuPaths);
 
   // Compact the contexts vector, eliminating tombstones. The shared set
   // tables are index-stable and left untouched.
@@ -376,6 +380,9 @@ struct BakedIndexes {
   CallGraph graph;
   ControlFlowIndex cfIndex;
   ChannelIndex channels;
+  // Every file each TU's parse opened (see FileStamp.h); a TU whose parse
+  // crashed before the end of the TU has no entry.
+  TuDependencies deps;
 };
 
 // Build both indexes in a single frontend parse per TU: the node/hierarchy

@@ -191,7 +191,14 @@ void writeShard(const std::string &shardPath,
     site.tuPath = tu;
     channels.addSite(std::move(site));
   }
+  // A worker records its batch's stamps and dependency lists in the
+  // shard meta; the parent absorbs the lists along with the indexes.
   SnapshotMeta meta;
+  meta.files = SnapshotIO::stampFiles(batch);
+  TuDependencies deps;
+  for (const auto &tu : batch)
+    deps[tu] = {{"/tu/common.h", 7000000000ull, 42ull}};
+  SnapshotIO::recordDependencies(meta, deps);
   REQUIRE(SnapshotIO::save(shardPath, g, cf, meta, channels));
 }
 
@@ -433,6 +440,83 @@ TEST_CASE("overlapping deep_chains shards dedup edges; removeTU of the "
 // Dispatcher bookkeeping through the fake-runner seam
 // ============================================================================
 
+TEST_CASE("the bake records the files each TU opened", "[worker_pool]") {
+  const std::string base =
+      std::string(PROJECT_SOURCE_DIR) + "/examples/deep_chains/";
+  const std::string tu = base + "main.cpp";
+  auto out = bakeFixture({tu});
+  auto it = out.deps.find(tu);
+  REQUIRE(it != out.deps.end());
+  const auto &opened = it->second;
+  std::vector<std::string> paths;
+  for (const auto &d : opened)
+    paths.push_back(d.path);
+  CHECK(std::is_sorted(paths.begin(), paths.end()));
+  // Its own includes, by the canonical spelling; never the TU itself.
+  auto cb = std::find(paths.begin(), paths.end(), base + "callbacks.hpp");
+  REQUIRE(cb != paths.end());
+  CHECK(std::find(paths.begin(), paths.end(), tu) == paths.end());
+  // Stamps are the frontend's own stat: whole seconds, real sizes.
+  const auto &cbStamp = opened[static_cast<size_t>(cb - paths.begin())];
+  auto now = SnapshotIO::stampFiles({base + "callbacks.hpp"})[0];
+  CHECK(cbStamp.size == now.size);
+  CHECK(cbStamp.mtimeNs == now.mtimeNs - now.mtimeNs % 1000000000ull);
+}
+
+TEST_CASE("removeTUs of a set equals removing each TU in turn",
+          "[worker_pool]") {
+  const std::string base =
+      std::string(PROJECT_SOURCE_DIR) + "/examples/deep_chains/";
+  auto files = deepChainsFiles(base);
+  auto oneByOne = bakeFixture(files);
+  auto batched = bakeFixture(files);
+  std::vector<std::string> gone = {base + "pipeline.cpp",
+                                   base + "tokenizer.cpp",
+                                   base + "callbacks.cpp",
+                                   base + "not-indexed.cpp"};
+  size_t edgesOne = 0, ctxOne = 0;
+  for (const auto &tu : gone) {
+    edgesOne += oneByOne.graph.removeTU(tu);
+    ctxOne += oneByOne.cfIndex.removeTU(tu);
+  }
+  CHECK(batched.graph.removeTUs(gone) == edgesOne);
+  CHECK(batched.cfIndex.removeTUs(gone) == ctxOne);
+  CHECK(edgesOne > 0);
+  CHECK(ctxOne > 0);
+  checkGraphsEqual(batched.graph, oneByOne.graph);
+  CHECK(batched.cfIndex.size() == oneByOne.cfIndex.size());
+  CHECK(canonContexts(batched.cfIndex) == canonContexts(oneByOne.cfIndex));
+
+  // Channels: sites from three TUs, one channel shared by all.
+  auto makeChannels = [] {
+    ChannelIndex ci;
+    for (const char *tu : {"/tu/a.cpp", "/tu/b.cpp", "/tu/c.cpp"}) {
+      for (const char *chan : {"shared", tu}) {
+        ChannelSite site;
+        site.channelId = chan;
+        site.channelTypeName = "Queue";
+        site.category = "queue";
+        site.op = ChannelOperation::Produce;
+        site.siteFunctionUsr = std::string("fn@") + tu;
+        site.siteFunctionDisplay = site.siteFunctionUsr;
+        site.callSite = std::string(tu) + ":3:1";
+        site.tuPath = tu;
+        ci.addSite(std::move(site));
+      }
+    }
+    return ci;
+  };
+  auto chOne = makeChannels(), chBatched = makeChannels();
+  size_t sitesOne = chOne.removeTU("/tu/a.cpp") + chOne.removeTU("/tu/b.cpp");
+  CHECK(chBatched.removeTUs({"/tu/a.cpp", "/tu/b.cpp"}) == sitesOne);
+  CHECK(sitesOne == 4);
+  CHECK(chBatched.size() == chOne.size());
+  CHECK(chBatched.size() == 2);
+  CHECK(chBatched.producersOf("shared").size() == 1);
+  CHECK(chBatched.producersOf("/tu/c.cpp").size() == 1);
+  CHECK(chBatched.producersOf("/tu/a.cpp").empty());
+}
+
 TEST_CASE("dispatcher absorbs clean batches", "[worker_pool][dispatcher]") {
   std::string dir = makeShardDir();
   std::vector<std::string> files = {"/tu/a.cpp", "/tu/b.cpp", "/tu/c.cpp",
@@ -468,6 +552,15 @@ TEST_CASE("dispatcher absorbs clean batches", "[worker_pool][dispatcher]") {
   CHECK(out.channels.size() == files.size());
   for (const auto &tu : files)
     CHECK(out.channels.producersOf("chan@" + tu).size() == 1);
+  // Dependency lists ride the shard meta.
+  REQUIRE(out.deps.size() == files.size());
+  for (const auto &tu : files) {
+    INFO(tu);
+    REQUIRE(out.deps.count(tu) == 1);
+    REQUIRE(out.deps.at(tu).size() == 1);
+    CHECK(out.deps.at(tu)[0] ==
+          FileStamp{"/tu/common.h", 7000000000ull, 42ull});
+  }
   CHECK(stats.tuStats.size() == files.size());
   CHECK(stats.crashCount() == 0);
   for (const auto &t : stats.tuStats)

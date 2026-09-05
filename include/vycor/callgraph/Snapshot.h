@@ -18,6 +18,7 @@
 #include "vycor/callgraph/CallGraph.h"
 #include "vycor/callgraph/ChannelIndex.h"
 #include "vycor/callgraph/ControlFlowIndex.h"
+#include "vycor/callgraph/FileStamp.h"
 
 #include <cstdint>
 #include <optional>
@@ -42,16 +43,6 @@ namespace vycor {
 // full build. Snapshots are a cache, never a source of truth.
 // ============================================================================
 
-struct FileStamp {
-  std::string path;
-  uint64_t mtimeNs = 0; // last modification, nanoseconds since epoch
-  uint64_t size = 0;
-
-  bool operator==(const FileStamp &o) const {
-    return path == o.path && mtimeNs == o.mtimeNs && size == o.size;
-  }
-};
-
 struct SnapshotMeta {
   // Build configuration the snapshot was produced with. Any mismatch with
   // the current invocation invalidates the snapshot wholesale, because these
@@ -65,6 +56,13 @@ struct SnapshotMeta {
 
   // Stamps of every TU baked into the snapshot.
   std::vector<FileStamp> files;
+  // v9: every file the frontend opened while parsing those TUs (headers,
+  // .inc/.def, PCH inputs), deduplicated and stamped as the frontend saw
+  // it, and per TU (parallel to `files`) the indices of the ones it
+  // opened. A TU is dirty on warm start when its own stamp or any of its
+  // dependencies' changed (SnapshotIO::dirtyTUs).
+  std::vector<FileStamp> deps;
+  std::vector<std::vector<uint32_t>> tuDeps;
   // v8: the bake's --entry-point list, so query verbs and serve default
   // to the same roots the index was built for (empty = "main").
   std::vector<std::string> entryPoints;
@@ -153,7 +151,9 @@ public:
   ///     table of {kind, offset, length} for meta / graph / control flow /
   ///     channels) lets a load decode only the sections a query needs;
   ///     meta carries the bake's entry points.
-  static constexpr uint32_t kFormatVersion = 8;
+  /// v9: meta records each TU's dependencies (SnapshotMeta::deps/tuDeps)
+  ///     so a header edit dirties its includers on warm start.
+  static constexpr uint32_t kFormatVersion = 9;
   /// Bytes before the first section: magic(4) + version(4) + summary(32) +
   /// table count(4) + 4 entries of kind(1) + offset(8) + length(8).
   static constexpr uint64_t kHeaderBytes = 4 + 4 + 32 + 4 + 4 * 17;
@@ -181,6 +181,29 @@ public:
   /// reindex of that TU).
   static std::vector<FileStamp>
   stampFiles(const std::vector<std::string> &files);
+
+  /// Which of `current` (stamps of the selected TUs, taken before the
+  /// parse) must be re-indexed against `meta`: not recorded, own stamp
+  /// changed, or any recorded dependency changed. Dependency stamps are
+  /// compared at whole-second mtime resolution (what the frontend
+  /// records); a dependency that no longer exists counts as changed.
+  /// Returns one flag per entry of `current`; `viaDeps`, if given, counts
+  /// the TUs whose own stamp still matches and are dirty only through a
+  /// dependency.
+  static std::vector<bool> dirtyTUs(const SnapshotMeta &meta,
+                                    const std::vector<FileStamp> &current,
+                                    size_t *viaDeps = nullptr);
+
+  /// meta.deps/tuDeps expanded to per-TU stamp lists, keyed by TU path.
+  static TuDependencies dependenciesOf(const SnapshotMeta &meta);
+
+  /// Replace meta.deps/tuDeps from `deps` for the TUs in meta.files (a TU
+  /// absent from `deps` gets an empty list; TUs absent from meta.files
+  /// are ignored). A dependency two TUs saw with different stamps is
+  /// recorded with the older one, so the TU that parsed the earlier
+  /// version is still dirtied.
+  static void recordDependencies(SnapshotMeta &meta,
+                                 const TuDependencies &deps);
 };
 
 } // namespace vycor

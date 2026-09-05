@@ -267,6 +267,9 @@ BakedIndexes bakeIsolatedWithRunner(const WorkerRunner &runner,
         out.graph.absorb(snap->graph);
         out.cfIndex.absorb(snap->cfIndex);
         out.channels.absorb(snap->channels);
+        // The worker records its batch's dependencies in the shard meta.
+        for (auto &kv : SnapshotIO::dependenciesOf(snap->meta))
+          out.deps[kv.first] = std::move(kv.second);
         if (stats) {
           // Honest per-TU accounting isn't available across a batch; record
           // the batch wall divided evenly rather than faking parse times.

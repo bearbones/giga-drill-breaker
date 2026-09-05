@@ -20,6 +20,7 @@
 #include "vycor/callgraph/ControlFlowIndex.h"
 #include "vycor/callgraph/Snapshot.h"
 
+#include "llvm/ADT/SmallString.h"
 #include "llvm/Support/FileSystem.h"
 
 #include <catch2/catch_test_macros.hpp>
@@ -131,6 +132,9 @@ SnapshotMeta makeMeta() {
   meta.channelTypes = {{"Queue", {"push"}, {"pop"}, "queue"}};
   meta.files = {{"/src/a.cpp", 1234567890ull, 2048ull},
                 {"/src/b.cpp", 987654321ull, 4096ull}};
+  meta.deps = {{"/src/a.h", 1000000000ull, 10ull},
+               {"/src/shared.h", 2000000000ull, 20ull}};
+  meta.tuDeps = {{0, 1}, {1}};
   return meta;
 }
 
@@ -213,6 +217,8 @@ TEST_CASE("snapshot round-trips graph, CF index, and meta",
     REQUIRE(loaded->meta.files.size() == 2);
     CHECK(loaded->meta.files[0] == meta.files[0]);
     CHECK(loaded->meta.files[1] == meta.files[1]);
+    CHECK(loaded->meta.deps == meta.deps);
+    CHECK(loaded->meta.tuDeps == meta.tuDeps);
   }
 
   SECTION("channels defaults empty when save() isn't given a ChannelIndex") {
@@ -535,6 +541,115 @@ TEST_CASE("stampFiles flags missing files with zero stamps", "[snapshot]") {
   REQUIRE(stamps.size() == 1);
   CHECK(stamps[0].mtimeNs == 0);
   CHECK(stamps[0].size == 0);
+}
+
+namespace {
+
+std::string writeText(const std::string &path, const std::string &text) {
+  std::ofstream(path) << text;
+  return path;
+}
+
+/// What the frontend records for a file it opened: whole-second mtime.
+FileStamp parsedStamp(const std::string &path) {
+  auto fs = SnapshotIO::stampFiles({path})[0];
+  fs.mtimeNs -= fs.mtimeNs % 1000000000ull;
+  return fs;
+}
+
+} // anonymous namespace
+
+TEST_CASE("dependency stamps dirty the TUs that opened a changed header",
+          "[snapshot]") {
+  llvm::SmallString<128> dir;
+  REQUIRE(!llvm::sys::fs::createUniqueDirectory("vycor-deps", dir));
+  const std::string base = std::string(dir) + "/";
+  auto a = writeText(base + "a.cpp", "int a();\n");
+  auto b = writeText(base + "b.cpp", "int b();\n");
+  auto shared = writeText(base + "shared.h", "// shared\n");
+  auto priv = writeText(base + "priv.h", "// private\n");
+
+  SnapshotMeta meta;
+  meta.files = SnapshotIO::stampFiles({a, b});
+  TuDependencies deps;
+  deps[a] = {parsedStamp(shared), parsedStamp(priv)};
+  deps[b] = {parsedStamp(shared)};
+  deps[base + "ghost.cpp"] = {parsedStamp(priv)}; // not a recorded TU
+  SnapshotIO::recordDependencies(meta, deps);
+
+  auto dirtyNow = [&](std::vector<std::string> tus, size_t &via) {
+    return SnapshotIO::dirtyTUs(meta, SnapshotIO::stampFiles(tus), &via);
+  };
+  size_t via = 99;
+
+  SECTION("recordDependencies interns each file once, per recorded TU") {
+    REQUIRE(meta.deps.size() == 2);
+    REQUIRE(meta.tuDeps.size() == 2);
+    CHECK(meta.tuDeps[0].size() == 2);
+    REQUIRE(meta.tuDeps[1].size() == 1);
+    CHECK(meta.deps[meta.tuDeps[1][0]].path == shared);
+    auto expanded = SnapshotIO::dependenciesOf(meta);
+    REQUIRE(expanded.size() == 2);
+    CHECK(expanded[a] == deps[a]);
+    CHECK(expanded[b] == deps[b]);
+  }
+
+  SECTION("nothing changed: nothing dirty") {
+    CHECK(dirtyNow({a, b}, via) == std::vector<bool>{false, false});
+    CHECK(via == 0);
+  }
+
+  SECTION("a changed private header dirties only its includer") {
+    writeText(priv, "// private, edited\n");
+    CHECK(dirtyNow({a, b}, via) == std::vector<bool>{true, false});
+    CHECK(via == 1);
+  }
+
+  SECTION("a changed shared header dirties every includer") {
+    writeText(shared, "// shared, edited\n");
+    CHECK(dirtyNow({a, b}, via) == std::vector<bool>{true, true});
+    CHECK(via == 2);
+  }
+
+  SECTION("a deleted header dirties its includer") {
+    llvm::sys::fs::remove(priv);
+    CHECK(dirtyNow({a, b}, via) == std::vector<bool>{true, false});
+    CHECK(via == 1);
+  }
+
+  SECTION("an unrecorded TU and an edited TU are dirty on their own") {
+    auto c = writeText(base + "c.cpp", "int c();\n");
+    writeText(a, "int a();\nint aa();\n");
+    CHECK(dirtyNow({a, b, c}, via) == std::vector<bool>{true, false, true});
+    CHECK(via == 0);
+  }
+
+  SECTION("two parses of one header keep the older stamp") {
+    FileStamp older = parsedStamp(shared);
+    older.mtimeNs -= 5 * 1000000000ull;
+    TuDependencies two;
+    two[a] = {older};
+    two[b] = {parsedStamp(shared)};
+    SnapshotIO::recordDependencies(meta, two);
+    REQUIRE(meta.deps.size() == 1);
+    CHECK(meta.deps[0] == older);
+    // The file on disk is newer than the older stamp: both are dirty.
+    CHECK(dirtyNow({a, b}, via) == std::vector<bool>{true, true});
+    CHECK(via == 2);
+  }
+
+  SECTION("the tables survive a save/load") {
+    std::string path = base + "snap.vycs";
+    REQUIRE(SnapshotIO::save(path, CallGraph(), ControlFlowIndex(), meta));
+    auto loaded = SnapshotIO::load(path, nullptr, LoadMode::ReadOnly, 0);
+    REQUIRE(loaded);
+    CHECK(loaded->meta.deps == meta.deps);
+    CHECK(loaded->meta.tuDeps == meta.tuDeps);
+    CHECK(SnapshotIO::dependenciesOf(loaded->meta) ==
+          SnapshotIO::dependenciesOf(meta));
+  }
+
+  llvm::sys::fs::remove_directories(dir);
 }
 
 TEST_CASE("snapshot round-trips multi-contributor deduped edges",

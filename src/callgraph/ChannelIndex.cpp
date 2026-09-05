@@ -173,34 +173,42 @@ void ChannelIndex::absorb(const ChannelIndex &shard) {
 }
 
 size_t ChannelIndex::removeTU(const std::string &tuPath) {
+  return removeTUs({tuPath});
+}
+
+size_t ChannelIndex::removeTUs(const std::vector<std::string> &tuPaths) {
   std::lock_guard<std::mutex> lock(mutex_);
   size_t removed = 0;
-  auto tit = byTu_.find(tuPath);
-  if (tit == byTu_.end())
-    return 0;
 
+  // Release every TU's registrations first, then scrub each affected
+  // index vector once for the whole set (mirrors CallGraph::removeTUs).
   std::unordered_set<size_t> dead;
   std::unordered_set<std::string> affectedChannels, affectedFuncUsr,
       affectedFuncDisplay;
-  for (size_t idx : tit->second) {
-    StoredSite &se = sites_[idx];
-    if (se.refs == 0)
-      continue; // already tombstoned
-    if (--se.refs > 0)
-      continue; // other contributors remain
+  for (const auto &tuPath : tuPaths) {
+    auto tit = byTu_.find(tuPath);
+    if (tit == byTu_.end())
+      continue;
+    for (size_t idx : tit->second) {
+      StoredSite &se = sites_[idx];
+      if (se.refs == 0)
+        continue; // already tombstoned
+      if (--se.refs > 0)
+        continue; // other contributors remain
 
-    dead.insert(idx);
-    affectedChannels.insert(se.site.channelId);
-    affectedFuncUsr.insert(se.site.siteFunctionUsr);
-    if (se.site.siteFunctionDisplay != se.site.siteFunctionUsr)
-      affectedFuncDisplay.insert(se.site.siteFunctionDisplay);
+      dead.insert(idx);
+      affectedChannels.insert(se.site.channelId);
+      affectedFuncUsr.insert(se.site.siteFunctionUsr);
+      if (se.site.siteFunctionDisplay != se.site.siteFunctionUsr)
+        affectedFuncDisplay.insert(se.site.siteFunctionDisplay);
 
-    index_.erase(
-        SiteKey{se.site.channelId, se.site.callSite, se.site.siteFunctionUsr,
-                se.site.op});
-    se.live = false;
-    --liveCount_;
-    ++removed;
+      index_.erase(SiteKey{se.site.channelId, se.site.callSite,
+                           se.site.siteFunctionUsr, se.site.op});
+      se.live = false;
+      --liveCount_;
+      ++removed;
+    }
+    byTu_.erase(tit);
   }
 
   auto scrub = [&dead](std::vector<size_t> &v) {
@@ -232,7 +240,6 @@ size_t ChannelIndex::removeTU(const std::string &tuPath) {
     if (it->second.empty())
       byFunctionDisplay_.erase(it);
   }
-  byTu_.erase(tit);
   return removed;
 }
 

@@ -175,6 +175,20 @@ void emitMeta(std::string &out, const SnapshotMeta &meta) {
   putU32(out, static_cast<uint32_t>(meta.entryPoints.size()));
   for (const auto &s : meta.entryPoints)
     putLenStr(out, s);
+  // v9: dependency table, then per TU (in meta.files order) its indices.
+  putU32(out, static_cast<uint32_t>(meta.deps.size()));
+  for (const auto &d : meta.deps) {
+    putLenStr(out, d.path);
+    putU64(out, d.mtimeNs);
+    putU64(out, d.size);
+  }
+  static const std::vector<uint32_t> kNoDeps;
+  for (size_t i = 0; i < meta.files.size(); ++i) {
+    const auto &ids = i < meta.tuDeps.size() ? meta.tuDeps[i] : kNoDeps;
+    putU32(out, static_cast<uint32_t>(ids.size()));
+    for (uint32_t id : ids)
+      putU32(out, id);
+  }
 }
 
 bool readMeta(Reader &r, SnapshotMeta &meta) {
@@ -199,6 +213,26 @@ bool readMeta(Reader &r, SnapshotMeta &meta) {
   n = r.count();
   for (uint32_t i = 0; r.ok && i < n; ++i)
     meta.entryPoints.push_back(r.lenStr());
+  n = r.count();
+  for (uint32_t i = 0; r.ok && i < n; ++i) {
+    FileStamp fs;
+    fs.path = r.lenStr();
+    fs.mtimeNs = r.u64();
+    fs.size = r.u64();
+    meta.deps.push_back(std::move(fs));
+  }
+  meta.tuDeps.resize(meta.files.size());
+  for (size_t i = 0; r.ok && i < meta.files.size(); ++i) {
+    uint32_t m = r.count();
+    for (uint32_t j = 0; r.ok && j < m; ++j) {
+      uint32_t id = r.u32();
+      if (id >= meta.deps.size()) {
+        r.ok = false;
+        break;
+      }
+      meta.tuDeps[i].push_back(id);
+    }
+  }
   return r.ok;
 }
 
@@ -1017,6 +1051,98 @@ SnapshotIO::stampFiles(const std::vector<std::string> &files) {
     stamps.push_back(std::move(fs));
   }
   return stamps;
+}
+
+namespace {
+
+constexpr uint64_t kNsPerSecond = 1000000000ull;
+
+/// A recorded dependency stamp (the frontend's whole-second mtime) matches
+/// the file as it is now when the sizes agree and the current mtime falls
+/// in that second.
+bool sameParsedVersion(const FileStamp &recorded, const FileStamp &now) {
+  return recorded.size == now.size &&
+         recorded.mtimeNs == now.mtimeNs - now.mtimeNs % kNsPerSecond;
+}
+
+} // anonymous namespace
+
+std::vector<bool> SnapshotIO::dirtyTUs(const SnapshotMeta &meta,
+                                       const std::vector<FileStamp> &current,
+                                       size_t *viaDeps) {
+  std::unordered_map<std::string, size_t> recorded;
+  recorded.reserve(meta.files.size());
+  for (size_t i = 0; i < meta.files.size(); ++i)
+    recorded[meta.files[i].path] = i;
+
+  // Stat every dependency once, not once per includer.
+  std::vector<std::string> depPaths;
+  depPaths.reserve(meta.deps.size());
+  for (const auto &d : meta.deps)
+    depPaths.push_back(d.path);
+  auto depsNow = stampFiles(depPaths);
+  std::vector<bool> depChanged(meta.deps.size(), false);
+  for (size_t i = 0; i < meta.deps.size(); ++i)
+    depChanged[i] = !sameParsedVersion(meta.deps[i], depsNow[i]);
+
+  std::vector<bool> dirty(current.size(), false);
+  size_t via = 0;
+  for (size_t i = 0; i < current.size(); ++i) {
+    auto it = recorded.find(current[i].path);
+    if (it == recorded.end() || !(meta.files[it->second] == current[i])) {
+      dirty[i] = true;
+      continue;
+    }
+    if (it->second >= meta.tuDeps.size())
+      continue;
+    for (uint32_t id : meta.tuDeps[it->second]) {
+      if (id < depChanged.size() && depChanged[id]) {
+        dirty[i] = true;
+        ++via;
+        break;
+      }
+    }
+  }
+  if (viaDeps)
+    *viaDeps = via;
+  return dirty;
+}
+
+TuDependencies SnapshotIO::dependenciesOf(const SnapshotMeta &meta) {
+  TuDependencies out;
+  for (size_t i = 0; i < meta.files.size() && i < meta.tuDeps.size(); ++i) {
+    auto &list = out[meta.files[i].path];
+    for (uint32_t id : meta.tuDeps[i])
+      if (id < meta.deps.size())
+        list.push_back(meta.deps[id]);
+  }
+  return out;
+}
+
+void SnapshotIO::recordDependencies(SnapshotMeta &meta,
+                                    const TuDependencies &deps) {
+  meta.deps.clear();
+  meta.tuDeps.assign(meta.files.size(), {});
+  std::unordered_map<std::string, uint32_t> ids;
+  for (size_t i = 0; i < meta.files.size(); ++i) {
+    auto it = deps.find(meta.files[i].path);
+    if (it == deps.end())
+      continue;
+    for (const auto &d : it->second) {
+      auto [pos, inserted] =
+          ids.emplace(d.path, static_cast<uint32_t>(meta.deps.size()));
+      if (inserted) {
+        meta.deps.push_back(d);
+      } else {
+        // Two parses saw different versions: keep the older stamp so the
+        // TU that parsed it is dirtied by the newer file.
+        FileStamp &kept = meta.deps[pos->second];
+        if (d.mtimeNs < kept.mtimeNs)
+          kept = d;
+      }
+      meta.tuDeps[i].push_back(pos->second);
+    }
+  }
 }
 
 } // namespace vycor

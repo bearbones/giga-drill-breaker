@@ -472,7 +472,18 @@ leak-at-exit for one-shot verbs (#59), then the read-only load mode
 (3.1.2, numbers under 3.1.1 too), then the sectioned v8 layout with
 per-tool `ToolEntry::needs`, `info` on the meta section alone, and the
 bake's entry points recorded in the v8 meta (measurements under 3.1.1),
-which closes item 6.
+which closes item 6. Item 7 (3.1.3, 3.1.4; D5, D6) landed next: the
+dirty set goes through `bakeIndexes`/`bakeIsolated` and is absorbed, and
+the v9 meta records per TU the files its parse opened, stamped by the
+frontend's own stat, so a header edit dirties its includers; `--force`
+rebuilds regardless. Along the way: `index` loads the meta section first
+and an unchanged index exits without decoding the graph, and the drop +
+dirty set is removed with one batched `removeTUs` per index. Measured on
+the 938-TU testbed (12 threads; cold bake 150–205 s): unchanged `index`
+0.03 s / 29 MB (was 6.9 s / 2.1 GB); a header with 3 includers 8–12 s
+wall (load 2.6–3.8, bake 2.7–4.2, save 1.1–1.4); a header with 74
+includers 44–49 s wall (remove 3.9 s after batching, from 17.7 s; bake
+25–31 s; absorb 0.6–1.0 s).
 
 Items 1–5 make the CLI real and can land in one or two PRs. Item 6 is the
 one performance change the CLI model actually needs, and it is gated on a
