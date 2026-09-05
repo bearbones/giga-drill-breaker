@@ -47,9 +47,11 @@ bool isAmbiguousResult(const llvm::json::Value &result) {
 }
 
 // The list-shaped member of each tool's payload (ToolEntry::recordsKey).
-// Tools absent here answer with one scalar record. Where a payload carries
-// two lists (analyze_dead_code, get_class_hierarchy, query_channel) the
-// primary one is named; the other stays in the ndjson _summary line.
+// Tools absent here answer with one scalar record — including query_channel,
+// whose producers/consumers lists are peers (naming one would report a
+// consumer-only channel as empty). Where a payload carries a primary list
+// plus a secondary one (analyze_dead_code, get_class_hierarchy) the primary
+// is named; the other stays in the ndjson _summary line.
 static const std::map<std::string, std::string> kRecordsKeys = {
     {"search_functions", "matches"},
     {"get_callees", "callees"},
@@ -60,11 +62,10 @@ static const std::map<std::string, std::string> kRecordsKeys = {
     {"list_callback_sites", "targets"},
     {"list_concurrency_entry_points", "entries"},
     {"query_raii_scopes_at_callsite", "locals"},
-    {"query_locks_held", "locksHeld"},
+    {"query_locks_held", "paths"},
     {"query_same_lock", "sharedLocks"},
     {"analyze_dead_code", "dead"},
     {"list_channels", "channels"},
-    {"query_channel", "producers"},
     {"query_channels_for_function", "sites"},
 };
 

@@ -41,8 +41,8 @@ crash while parsing TUs that include them.
 
 `--source` must be repeated once per file — it does not accept globs.
 Progress goes to stderr; when the bake finishes the index is written to
-`<build-path>/.vycor/megascope.vycs` (override with `--index <file>` or
-`$VYCOR_INDEX`) and one JSON summary line goes to stdout:
+`<build-path>/.vycor/megascope.vycs` (override with `--index <file>`) and
+one JSON summary line goes to stdout:
 
 ```
 megascope: baking call graph + control flow index (68 files, 8 threads)...
@@ -80,8 +80,8 @@ stdout is the payload and nothing else: compact JSON by default,
 `--pretty` to indent, `--format ndjson` for one record per line (after a
 `{"_summary":...}` line carrying the scalar fields, so `head`, `grep`,
 and `jq -c` work without loading the whole result), `--format tsv` for
-the flat tables (sorted columns, header first). stderr is quiet unless
-`-v`.
+the flat tables (sorted columns, header first). stderr carries only error
+messages unless `-v`.
 
 Exit codes are the contract to branch on:
 

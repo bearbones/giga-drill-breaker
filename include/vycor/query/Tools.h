@@ -77,7 +77,12 @@ struct ToolContext {
 ///
 /// Result contract (shared by every transport):
 ///   - success: the payload object itself, no envelope;
-///   - error:   `{"error": "<message>"}` (see errorResult / isErrorResult);
+///   - error:   `{"error": "<message>"}` (see errorResult / isErrorResult).
+///              A message starting with "Missing", "Requires", or "Invalid"
+///              means the arguments were malformed; any other message means
+///              a well-formed query matched nothing ("Function not found:
+///              ..."). The CLI maps the two onto exit codes 2 and 1, so
+///              keep new error messages on one side of that line;
 ///   - ambiguous identity: a non-error payload with `"ambiguous": true` and
 ///     a `candidates` list (see isAmbiguousResult and Identity.h).
 using ToolHandler =

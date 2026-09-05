@@ -201,7 +201,7 @@ semantics). `megascope index` prints a one-line JSON summary on stdout.
 `get_class_hierarchy`, `list_entry_points`, `graph_summary`,
 `list_callback_sites`, `list_concurrency_entry_points`, `list_channels`,
 `query_channel`, `query_channels_for_function`, `explain_ordering`,
-`reindex_tu`.
+`reindex_tu` (serve only).
 
 Identical edges registered by multiple TUs (header-inlined code) are
 **deduplicated at insert** with per-TU refcounting, so `removeTU` only drops
@@ -289,7 +289,7 @@ To add a new subcommand, follow the pattern in `main.cpp`:
 ### prism vs megascope
 
 - **prism**: One-shot CLI tool. Parses AST per invocation, outputs JSON to stdout. Best for quick single-file investigations.
-- **megascope**: Cross-TU. `megascope index` bakes a unified call graph + control-flow index into a file once; every query verb (`megascope get-callers --name f`, `megascope batch`) loads it and answers, and `megascope serve` exposes the same tools over MCP stdio. **Always use megascope for security audits or multi-file analysis** — prism is single-TU and cannot see cross-file callers.
+- **megascope**: Cross-TU. `megascope index` bakes a unified call graph + control-flow index into a file once; every tool verb (`megascope get-callers --name f`, `megascope batch`) loads it and answers, and `megascope serve` exposes the same tools over MCP stdio. **Always use megascope for security audits or multi-file analysis** — prism is single-TU and cannot see cross-file callers.
 
 ### Edge Collapse (--collapse-paths)
 

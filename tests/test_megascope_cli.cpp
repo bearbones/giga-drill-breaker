@@ -89,7 +89,7 @@ std::string tempIndexPath(llvm::StringRef tag) {
 /// main -> helper (direct), plus two functions that share the display
 /// name "dup" (distinct USRs, distinct files) so name lookups are
 /// ambiguous.
-std::string saveFixtureIndex(llvm::StringRef tag) {
+std::string saveFixtureIndex(llvm::StringRef tag, bool withFiles = true) {
   CallGraph g;
   g.addNode({"main", "/src/a.cpp", 10, true, false, ""}, "/src/a.cpp");
   g.addNode({"helper", "/src/a.cpp", 3, false, false, ""}, "/src/a.cpp");
@@ -103,7 +103,8 @@ std::string saveFixtureIndex(llvm::StringRef tag) {
   ControlFlowIndex cf;
   SnapshotMeta meta;
   meta.collapsePaths = {"Client/Math"};
-  meta.files = {{"/src/a.cpp", 1, 2}, {"/src/b.cpp", 3, 4}};
+  if (withFiles)
+    meta.files = {{"/src/a.cpp", 1, 2}, {"/src/b.cpp", 3, 4}};
   std::string path = tempIndexPath(tag);
   REQUIRE(SnapshotIO::save(path, g, cf, meta));
   return path;
@@ -111,7 +112,8 @@ std::string saveFixtureIndex(llvm::StringRef tag) {
 
 struct IndexFile {
   std::string path;
-  explicit IndexFile(llvm::StringRef tag) : path(saveFixtureIndex(tag)) {}
+  explicit IndexFile(llvm::StringRef tag, bool withFiles = true)
+      : path(saveFixtureIndex(tag, withFiles)) {}
   ~IndexFile() { std::remove(path.c_str()); }
 };
 
@@ -207,6 +209,10 @@ TEST_CASE("parseToolArgs maps schema property types onto flags",
     REQUIRE_FALSE(bool(dangling));
     CHECK(llvm::toString(dangling.takeError()).find("requires a value") !=
           std::string::npos);
+    // A following flag is not a value.
+    auto swallowed = parseToolArgs(tool, {"--name", "--edge-kinds", "x"});
+    REQUIRE_FALSE(bool(swallowed));
+    llvm::consumeError(swallowed.takeError());
 
     auto positional = parseToolArgs(tool, {"Foo::bar"});
     REQUIRE_FALSE(bool(positional));
@@ -231,6 +237,15 @@ TEST_CASE("parseToolArgs maps schema property types onto flags",
     auto ok = parseToolArgs(tool, {"--file", "/src/a.cpp"});
     REQUIRE(bool(ok));
   }
+}
+
+TEST_CASE("records keys name real list members", "[megascope][cli]") {
+  auto tools = getRegisteredTools();
+  CHECK(toolNamed(tools, "query_locks_held").recordsKey == "paths");
+  CHECK(toolNamed(tools, "get_callers").recordsKey == "callers");
+  // Peer lists (producers/consumers) must not make one of them "the" list.
+  CHECK(toolNamed(tools, "query_channel").recordsKey.empty());
+  CHECK(toolNamed(tools, "lookup_function").recordsKey.empty());
 }
 
 TEST_CASE("printToolHelp lists every schema property with its description",
@@ -384,6 +399,14 @@ TEST_CASE("tsv output has a sorted header and escaped cells",
   CHECK(ls[1] == "f0\t10\t{\"k\":1}\thas\\ttab");
   CHECK(ls[2] == "f1\t11\t\t");
 
+  SECTION("an empty record list prints nothing (columns unknown)") {
+    int code = 0;
+    std::string none =
+        emit(callersPayload(0), "callers", OutputFormat::Tsv, false, &code);
+    CHECK(code == kExitEmpty);
+    CHECK(none.empty());
+  }
+
   SECTION("errors go to stderr and a two-line error block on stdout") {
     int code = 0;
     std::string err;
@@ -438,6 +461,16 @@ TEST_CASE("query verbs answer from a saved index", "[megascope][cli]") {
     CHECK(llvm::StringRef(lines(t.out)[0]).contains("callerName"));
   }
 
+  SECTION("common flags accept underscores and refuse a dangling value") {
+    auto r = run({"get-callers", "--index", idx.path, "--name", "helper",
+                  "--entry_point", "main", "--build_path", "/nowhere"});
+    CHECK(r.code == kExitResults);
+    // `--index` followed by another flag is a usage error, not exit 3.
+    auto dangling = run({"get-callers", "--index", "--name", "helper"});
+    CHECK(dangling.code == kExitUsage);
+    CHECK(dangling.err.find("requires a value") != std::string::npos);
+  }
+
   SECTION("call <tool> --args") {
     auto r = run({"call", "lookup_function", "--index", idx.path, "--args",
                   R"({"name":"helper"})"});
@@ -449,6 +482,9 @@ TEST_CASE("query verbs answer from a saved index", "[megascope][cli]") {
     CHECK(bad.err.find("--args must be a JSON object") != std::string::npos);
     auto none = run({"call", "--index", idx.path});
     CHECK(none.code == kExitUsage);
+    auto bogus = run({"call", "bogus", "--index", idx.path});
+    CHECK(bogus.code == kExitUsage);
+    CHECK(bogus.err.find("unknown verb or tool 'bogus'") != std::string::npos);
   }
 
   SECTION("empty answers exit 1, ambiguity exits 4 with candidates") {
@@ -544,6 +580,11 @@ TEST_CASE("query verbs answer from a saved index", "[megascope][cli]") {
     REQUIRE(cfg != nullptr);
     CHECK(cfg->getArray("collapse_paths")->size() == 1);
 
+    IndexFile bare("nofiles", /*withFiles=*/false);
+    auto noFiles = run({"info", "--index", bare.path, "--files"});
+    CHECK(noFiles.code == kExitResults); // a presentation flag, not an answer
+    CHECK(parseObject(noFiles.out).getArray("files")->empty());
+
     auto files = run({"info", "--index", idx.path, "--files", "--format",
                       "ndjson"});
     CHECK(files.code == kExitResults);
@@ -607,6 +648,11 @@ TEST_CASE("tools lists every registered tool", "[megascope][cli]") {
   CHECK(text.out.find("reindex-tu") != std::string::npos);
   CHECK(text.out.find("[serve only]") != std::string::npos);
   CHECK(lines(text.out).size() == tools.size());
+  // One sentence per tool, and "e.g. " inside a sentence does not end it.
+  for (const auto &line : lines(text.out)) {
+    CHECK_FALSE(llvm::StringRef(line).ends_with("e.g."));
+    CHECK_FALSE(llvm::StringRef(line).ends_with("(e.g."));
+  }
 
   auto json = run({"tools", "--format", "json"});
   CHECK(json.code == kExitResults);

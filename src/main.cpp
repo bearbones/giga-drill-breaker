@@ -38,7 +38,6 @@
 
 #include <algorithm>
 #include <chrono>
-#include <cstdlib>
 #include <iostream>
 #include <optional>
 #include <set>
@@ -623,7 +622,7 @@ static llvm::cl::opt<std::string>
         llvm::cl::desc("Index file: load the baked graph if present "
                        "(re-indexing only changed TUs) and save after "
                        "building. The index/serve verbs default it to "
-                       "$VYCOR_INDEX, then <build-path>/.vycor/megascope.vycs"),
+                       "<build-path>/.vycor/megascope.vycs"),
         llvm::cl::value_desc("file"),
         llvm::cl::sub(MegascopeCmd));
 
@@ -631,7 +630,7 @@ static llvm::cl::opt<std::string>
 // McpIndex's subcommand).
 static llvm::cl::alias
     McpSnapshotAlias("snapshot", llvm::cl::desc("Alias for --index"),
-                     llvm::cl::aliasopt(McpIndex));
+                     llvm::cl::aliasopt(McpIndex), llvm::cl::NotHidden);
 
 static llvm::cl::opt<bool>
     McpVerbose("v",
@@ -1328,20 +1327,19 @@ int main(int argc, const char **argv) {
       llvm::errs() << "megascope: at least one --source file is required\n";
       return 1;
     }
-    if (!McpMcp) {
+    if (!McpMcp && megascopeVerb != MegascopeVerb::Index) {
       llvm::errs() << "megascope: MCP is the only serve transport\n";
       return 1;
     }
 
-    // The verb forms resolve the index location the way the query verbs do
-    // (--index, $VYCOR_INDEX, <build-path>/.vycor/megascope.vycs); the
-    // legacy verb-less form keeps --snapshot's opt-in semantics.
+    // The verb forms default the index location to
+    // <build-path>/.vycor/megascope.vycs — not $VYCOR_INDEX, which is a
+    // query-side convenience and must never become a write target (see
+    // resolveIndexPath). The legacy verb-less form keeps --snapshot's
+    // opt-in semantics.
     std::string indexPath = McpIndex;
-    if (megascopeVerb != MegascopeVerb::Legacy && indexPath.empty()) {
-      const char *envIndex = std::getenv("VYCOR_INDEX");
-      indexPath = vycor::resolveIndexPath("", envIndex ? envIndex : "",
-                                          McpBuildPath);
-    }
+    if (megascopeVerb != MegascopeVerb::Legacy && indexPath.empty())
+      indexPath = vycor::defaultIndexPath(McpBuildPath);
 
     std::string dbError;
     auto compDb = clang::tooling::CompilationDatabase::loadFromDirectory(
@@ -1513,8 +1511,12 @@ int main(int argc, const char **argv) {
                        << graph.edgeCount() << " edges, "
                        << cfIndex.size() << " call sites)\n";
         }
+      } else if (llvm::sys::fs::exists(indexPath)) {
+        llvm::errs() << "megascope: cannot load index " << indexPath
+                     << " (wrong format version or unreadable) — full "
+                        "build\n";
       } else {
-        llvm::errs() << "megascope: no usable index at " << indexPath
+        llvm::errs() << "megascope: no index yet at " << indexPath
                      << " — full build\n";
       }
     }

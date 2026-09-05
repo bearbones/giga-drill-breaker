@@ -187,7 +187,8 @@ parseToolArgs(const ToolEntry &tool, llvm::ArrayRef<std::string> argv,
     auto takeValue = [&]() -> llvm::Expected<llvm::StringRef> {
       if (hasInline)
         return inlineVal;
-      if (i + 1 >= argv.size())
+      if (i + 1 >= argv.size() ||
+          llvm::StringRef(argv[i + 1]).starts_with("--"))
         return fail("flag '--" + rawKey + "' requires a value");
       return llvm::StringRef(argv[++i]);
     };
@@ -288,7 +289,7 @@ void printToolHelp(const ToolEntry &tool, llvm::raw_ostream &os) {
 namespace {
 
 /// Handler error messages that describe malformed arguments rather than an
-/// empty answer. The handlers spell these consistently (Tools.h contract).
+/// empty answer: the prefixes the result contract in Tools.h reserves.
 bool isUsageMessage(llvm::StringRef msg) {
   return msg.starts_with("Missing") || msg.starts_with("Requires") ||
          msg.starts_with("Invalid");
@@ -357,6 +358,8 @@ void writeTsv(llvm::raw_ostream &os, const llvm::json::Value &payload,
   // Rows: the records list, or the payload itself as one row.
   std::vector<const llvm::json::Value *> rows;
   if (const auto *records = recordsOf(payload, recordsKey)) {
+    if (records->empty())
+      return; // no rows, no header: the columns are unknown
     for (const auto &r : *records)
       rows.push_back(&r);
   } else {
@@ -501,7 +504,11 @@ llvm::Expected<CommonOpts> splitCommonFlags(llvm::ArrayRef<std::string> argv,
     }
     llvm::StringRef body = a.starts_with("--") ? a.drop_front(2) : a;
     const bool hasInline = a.starts_with("--") && body.contains('=');
-    auto [key, inlineVal] = body.split('=');
+    auto [rawKey, inlineVal] = body.split('=');
+    // Same spelling rule as the tool flags: underscores read as hyphens.
+    std::string keyStorage = rawKey.str();
+    std::replace(keyStorage.begin(), keyStorage.end(), '_', '-');
+    const llvm::StringRef key = keyStorage;
     std::string *target = nullptr;
     if (a.starts_with("--")) {
       if (key == "index")
@@ -521,7 +528,8 @@ llvm::Expected<CommonOpts> splitCommonFlags(llvm::ArrayRef<std::string> argv,
     llvm::StringRef value;
     if (hasInline) {
       value = inlineVal;
-    } else if (i + 1 < argv.size()) {
+    } else if (i + 1 < argv.size() &&
+               !llvm::StringRef(argv[i + 1]).starts_with("--")) {
       value = argv[++i];
     } else {
       return usageError("flag '--" + key + "' requires a value");
@@ -572,9 +580,18 @@ void printVerbHelp(llvm::raw_ostream &os) {
         "unreadable, 4 ambiguous identity (candidates on stdout).\n";
 }
 
+/// Up to the first sentence-ending ". " — skipping the abbreviations the
+/// tool descriptions use ("e.g. ", "i.e. ", "vs. ").
 llvm::StringRef firstSentence(llvm::StringRef text) {
   size_t dot = text.find(". ");
-  return dot == llvm::StringRef::npos ? text : text.substr(0, dot + 1);
+  while (dot != llvm::StringRef::npos) {
+    llvm::StringRef before = text.substr(0, dot);
+    if (!before.ends_with("e.g") && !before.ends_with("i.e") &&
+        !before.ends_with("vs"))
+      return text.substr(0, dot + 1);
+    dot = text.find(". ", dot + 1);
+  }
+  return text;
 }
 
 int runTools(const std::vector<ToolEntry> &tools, const CommonOpts &common,
@@ -661,9 +678,12 @@ int runInfo(const SnapshotData &snap, llvm::StringRef indexPath,
     }
     o["files"] = std::move(files);
   }
-  return emitToolResult(llvm::json::Value(std::move(o)),
-                        common.files ? "files" : "", format, common.pretty,
-                        out, err);
+  // "files" only lays out ndjson/tsv: an index with no TUs is still a
+  // fully answered description, so --files must not flip the exit code.
+  int code = emitToolResult(llvm::json::Value(std::move(o)),
+                            common.files ? "files" : "", format,
+                            common.pretty, out, err);
+  return code == kExitEmpty ? kExitResults : code;
 }
 
 int runBatch(const std::vector<ToolEntry> &tools, const ToolContext &ctx,
@@ -746,13 +766,15 @@ int runMegascopeQueryVerb(llvm::ArrayRef<std::string> args,
   const std::vector<ToolEntry> tools = getRegisteredTools();
 
   std::string toolName;
+  llvm::StringRef typed = verb; // what to name in "unknown tool"
   if (verb == "call") {
     if (tail.empty() || llvm::StringRef(tail.front()).starts_with("-")) {
       err << "megascope call: expected a tool name, e.g. `megascope call "
              "get_callers --args '{\"name\":\"f\"}'`\n";
       return kExitUsage;
     }
-    toolName = canonicalToolName(tail.front());
+    typed = tail.front();
+    toolName = canonicalToolName(typed);
     tail = tail.drop_front();
   } else if (verb != "tools" && verb != "info" && verb != "batch") {
     toolName = canonicalToolName(verb);
@@ -764,7 +786,7 @@ int runMegascopeQueryVerb(llvm::ArrayRef<std::string> args,
       if (t.name == toolName)
         tool = &t;
     if (!tool) {
-      err << "megascope: unknown verb or tool '" << verb
+      err << "megascope: unknown verb or tool '" << typed
           << "'. Verbs: index, serve, tools, info, batch, call, <tool>; "
              "run `vycor-cpp megascope tools` for the tool list.\n";
       return kExitUsage;

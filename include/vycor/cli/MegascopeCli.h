@@ -66,11 +66,14 @@ enum MegascopeExit : int {
 /// Default index location relative to a build directory.
 std::string defaultIndexPath(llvm::StringRef buildPath);
 
-/// Resolution chain for the index file: `--index`, then $VYCOR_INDEX
-/// (`envIndex`, already read by the caller), then
+/// Resolution chain for the index file read by the query verbs: `--index`,
+/// then $VYCOR_INDEX (`envIndex`, already read by the caller), then
 /// defaultIndexPath(buildPath) when a build path is known, else
 /// defaultIndexPath(".") — i.e. run from the build directory and no flag is
-/// needed at all.
+/// needed at all. The writing verbs (`index`, `serve`) deliberately skip
+/// the environment variable: it is a query-side convenience, and honoring
+/// it as a write location would let one project's bake overwrite another
+/// project's index.
 std::string resolveIndexPath(llvm::StringRef explicitIndex,
                              llvm::StringRef envIndex,
                              llvm::StringRef buildPath);
@@ -103,8 +106,9 @@ parseToolArgs(const ToolEntry &tool, llvm::ArrayRef<std::string> argv,
 void printToolHelp(const ToolEntry &tool, llvm::raw_ostream &os);
 
 /// Exit code for a tool payload: error payloads map to kExitUsage when the
-/// arguments were malformed ("Missing required ...", "Invalid ...") and
-/// kExitEmpty otherwise ("Function not found: ..."); ambiguity payloads to
+/// message carries one of the argument-error prefixes the Tools.h result
+/// contract reserves ("Missing", "Requires", "Invalid") and kExitEmpty
+/// otherwise ("Function not found: ..."); ambiguity payloads to
 /// kExitAmbiguous; an empty records list to kExitEmpty; everything else
 /// kExitResults.
 int exitCodeFor(const llvm::json::Value &payload, llvm::StringRef recordsKey);
