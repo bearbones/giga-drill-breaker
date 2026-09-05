@@ -52,6 +52,22 @@ bool isAmbiguousResult(const llvm::json::Value &result) {
 // consumer-only channel as empty). Where a payload carries a primary list
 // plus a secondary one (analyze_dead_code, get_class_hierarchy) the primary
 // is named; the other stays in the ndjson _summary line.
+// Sections beyond the graph a tool reads (ToolEntry::needs). Exception
+// and lock tools walk call-site contexts; channel tools read the channel
+// index; everything else, graph_summary included (it reports the header
+// counts), touches only the graph.
+static const std::map<std::string, unsigned> kExtraNeeds = {
+    {"query_exception_safety", kSectionControlFlow},
+    {"query_call_site_context", kSectionControlFlow},
+    {"query_raii_scopes_at_callsite", kSectionControlFlow},
+    {"query_locks_held", kSectionControlFlow},
+    {"query_same_lock", kSectionControlFlow},
+    {"list_channels", kSectionChannels},
+    {"query_channel", kSectionChannels},
+    {"query_channels_for_function", kSectionChannels},
+    {"explain_ordering", kSectionChannels},
+};
+
 static const std::map<std::string, std::string> kRecordsKeys = {
     {"search_functions", "matches"},
     {"get_callees", "callees"},
@@ -69,6 +85,17 @@ static const std::map<std::string, std::string> kRecordsKeys = {
     {"query_channels_for_function", "sites"},
 };
 
+std::vector<std::string> sectionNames(unsigned needs) {
+  std::vector<std::string> out;
+  if (needs & kSectionGraph)
+    out.push_back("graph");
+  if (needs & kSectionControlFlow)
+    out.push_back("control_flow");
+  if (needs & kSectionChannels)
+    out.push_back("channels");
+  return out;
+}
+
 std::vector<ToolEntry> getRegisteredTools() {
   std::vector<ToolEntry> tools;
   registerGraphTools(tools);
@@ -80,6 +107,9 @@ std::vector<ToolEntry> getRegisteredTools() {
     auto it = kRecordsKeys.find(tool.name);
     if (it != kRecordsKeys.end())
       tool.recordsKey = it->second;
+    auto needs = kExtraNeeds.find(tool.name);
+    tool.needs = kSectionGraph |
+                 (needs != kExtraNeeds.end() ? needs->second : 0u);
   }
 
   // reindex_tu — handler is null: it mutates the indexes, so each adapter
@@ -101,6 +131,7 @@ std::vector<ToolEntry> getRegisteredTools() {
                      "edges and contexts removed and current totals.",
                      llvm::json::Value(std::move(schema)),
                      nullptr});
+    tools.back().needs = kSectionAll; // mutates every index
   }
 
   return tools;

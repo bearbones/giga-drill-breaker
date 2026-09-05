@@ -696,7 +696,10 @@ handleGraphSummary(const llvm::json::Object & /*args*/,
   llvm::json::Object obj;
   obj["nodeCount"] = static_cast<int64_t>(ctx.graph.nodeCount());
   obj["edgeCount"] = static_cast<int64_t>(totalEdges);
-  obj["callSiteCount"] = static_cast<int64_t>(ctx.cfIndex.size());
+  // One-shot verbs load the graph section only; the header count stands
+  // in for the undecoded control-flow index.
+  obj["callSiteCount"] = static_cast<int64_t>(
+      ctx.summary ? ctx.summary->callSites : ctx.cfIndex.size());
   obj["entryPointCount"] = static_cast<int64_t>(ctx.entryPoints.size());
   obj["confidenceHistogram"] = llvm::json::Value(std::move(conf));
   obj["edgeKindHistogram"] = llvm::json::Value(std::move(kinds));

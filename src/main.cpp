@@ -67,6 +67,7 @@ loadSectionsJson(const vycor::SnapshotLoadStats &stats) {
     o["name"] = sec.name;
     o["bytes"] = static_cast<int64_t>(sec.bytes);
     o["ms"] = sec.ms;
+    o["skipped"] = sec.skipped;
     out.push_back(std::move(o));
   }
   return out;
@@ -1670,6 +1671,7 @@ int main(int argc, const char **argv) {
       meta.lockBuiltins = lockCfg.useBuiltins;
       meta.channelTypes = channelCfg.registeredTypes;
       meta.files = std::move(currentStamps);
+      meta.entryPoints.assign(McpEntryPoints.begin(), McpEntryPoints.end());
       auto snapSaveStart = StatsClock::now();
       if (vycor::SnapshotIO::save(indexPath, graph, cfIndex, meta,
                                   channels)) {
@@ -1794,8 +1796,12 @@ int main(int argc, const char **argv) {
       return 0;
     }
 
+    // --entry-point, else the roots recorded in the index (v8 meta), else
+    // main — the same resolution the query verbs use.
     std::vector<std::string> entryPoints(McpEntryPoints.begin(),
                                          McpEntryPoints.end());
+    if (entryPoints.empty() && snap)
+      entryPoints = snap->meta.entryPoints;
     if (entryPoints.empty())
       entryPoints.push_back("main");
 
